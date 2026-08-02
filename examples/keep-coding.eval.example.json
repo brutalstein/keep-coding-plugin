@@ -1,0 +1,18 @@
+{
+  "repository": "../target-project",
+  "promptFile": "./project-prompt.md",
+  "runs": 20,
+  "baseline": {
+    "command": ["codex", "exec", "--json", "-"]
+  },
+  "keepCoding": {
+    "command": ["codex", "exec", "--json", "-"]
+  },
+  "verifierCommands": [
+    "npm test",
+    "npm run build"
+  ],
+  "outputDirectory": "../eval-results",
+  "timeoutMs": 1800000
+}
+

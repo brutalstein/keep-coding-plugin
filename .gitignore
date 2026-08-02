@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+eval-results/
+*.log
+.DS_Store
+.keep-coding/
+plugins/keep-coding/dist/*.map

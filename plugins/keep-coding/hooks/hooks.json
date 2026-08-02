@@ -1,0 +1,83 @@
+{
+  "description": "Keep Coding project continuity lifecycle hooks.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/dist/keep-coding.mjs\" hook SessionStart",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\dist\\keep-coding.mjs\" hook SessionStart",
+            "timeout": 5,
+            "statusMessage": "Loading Keep Coding project state",
+            "additionalContextLimit": 3000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/dist/keep-coding.mjs\" hook UserPromptSubmit",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\dist\\keep-coding.mjs\" hook UserPromptSubmit",
+            "timeout": 8,
+            "statusMessage": "Checking project continuity",
+            "additionalContextLimit": 3000
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/dist/keep-coding.mjs\" hook PreCompact",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\dist\\keep-coding.mjs\" hook PreCompact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/dist/keep-coding.mjs\" hook PostCompact",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\dist\\keep-coding.mjs\" hook PostCompact",
+            "timeout": 5,
+            "additionalContextLimit": 3000
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/dist/keep-coding.mjs\" hook Stop",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\dist\\keep-coding.mjs\" hook Stop",
+            "timeout": 8,
+            "statusMessage": "Checking phase completion"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/dist/keep-coding.mjs\" hook SessionEnd",
+            "commandWindows": "node \"%PLUGIN_ROOT%\\dist\\keep-coding.mjs\" hook SessionEnd",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

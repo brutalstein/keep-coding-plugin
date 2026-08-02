@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "keep_coding": {
+      "command": "node",
+      "args": ["dist/keep-coding.mjs", "mcp"],
+      "cwd": "."
+    }
+  }
+}

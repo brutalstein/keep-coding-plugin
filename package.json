@@ -1,0 +1,38 @@
+{
+  "name": "keep-coding",
+  "version": "0.1.0",
+  "description": "Evidence-gated continuity for long-running Codex projects.",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "bin": {
+    "keep-coding": "plugins/keep-coding/dist/keep-coding.mjs"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "npm run lint && npm run typecheck && npm run test:coverage && npm run build && npm run validate:plugin",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "validate:plugin": "node scripts/validate-plugin.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "minimatch": "10.2.6",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@modelcontextprotocol/client": "2.0.0",
+    "@types/node": "26.1.2",
+    "@vitest/coverage-v8": "4.1.10",
+    "esbuild": "0.28.1",
+    "eslint": "10.8.0",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10"
+  }
+}

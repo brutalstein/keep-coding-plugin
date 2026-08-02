@@ -1,0 +1,7 @@
+interface:
+  display_name: "Keep Coding"
+  short_description: "Run large coding projects through verified phases"
+  default_prompt: "Use $keep-coding to deliver this project through evidence-gated phases."
+
+policy:
+  allow_implicit_invocation: true
