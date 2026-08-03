@@ -1,5 +1,8 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { GraphEdge, GraphNode, PhaseDefinition, PhaseRecord, PlanAmendment, PlanRevisionRecord, ProjectContract } from "../domain/model.js";
+import type {
+  GraphEdge, GraphNode, PhaseDefinition, PhaseRecord, PlanAmendment, PlanRevisionRecord,
+  ProjectContract, ProjectContractPatch
+} from "../domain/model.js";
 import { type DbRow, json, must, now, text } from "./platform-db.js";
 
 export interface PlanHost {
@@ -122,10 +125,12 @@ function validateDefinitions(phases: PhaseDefinition[], existing: Map<string, Ph
   for (const phase of phases) visit(phase.id);
 }
 
-function mergeContract(contract: ProjectContract, patch: Partial<ProjectContract>): ProjectContract {
+function mergeContract(contract: ProjectContract, patch: ProjectContractPatch): ProjectContract {
+  const definedPatch = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)) as ProjectContractPatch;
   return {
-    ...contract, ...patch,
-    ...(patch.budget ? { budget: { ...contract.budget, ...patch.budget } } : {}),
-    ...(patch.critic ? { critic: { ...contract.critic, ...patch.critic } } : {})
-  };
+    ...contract,
+    ...definedPatch,
+    ...(definedPatch.budget ? { budget: { ...contract.budget, ...definedPatch.budget } } : {}),
+    ...(definedPatch.critic ? { critic: { ...contract.critic, ...definedPatch.critic } } : {})
+  } as ProjectContract;
 }
