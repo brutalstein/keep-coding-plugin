@@ -36,10 +36,12 @@ export async function runCritic(input: CriticInput): Promise<CriticEvidence> {
 function parseCommand(value: string | undefined): string[] {
   if (!value) return [];
   const parsed = JSON.parse(value) as unknown;
-  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string") || parsed.length === 0) {
+  if (!Array.isArray(parsed)) throw new Error("KEEP_CODING_CRITIC_COMMAND_JSON must be a non-empty JSON string array");
+  const command = parsed.filter((item): item is string => typeof item === "string");
+  if (command.length !== parsed.length || command.length === 0) {
     throw new Error("KEEP_CODING_CRITIC_COMMAND_JSON must be a non-empty JSON string array");
   }
-  return parsed;
+  return command;
 }
 
 async function runJsonProcess(executable: string, args: string[], input: CriticInput): Promise<{ passed: boolean; summary: string; findings: string[] }> {
