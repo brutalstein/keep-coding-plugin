@@ -1,4 +1,5 @@
 import { handleHook } from "./hooks/handler.js";
+import { runHttpMcpServer } from "./mcp/http.js";
 import { runMcpServer } from "./mcp/server.js";
 import { KeepCodingService } from "./core/service.js";
 import { indexRepository } from "./core/indexer.js";
@@ -10,6 +11,9 @@ try {
   switch (command) {
     case "mcp":
       await runMcpServer();
+      break;
+    case "mcp-http":
+      await runHttpMcpServer();
       break;
     case "hook": {
       const input = JSON.parse(await readStdin() || "{}") as Record<string, unknown>;
@@ -36,7 +40,7 @@ try {
       process.stdout.write("0.1.0\n");
       break;
     default:
-      process.stdout.write("Keep Coding v0.1.0\nUsage: keep-coding <mcp|hook|init|status|context|index|eval|version> [path]\n");
+      process.stdout.write("Keep Coding v0.1.0\nUsage: keep-coding <mcp|mcp-http|hook|init|status|context|index|eval|version> [path]\n");
   }
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
