@@ -1,74 +1,56 @@
 # Architecture
 
-Keep Coding is single-workflow and local-first, with an optional remote MCP adapter for normal ChatGPT chats.
+Keep Coding is a single-workflow, local-first continuity platform with an optional bounded HTTP MCP adapter.
 
-## Boundaries
+## Layers
 
-| Layer | Responsibility | Must not do |
-|---|---|---|
-| Skill | Tell Codex when and how to use the workflow | Pretend checks passed |
-| Hooks | Activate, restore context, and guard stopping in Codex | Mutate source code |
-| MCP server | Validate inputs and expose lifecycle/workspace operations | Keep process-global project state |
-| HTTP adapter | Authenticate, bound requests, validate Host, and restrict roots/commands | Expose unrestricted filesystem or shell access |
-| Workspace tools | Read/search/diff and apply phase-scoped patches | Escape the Git root or bypass phase scope |
-| Service | Coordinate Git, graph indexing, storage, workspace, and verification | Bypass the state machine |
-| Store | Persist contracts, phases, events, evidence, and graph | Execute shell commands |
-| Verifier | Enforce phase scope, scan changed files for secrets, and execute declared checks | Promote phases directly |
-| Evaluator | Run controlled paired experiments | Score subjective quality internally |
+| Layer | Responsibility |
+|---|---|
+| Runtime adapters | Normalize Codex hooks, Claude-style hooks, or polling into continuity directives. |
+| MCP/CLI | Validate explicit project roots and expose lifecycle and workspace operations. |
+| Service | Coordinate state, Git, graph indexing, verification, playbook, and orchestration. |
+| Store | Migration-safe SQLite source of truth for plan versions, phases, evidence, approvals, budgets, graph, worktrees, and events. |
+| Semantic graph | TypeScript AST plus language adapters for symbols, imports, calls, references, tests, and blast radius. |
+| Verifier | Scope → secret scan → budget → selective tests → acceptance commands → optional critic. |
+| Orchestrator | Isolated worktrees and merge-after-evidence for independent parallel-safe phases. |
+| Dashboard | Loopback-only read-only HTML and JSON projection of durable state. |
 
-## State machine
+## State and migrations
 
-A project moves through `PLANNING → ACTIVE → READY_TO_COMPLETE → COMPLETED`, with `BLOCKED` as an intervention state. A phase moves through `PENDING → READY → IN_PROGRESS → VERIFYING → COMPLETED`. Failed evidence produces `FAILED` until the attempt budget is exhausted, then `BLOCKED`.
+Old v0.1 databases are upgraded additively. New phase states include `AWAITING_APPROVAL`, `REVERIFY_REQUIRED`, `BLOCKED_BUDGET`, and `SUPERSEDED`. Plan revisions and amendments are append-only records. Completed checkpoints remain attached to their original phase revision.
 
-Dependent phases become `READY` only in the same database transaction that records a passing checkpoint. Completion is rejected unless all phases are `COMPLETED`.
+## Adaptive planning
 
-At first phase start, Keep Coding stores a content-hash snapshot of the working tree. Scope verification compares against that snapshot, not `HEAD`, so pre-existing edits and files changed by earlier verified phases do not contaminate the current phase.
+`amend_plan` can add phases and supersede inactive phases after implementation starts. It rejects in-progress supersession, duplicate IDs, invalid dependencies, cycles, no-op acceptance commands, and invalid budgets. Events record the reason, added phases, superseded phases, and plan version.
 
-## Verification pipeline
+## Git-native checkpoints and parallelism
 
-Every checkpoint runs the following gates in order:
+A passing checkpoint stages only the phase change set and creates a phase-scoped commit. Baseline restore is explicit. Parallel execution is conservative: every phase must be `READY`, `parallelSafe`, and have disjoint scope roots. Each receives a Git worktree and branch; verification runs in isolation and merge occurs only after passing evidence.
 
-1. compute the changed-file set from the phase baseline;
-2. enforce the phase's declared `allowedScope` patterns;
-3. scan every changed text file for private-key markers, provider token formats, suspicious secret assignments, and high-entropy credential candidates;
-4. execute the phase's declared acceptance commands only when scope and secret scanning pass.
+## Semantic impact and testing
 
-Secret scanning is an invariant rather than a plan option. A phase author cannot disable it or omit it from `acceptanceCommands`. Binary files and text files larger than 2 MiB are skipped to keep verification bounded. Findings store a rule identifier, path, line, non-reversible fingerprint, and redacted preview; raw secret values are never persisted in checkpoint evidence.
+The index is parser-backed rather than regex-only. It emits file, test, and symbol nodes plus `contains`, `imports`, `calls`, `references`, and `tested_by` edges. `get_impact` returns distance and edge provenance. Changed files determine a minimal impacted-test list when a contract provides `selectiveTests.commandTemplate`. Project completion reserves `fullSuiteCommands` as the authoritative final gate. If a later phase touches files previously owned by a completed phase, that phase moves to `REVERIFY_REQUIRED`.
 
-## Persistence
+## Verification and safety
 
-Each target Git repository owns one `.keep-coding/state.db`. SQLite uses WAL mode, foreign keys, and a busy timeout. The append-only event sequence lets the Codex Stop hook distinguish real progress from a continuation loop.
+Secret scanning is unconditional and stores only redacted previews and non-reversible fingerprints. Budgets merge project and phase limits using the stricter value. Deterministic commands remain authoritative. The critic is independent and optional; advisory output never blocks unless the contract explicitly makes it blocking. A blocking critic without a configured command fails closed.
 
-Normal ChatGPT does not execute Codex hooks. It uses the same persisted state through explicit MCP calls, so the app must be selected or invoked in the conversation.
+## Human approval
 
-## Remote transport
+A phase may declare `requiresApproval`. `request_approval` records the question and pauses the project. Only `resolve_approval` can return it to `READY` or block it after rejection.
 
-`mcp-http` uses the MCP SDK's per-request Streamable HTTP handler. Project state remains repository-scoped in SQLite. Before service access, the adapter applies:
+## Compounding memory
 
-1. request-size limits;
-2. HTTP Host allowlisting;
-3. an authentication boundary;
-4. canonical project-root allowlisting.
+With `playbookOptIn`, successful phase templates and failure fingerprints are stored in a separate user-level SQLite database. Projects never write cross-project memory without this explicit contract flag.
 
-The operator also supplies an exact acceptance-command allowlist. It is checked when a remote plan is saved and again immediately before a checkpoint, including plans created by an earlier local session.
+## Remote transport and workspace safety
 
-## Workspace tools
+The Streamable HTTP adapter retains canonical allowed-root checks, Host and request-size validation, authentication boundaries, and exact acceptance-command allowlisting. Workspace writes are limited to phase-scoped unified patches and reject protected metadata paths and symbolic links. No generic remote shell tool is exposed.
 
-The remote surface is narrower than a coding-agent shell:
+## Observability and integrations
 
-- bounded file listing and text reads;
-- bounded literal text search;
-- bounded Git diff;
-- unified patches checked with `git apply --check`;
-- active-phase and `allowedScope` enforcement;
-- protected metadata paths and symbolic-link patch rejection.
-
-No arbitrary process-execution tool is exposed. Only checkpoint commands already approved by the server operator can run.
-
-## Code graph
-
-The index stores file nodes, common JavaScript/TypeScript/Python symbols, relative imports, phase dependencies, decisions, and phase-to-file modification edges. Passing checkpoints refresh hashes and structural relationships. This is a continuity graph, not language-server-grade semantic analysis.
+`keep-coding dashboard` binds only to loopback and exposes no mutation route. GitHub integration generates PR prose and commit messages from durable decisions and checkpoints. CI runs the full repository check on pushes and pull requests.
 
 ## Packaging
 
-`scripts/build.mjs` bundles the TypeScript server, HTTP adapter, hook runner, CLI, evaluator, and workspace tools into one ESM executable. Codex uses the local stdio command; normal ChatGPT deployments start the same executable with `mcp-http` and connect the remote endpoint as a custom app.
+`scripts/build.mjs` bundles the server, adapters, hook runner, CLI, evaluator, dashboard, semantic parser, and workspace tools into one ESM executable.
