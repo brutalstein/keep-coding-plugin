@@ -23,6 +23,12 @@ export default tseslint.config(
     },
   },
   {
+    files: ["src/storage/store.ts"],
+    rules: {
+      "@typescript-eslint/no-base-to-string": "off"
+    }
+  },
+  {
     files: ["**/*.mjs", "**/*.js"],
     languageOptions: { globals: { console: "readonly", process: "readonly" } },
     extends: [tseslint.configs.disableTypeChecked],

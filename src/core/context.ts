@@ -14,6 +14,7 @@ export function compileContext(store: ProjectStore, maxChars = DEFAULT_MAX_CHARS
     header(snapshot),
     contractSection(snapshot),
     phaseSection(snapshot),
+    approvalSection(snapshot),
     decisionSection(snapshot),
     failureSection(snapshot),
     checkpointSection(snapshot),
@@ -27,7 +28,7 @@ export function compileContext(store: ProjectStore, maxChars = DEFAULT_MAX_CHARS
 function header(snapshot: ProjectSnapshot): string {
   return [
     "# KEEP CODING ACTIVE",
-    "Use the Keep Coding MCP workflow. Do not declare completion without a passing checkpoint.",
+    "Use the Keep Coding MCP workflow. Do not declare completion without passing checkpoints and the final full-suite gate.",
     `Project root: ${snapshot.project.root}`,
     `Project status: ${snapshot.project.status}`,
     `Plan version: ${snapshot.project.planVersion}`
@@ -43,8 +44,10 @@ function contractSection(snapshot: ProjectSnapshot): string {
     `Deliverables:\n${bullets(contract.deliverables)}`,
     `Constraints:\n${bullets(contract.constraints)}`,
     `Invariants:\n${bullets(contract.invariants)}`,
-    `Done when:\n${bullets(contract.doneWhen)}`
-  ].join("\n");
+    `Done when:\n${bullets(contract.doneWhen)}`,
+    `Critic gate: ${contract.criticGate ?? "advisory"}`,
+    contract.budget ? `Project budget: ${JSON.stringify(contract.budget)}` : ""
+  ].filter(Boolean).join("\n");
 }
 
 function phaseSection(snapshot: ProjectSnapshot): string {
@@ -59,8 +62,14 @@ function phaseSection(snapshot: ProjectSnapshot): string {
     `Allowed scope:\n${bullets(active.allowedScope)}`,
     `Acceptance commands:\n${bullets(active.acceptanceCommands)}`,
     `Attempts: ${active.attempts}/${active.maxAttempts}`,
-    "Complete this phase, call `checkpoint_phase`, repair failures, then continue to the next ready phase."
-  ].join("\n");
+    active.budget ? `Phase budget: ${JSON.stringify(active.budget)}` : "",
+    nextPhaseInstruction(active.status)
+  ].filter(Boolean).join("\n");
+}
+
+function approvalSection(snapshot: ProjectSnapshot): string {
+  const pending = snapshot.approvals.filter((approval) => approval.status === "pending");
+  return pending.length === 0 ? "" : `## Pending human approval\n${pending.map((approval) => `- ${approval.id} [${approval.phaseId}]: ${approval.question}\n  ${approval.details}`).join("\n")}`;
 }
 
 function decisionSection(snapshot: ProjectSnapshot): string {
@@ -75,7 +84,26 @@ function failureSection(snapshot: ProjectSnapshot): string {
 
 function checkpointSection(snapshot: ProjectSnapshot): string {
   const checkpoints = snapshot.checkpoints.slice(-5);
-  return checkpoints.length === 0 ? "" : `## Recent verified checkpoints\n${checkpoints.map((checkpoint) => `- ${checkpoint.phaseId} @ ${checkpoint.gitSha.slice(0, 12)}: ${checkpoint.summary}`).join("\n")}`;
+  return checkpoints.length === 0 ? "" : `## Recent verified checkpoints\n${checkpoints.map((checkpoint) => {
+    const verification = checkpoint.verification;
+    return `- ${checkpoint.phaseId} @ ${(verification.checkpointCommitSha ?? checkpoint.gitSha).slice(0, 12)}: ${checkpoint.summary}; files=${checkpoint.changedFiles.length}, tests=${verification.impactedTests.length}, secrets=${verification.secretFindings.length}`;
+  }).join("\n")}`;
+}
+
+function nextPhaseInstruction(status: string): string {
+  switch (status) {
+    case "AWAITING_APPROVAL":
+      return "Wait for the human response and call `resolve_approval`; do not continue implementation.";
+    case "NEEDS_REVERIFICATION":
+      return "Re-run this phase's acceptance evidence because a later change invalidated the prior checkpoint.";
+    case "FAILED":
+      return "Repair the failure or call `restore_phase`, then restart and checkpoint the phase.";
+    case "BLOCKED":
+    case "BLOCKED_BUDGET":
+      return "Human intervention or a versioned plan amendment is required before continuing.";
+    default:
+      return "Complete this phase, call `checkpoint_phase`, repair failures, then continue to the next ready phase.";
+  }
 }
 
 function fitSections(sections: string[], maxChars: number): string {

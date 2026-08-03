@@ -1,11 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import type { PhaseRecord } from "../src/domain/model.js";
 import { GitRepository } from "../src/core/git.js";
 import { PhaseVerifier } from "../src/core/verifier.js";
-import type { PhaseRecord } from "../src/domain/model.js";
 
 function repository(): string {
   const root = mkdtempSync(path.join(tmpdir(), "keep-coding-git-"));
@@ -20,7 +20,25 @@ function repository(): string {
 }
 
 function phase(scope: string[], commands: string[]): PhaseRecord {
-  return { id: "phase", ordinal: 0, title: "Phase", goal: "Test", status: "IN_PROGRESS", dependencies: [], allowedScope: scope, acceptanceCommands: commands, maxAttempts: 3, attempts: 0, startedAt: null, completedAt: null, baseSha: null, headSha: null, summary: null };
+  return {
+    id: "phase",
+    ordinal: 0,
+    title: "Phase",
+    goal: "Test",
+    status: "IN_PROGRESS",
+    dependencies: [],
+    allowedScope: scope,
+    acceptanceCommands: commands,
+    maxAttempts: 3,
+    attempts: 0,
+    startedAt: null,
+    completedAt: null,
+    baseSha: null,
+    headSha: null,
+    summary: null,
+    planVersion: 1,
+    supersededBy: null
+  };
 }
 
 describe("phase verifier", () => {
@@ -28,7 +46,7 @@ describe("phase verifier", () => {
     const root = repository();
     writeFileSync(path.join(root, "src", "a.js"), "export const a = 2;\n");
     const result = await new PhaseVerifier(2_000).verify(await GitRepository.open(root), phase(["src/**"], ["node --check src/a.js"]));
-    expect(result.passed).toBe(true);
+    expect(result).toMatchObject({ passed: true, secretScanPassed: true, impactedTests: [] });
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -40,5 +58,27 @@ describe("phase verifier", () => {
     expect(result.commands).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
-});
 
+  it("blocks leaked secrets before acceptance commands", async () => {
+    const root = repository();
+    writeFileSync(path.join(root, "src", "a.js"), "export const token = 'ghp_abcdefghijklmnopqrstuvwxyz1234567890';\n");
+    const result = await new PhaseVerifier().verify(await GitRepository.open(root), phase(["src/**"], ["node --version"]));
+    expect(result.secretScanPassed).toBe(false);
+    expect(result.secretFindings[0]?.rule).toBe("github-token");
+    expect(result.commands).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("enforces the tighter project and phase budget", async () => {
+    const root = repository();
+    writeFileSync(path.join(root, "src", "a.js"), "export const a = 2;\n");
+    const limited = { ...phase(["src/**"], ["node --version"]), budget: { maxTokens: 100 } };
+    const result = await new PhaseVerifier().verify(await GitRepository.open(root), limited, undefined, {
+      contract: { goal: "Deliver a verified change", nonGoals: [], constraints: [], deliverables: ["change"], invariants: [], doneWhen: ["checks pass"], budget: { maxTokens: 200 } },
+      usage: { tokens: 101 }
+    });
+    expect(result.budget).toMatchObject({ passed: false, limits: { maxTokens: 100 } });
+    expect(result.commands).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+});

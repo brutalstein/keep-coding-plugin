@@ -1,7 +1,7 @@
 {
   "name": "keep-coding",
-  "version": "0.1.0",
-  "description": "Evidence-gated continuity for long-running Codex projects.",
+  "version": "0.2.0",
+  "description": "Evidence-gated durable memory for long-running coding agents.",
   "type": "module",
   "private": true,
   "engines": {
