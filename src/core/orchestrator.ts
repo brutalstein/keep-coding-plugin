@@ -2,6 +2,7 @@ import type { PhaseRecord, VerificationEvidence } from "../domain/model.js";
 import type { PlatformStore } from "../storage/platform-store.js";
 import { generateCommitMessage } from "../integrations/github.js";
 import { GitRepository } from "./git.js";
+import { indexRepository } from "./indexer.js";
 import { PhaseVerifier } from "./verifier.js";
 
 export class ParallelOrchestrator {
@@ -49,20 +50,34 @@ export class ParallelOrchestrator {
     return { baseSha, worktrees };
   }
 
-  async checkpoint(phaseId: string, summary: string): Promise<{ evidence: VerificationEvidence; mergeSha: string }> {
+  async checkpoint(phaseId: string, summary: string): Promise<{
+    evidence: VerificationEvidence;
+    mergeSha: string;
+    reverificationRequired: string[];
+  }> {
     const record = this.store.getWorktree(phaseId);
     if (!record || record.status !== "active") throw new Error(`active worktree not found for phase ${phaseId}`);
     const phase = this.store.getPhase(phaseId);
     if (!phase) throw new Error(`unknown phase: ${phaseId}`);
+    const contract = this.store.getProject()?.contract ?? {
+      goal: phase.goal, nonGoals: [], constraints: [], deliverables: [phase.goal], invariants: [], doneWhen: phase.acceptanceCommands
+    };
     const isolated = await GitRepository.open(record.path);
-    this.store.markVerifying(phaseId);
     const baseline = this.store.getPhaseBaseline(phaseId);
+    const changedFiles = baseline ? await isolated.changedFilesSince(baseline) : await isolated.changedFiles();
+    const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
+    const impactedTests = this.store.impactedTests(changedFiles);
+    const selectiveCommands = contract.selectiveTests && impactedTests.length > 0
+      ? [contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests.map(shellQuote).join(" "))]
+      : [];
+
+    this.store.markVerifying(phaseId);
     const evidence = await new PhaseVerifier().verify(isolated, { ...phase, status: "VERIFYING" }, {
       ...(baseline ? { baseline } : {}),
+      selectiveCommands,
       budget: this.store.budgetEvidence(phaseId),
-      contract: this.store.getProject()?.contract ?? {
-        goal: phase.goal, nonGoals: [], constraints: [], deliverables: [phase.goal], invariants: [], doneWhen: phase.acceptanceCommands
-      }
+      contract,
+      impactedCompletedPhases
     });
     if (!evidence.passed) {
       this.store.finishVerification(phaseId, summary, evidence);
@@ -73,17 +88,34 @@ export class ParallelOrchestrator {
     const mergeSha = await this.git.mergeWorktree(record.branch);
     evidence.gitSha = mergeSha;
     this.store.finishVerification(phaseId, summary, evidence);
+    await indexRepository(this.store, this.git);
+    const reverificationRequired = this.store.markReverification(
+      impactedCompletedPhases,
+      `Files affected by parallel phase ${phaseId}: ${changedFiles.join(", ")}`,
+      phaseId
+    );
     this.store.setWorktree({ ...record, status: "merged" });
     await this.git.removeWorktree(record.path, record.branch);
-    return { evidence, mergeSha: commitSha === mergeSha ? commitSha : mergeSha };
+    return { evidence, mergeSha: commitSha === mergeSha ? commitSha : mergeSha, reverificationRequired };
   }
 }
 
 function scopesIndependent(left: string[], right: string[]): boolean {
-  const roots = (scope: string): string => scope.replace(/^!/, "").split(/[/*?{[]/, 1)[0] ?? "";
   return left.every((a) => right.every((b) => {
-    const x = roots(a);
-    const y = roots(b);
-    return x !== "" && y !== "" && !x.startsWith(y) && !y.startsWith(x);
+    const x = scopePrefix(a);
+    const y = scopePrefix(b);
+    if (x === "" || y === "") return false;
+    return x !== y && !x.startsWith(`${y}/`) && !y.startsWith(`${x}/`);
   }));
+}
+
+function scopePrefix(scope: string): string {
+  const withoutNegation = scope.replace(/^!/, "").replaceAll("\\", "/");
+  const wildcard = withoutNegation.search(/[*?{[]/);
+  const prefix = wildcard >= 0 ? withoutNegation.slice(0, wildcard) : withoutNegation;
+  return prefix.replace(/\/+$/, "");
+}
+
+function shellQuote(value: string): string {
+  return process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : `'${value.replaceAll("'", "'\\''")}'`;
 }
