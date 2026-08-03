@@ -94,14 +94,16 @@ export class KeepCodingService {
     if (!phase) throw new Error(`unknown phase: ${phaseId}`);
     const baseline = this.store.getPhaseBaseline(phaseId) ?? undefined;
     const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
+    const impactedFiles = expandImpactedFiles(this.store, changedFiles);
     const impactedTests = this.store.impactedTests(changedFiles);
-    const impactedCompletedPhases = this.store.completedPhasesImpactedByFiles(changedFiles, phaseId);
+    const impactedCompletedPhases = this.store.completedPhasesImpactedByFiles(impactedFiles, phaseId);
+    const measuredUsage = withMeasuredWallClock(usage, phase.startedAt);
     this.store.markVerifying(phaseId);
     const verifying = this.store.getPhase(phaseId);
     if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
     const evidence = await new PhaseVerifier().verify(this.git, verifying, baseline, {
       contract: this.store.getProject()?.contract,
-      usage,
+      usage: measuredUsage,
       impactedTests
     });
 
@@ -120,6 +122,7 @@ export class KeepCodingService {
     return {
       phase: updated,
       evidence,
+      impactedFiles,
       impactedCompletedPhases,
       project: this.store.getProject(),
       canRestore: !evidence.passed && this.store.getRestoreSnapshot(phaseId) !== null,
@@ -196,6 +199,21 @@ export class KeepCodingService {
     this.store.appendEvent("project_completion_gate_passed", null, gate ?? { command: null, skipped: true });
     return { project, fullSuiteGate: gate, nextAction: "report_completion" };
   }
+}
+
+export function expandImpactedFiles(store: ProjectStore, changedFiles: string[]): string[] {
+  const impacted = new Set(changedFiles);
+  for (const file of changedFiles) {
+    for (const related of store.getImpact(file, 4).files) impacted.add(related);
+  }
+  return [...impacted].sort();
+}
+
+export function withMeasuredWallClock(usage: BudgetUsage, startedAt: string | null): BudgetUsage {
+  if (usage.wallClockMs !== undefined || !startedAt) return usage;
+  const started = Date.parse(startedAt);
+  if (!Number.isFinite(started)) return usage;
+  return { ...usage, wallClockMs: Math.max(0, Date.now() - started) };
 }
 
 async function runCompletionGate(root: string): Promise<{ command: string; passed: boolean; durationMs: number; output: string } | null> {
