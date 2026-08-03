@@ -1,4 +1,4 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { KeepCodingService } from "../core/service.js";
 
 export interface DashboardHandle {
@@ -10,37 +10,8 @@ export interface DashboardHandle {
 
 export async function startDashboard(projectRoot: string, port = 0, host = "127.0.0.1"): Promise<DashboardHandle> {
   if (!isLoopback(host)) throw new Error("dashboard is loopback-only; use 127.0.0.1, ::1, or localhost");
-  const server = createServer(async (request, response) => {
-    try {
-      response.setHeader("Cache-Control", "no-store");
-      response.setHeader("X-Content-Type-Options", "nosniff");
-      response.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'");
-      if (request.method !== "GET") {
-        response.writeHead(405, { "Content-Type": "application/json; charset=utf-8", Allow: "GET" });
-        response.end(JSON.stringify({ error: "read-only dashboard" }));
-        return;
-      }
-      if (request.url === "/api/status") {
-        const service = await KeepCodingService.open(projectRoot);
-        try {
-          response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
-          response.end(JSON.stringify(service.store.snapshot()));
-        } finally {
-          service.close();
-        }
-        return;
-      }
-      if (request.url === "/" || request.url === "/index.html") {
-        response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        response.end(DASHBOARD_HTML);
-        return;
-      }
-      response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(JSON.stringify({ error: "not found" }));
-    } catch (error) {
-      response.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
-      response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
-    }
+  const server = createServer((request, response) => {
+    void handleRequest(projectRoot, request, response);
   });
   await listen(server, port, host);
   const address = server.address();
@@ -52,6 +23,39 @@ export async function startDashboard(projectRoot: string, port = 0, host = "127.
     url: `http://${displayHost}:${address.port}`,
     close: () => close(server)
   };
+}
+
+async function handleRequest(projectRoot: string, request: IncomingMessage, response: ServerResponse): Promise<void> {
+  try {
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Security-Policy", "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'");
+    if (request.method !== "GET") {
+      response.writeHead(405, { "Content-Type": "application/json; charset=utf-8", Allow: "GET" });
+      response.end(JSON.stringify({ error: "read-only dashboard" }));
+      return;
+    }
+    if (request.url === "/api/status") {
+      const service = await KeepCodingService.open(projectRoot);
+      try {
+        response.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
+        response.end(JSON.stringify(service.store.snapshot()));
+      } finally {
+        service.close();
+      }
+      return;
+    }
+    if (request.url === "/" || request.url === "/index.html") {
+      response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      response.end(DASHBOARD_HTML);
+      return;
+    }
+    response.writeHead(404, { "Content-Type": "application/json; charset=utf-8" });
+    response.end(JSON.stringify({ error: "not found" }));
+  } catch (error) {
+    response.writeHead(500, { "Content-Type": "application/json; charset=utf-8" });
+    response.end(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+  }
 }
 
 function listen(server: Server, port: number, host: string): Promise<void> {
