@@ -1,0 +1,43 @@
+name: Sync generated release files
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/durable-memory-platform
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-generated-release
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/durable-memory-platform
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm install --package-lock-only --ignore-scripts
+      - run: npm run build
+      - name: Commit generated release files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json plugins/keep-coding/dist/keep-coding.mjs
+          if git diff --cached --quiet; then
+            echo "Generated release files are already current."
+            exit 0
+          fi
+          git commit -m "Build Keep Coding 0.2.0 release bundle"
+          git push origin HEAD:agent/durable-memory-platform
