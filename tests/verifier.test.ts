@@ -29,6 +29,7 @@ describe("phase verifier", () => {
     writeFileSync(path.join(root, "src", "a.js"), "export const a = 2;\n");
     const result = await new PhaseVerifier(2_000).verify(await GitRepository.open(root), phase(["src/**"], ["node --check src/a.js"]));
     expect(result.passed).toBe(true);
+    expect(result.secretScan).toMatchObject({ passed: true, findings: [] });
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -40,5 +41,27 @@ describe("phase verifier", () => {
     expect(result.commands).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
-});
 
+  it("blocks a checkpoint containing a secret before commands execute", async () => {
+    const root = repository();
+    writeFileSync(path.join(root, "src", "a.js"), "export const token = 'ghp_abcdefghijklmnopqrstuvwxyz123456';\n");
+    const result = await new PhaseVerifier().verify(await GitRepository.open(root), phase(["src/**"], ["node --version"]));
+    expect(result.passed).toBe(false);
+    expect(result.secretScan.passed).toBe(false);
+    expect(result.secretScan.findings).toEqual([
+      expect.objectContaining({ ruleId: "github-token", file: "src/a.js", line: 1 })
+    ]);
+    expect(result.secretScan.findings[0]?.preview).not.toContain("abcdefghijklmnopqrstuvwxyz");
+    expect(result.commands).toEqual([]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  it("scans untracked files and ignores ordinary source text", async () => {
+    const root = repository();
+    writeFileSync(path.join(root, "src", "new.js"), "export const message = 'ordinary text';\n");
+    const result = await new PhaseVerifier().verify(await GitRepository.open(root), phase(["src/**"], ["node --check src/new.js"]));
+    expect(result.passed).toBe(true);
+    expect(result.secretScan.scannedFiles).toContain("src/new.js");
+    rmSync(root, { recursive: true, force: true });
+  });
+});
