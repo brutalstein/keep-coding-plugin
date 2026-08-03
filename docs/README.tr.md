@@ -1,64 +1,49 @@
 # Keep Coding — Türkçe
 
-Keep Coding, büyük bir proje promptunu kalıcı ve doğrulama kapılı bir geliştirme akışına dönüştürür. V1 ürün yaklaşımında mod seçimi yoktur; tek varsayılan akış kullanılır.
+Keep Coding, uzun süren coding-agent çalışmalarını kalıcı proje hafızası ve gerçek doğrulama kapılarıyla yöneten tek-akışlı bir platformdur. Kullanıcıya mod seçtirmez; kullanılmayan yeni özellikler mevcut v0.1 davranışına geri düşer.
 
-İki yüzeyi destekler:
+## Sağlanan yetenekler
 
-- **Codex plugini:** skill, lifecycle hook'ları, yerel stdio MCP server ve context geri yükleme.
-- **Normal ChatGPT uygulaması:** uzaktan erişilen MCP endpoint'i ve sınırlandırılmış repo okuma/arama/diff/patch araçları.
+- Çalışma başladıktan sonra kanıtları silmeden sürümlü plan değişikliği
+- Her başarılı faz için atomik Git commit ve kapsamlı baseline geri alma
+- Bağımsız fazların izole Git worktree'lerde paralel yürütülmesi
+- Parser/AST tabanlı semantic graph, etki alanı analizi ve etkilenen test seçimi
+- Önceden tamamlanan fazların değişiklik etkisine göre tekrar doğrulanması
+- Zorunlu secret scan ve token, maliyet, zaman bütçeleri
+- Deterministik ana doğrulama ve isteğe bağlı bağımsız critic
+- İnsan onayı gereken kararlar için gerçek bekleme durumu
+- Açıkça etkinleştirilen projeler arası playbook hafızası
+- Yalnızca loopback üzerinde çalışan salt-okunur dashboard
+- Codex, Claude-benzeri hook ve generic polling adapter'ları
+- CI ve kalıcı kararlardan üretilen PR açıklaması
 
-İki yüzey de proje sözleşmesini, fazları, kararları, hataları, checkpoint kanıtlarını ve codebase graph'ını hedef repodaki `.keep-coding/state.db` içinde paylaşır.
-
-## Codex kurulumu
+## Geliştirme
 
 ```bash
 npm ci
 npm run check
 ```
 
-Codex CLI içinde `/plugins` ekranını aç, bu GitHub reposunu marketplace olarak ekle, **Keep Coding** pluginini kur, hook'ları inceleyip güven ver ve yeni bir oturum başlat.
+## Temel kural
 
-## Normal ChatGPT sohbetinde kullanım
+Bir faz; dosya kapsamı, secret taraması, bütçe, seçilmiş testler, acceptance komutları ve yapılandırılmış critic kapıları geçmeden `COMPLETED` olmaz. Proje tamamlanırken yapılandırılmış full test suite tekrar çalışır. Plan değişiklikleri yalnızca `amend_plan` ile yapılır ve event geçmişine yazılır.
 
-ChatGPT yerel stdio MCP server'a doğrudan bağlanamaz. Server'ı uzaktan erişilebilir hâle getirmek gerekir; geliştirici bilgisayarı veya özel ağ için OpenAI Secure MCP Tunnel tercih edilmelidir.
-
-```bash
-export KEEP_CODING_ALLOWED_ROOTS="/home/me/projects"
-export KEEP_CODING_ALLOWED_COMMANDS_JSON='["npm run check","npm test","git diff --check"]'
-node plugins/keep-coding/dist/keep-coding.mjs mcp-http
-```
-
-Varsayılan endpoint `http://127.0.0.1:8787/mcp` olur. Ardından uygun ChatGPT çalışma alanında geliştirici modunu açıp bu endpoint'i özel uygulama olarak ekle, araçları tarat ve izinleri incele.
-
-Önemli sınırlar:
-
-- Normal ChatGPT yüzeyinde Codex lifecycle hook'ları çalışmaz; uygulamayı sohbette seçmen veya açıkça çağırman gerekir.
-- `apply_patch` yalnızca `IN_PROGRESS` fazında ve fazın `allowedScope` alanı içinde çalışır.
-- Server yalnızca `KEEP_CODING_ALLOWED_ROOTS` altındaki canonical Git repo yollarını açar.
-- Faz test komutları yalnızca operatörün `KEEP_CODING_ALLOWED_COMMANDS_JSON` içinde birebir izin verdiği komutlar olabilir.
-- Genel amaçlı uzak shell aracı yoktur.
-
-3 Ağustos 2026 itibarıyla tam MCP yazma/değiştirme eylemleri ChatGPT Business, Enterprise ve Edu planlarında beta olarak sunulmaktadır. Pro özel MCP uygulamalarını read/fetch izinleriyle bağlayabilir; `apply_patch` gibi yazma araçları için yeterli değildir. Güncel plan ve arayüz durumunu her kurulumdan önce resmî OpenAI dokümanından doğrula.
-
-Ayrıntılı kurulum ve güvenlik açıklaması: [CHATGPT_APP.md](CHATGPT_APP.md).
-
-## Kullanım akışı
+Temel MCP sırası:
 
 1. `initialize_project`
 2. `save_plan`
-3. hazır faz için `start_phase`
-4. repo araçlarıyla inceleme ve `apply_patch`
+3. `start_phase`
+4. kapsam içi uygulama ve karar kaydı
 5. `checkpoint_phase`
-6. tüm fazlar geçince `complete_project`
+6. gerekiyorsa `amend_plan`, `resolve_approval` veya tekrar doğrulama
+7. tüm fazlar geçince `complete_project`
 
-Test/lint/build kanıtı geçmeden faz tamamlanmaz. Başarısız yöntemler kaydedilir ve sonraki denemelerde tekrar edilmemesi için context'e geri yüklenir.
+Paralel fazlar yalnızca `parallelSafe` olarak işaretlenmiş, kapsam kökleri bağımsız ve aynı anda `READY` olan fazlar için `prepare_parallel_phases` ile açılır.
 
-## Başarıyı ölçmek
-
-`examples/keep-coding.eval.example.json` dosyasını kopyala; baseline ve Keep Coding koşularında model, prompt, commit, izinler ve verifier komutlarını eşit tut. Ardından:
+Dashboard:
 
 ```bash
-node plugins/keep-coding/dist/keep-coding.mjs eval ./keep-coding.eval.json
+keep-coding dashboard /proje/yolu
 ```
 
-Araç başarı oranlarını, Wilson %95 güven aralıklarını, eşlenmiş farkı ve exact McNemar p-değerini üretir.
+Varsayılan adres yalnızca `127.0.0.1` üzerindedir. Normal ChatGPT için bounded HTTP MCP kurulumu [CHATGPT_APP.md](CHATGPT_APP.md), mimari ayrıntılar [ARCHITECTURE.md](ARCHITECTURE.md) dosyasındadır.
