@@ -1,9 +1,13 @@
-import type { ProjectSnapshot } from "../domain/model.js";
-import type { PlatformStore } from "../storage/platform-store.js";
+import type { GraphNode, ProjectSnapshot } from "../domain/model.js";
 
 const DEFAULT_MAX_CHARS = 12_000;
 
-export function compileContext(store: PlatformStore, maxChars = DEFAULT_MAX_CHARS): string {
+export interface ContextStore {
+  snapshot(): ProjectSnapshot;
+  searchGraph(terms: string[], limit: number): GraphNode[];
+}
+
+export function compileContext(store: ContextStore, maxChars = DEFAULT_MAX_CHARS): string {
   const snapshot = store.snapshot();
   const active = snapshot.project.currentPhaseId
     ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) ?? null
