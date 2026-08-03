@@ -1,4 +1,3 @@
-import { minimatch } from "minimatch";
 import type { PhaseRecord } from "../domain/model.js";
 import type { ProjectStore } from "../storage/store.js";
 import type { GitRepository, WorktreeRecord } from "./git.js";
@@ -76,10 +75,10 @@ function independentScopes(left: PhaseRecord, right: PhaseRecord): boolean {
 function patternsMayOverlap(left: string, right: string): boolean {
   const leftPrefix = staticPrefix(left);
   const rightPrefix = staticPrefix(right);
-  if (leftPrefix && rightPrefix && !leftPrefix.startsWith(rightPrefix) && !rightPrefix.startsWith(leftPrefix)) return false;
-  return minimatch(leftPrefix || rightPrefix || "sentinel", left, { dot: true }) ||
-    minimatch(leftPrefix || rightPrefix || "sentinel", right, { dot: true }) ||
-    leftPrefix === rightPrefix;
+  if (!leftPrefix || !rightPrefix) return true;
+  return leftPrefix === rightPrefix ||
+    leftPrefix.startsWith(`${rightPrefix}/`) ||
+    rightPrefix.startsWith(`${leftPrefix}/`);
 }
 
 function staticPrefix(pattern: string): string {
