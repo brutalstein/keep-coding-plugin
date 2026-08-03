@@ -31,7 +31,7 @@ npm ci
 npm run check
 ```
 
-The committed distributable is `plugins/keep-coding/dist/keep-coding.mjs`.
+The committed distributable is `plugins/keep-coding/dist/keep-coding.mjs`. Trusted internal `agent/*` pull requests regenerate and synchronize this bundle only after the full verification pipeline passes.
 
 ## CLI
 
