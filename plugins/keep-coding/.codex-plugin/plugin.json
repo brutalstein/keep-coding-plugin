@@ -1,18 +1,18 @@
 {
   "name": "keep-coding",
-  "version": "0.1.0",
-  "description": "Evidence-gated continuity for long-running Codex projects.",
+  "version": "0.2.0",
+  "description": "Evidence-gated durable memory for long-running coding agents.",
   "author": {
     "name": "Keep Coding contributors"
   },
   "license": "MIT",
-  "keywords": ["codex", "agents", "project-memory", "verification", "mcp"],
+  "keywords": ["codex", "agents", "project-memory", "verification", "mcp", "semantic-impact"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Keep Coding",
-    "shortDescription": "Keep large Codex projects coherent and verified.",
-    "longDescription": "Turns large project prompts into a durable contract, dependency-aware phases, evidence-backed checkpoints, and resumable context.",
+    "shortDescription": "Keep large agent projects coherent and verified.",
+    "longDescription": "Turns large project prompts into adaptive durable contracts, dependency-aware phases, semantic impact analysis, evidence-backed checkpoints, approvals, budgets, and resumable cross-runtime context.",
     "developerName": "Keep Coding contributors",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write"],
