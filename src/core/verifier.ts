@@ -21,9 +21,9 @@ const execFileAsync = promisify(execFile);
 const MAX_OUTPUT = 8_000;
 
 export interface VerificationOptions {
-  contract?: ProjectContract | null;
-  usage?: BudgetUsage;
-  impactedTests?: string[];
+  contract?: ProjectContract | null | undefined;
+  usage?: BudgetUsage | undefined;
+  impactedTests?: string[] | undefined;
 }
 
 export class PhaseVerifier {
