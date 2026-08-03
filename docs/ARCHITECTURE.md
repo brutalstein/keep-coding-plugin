@@ -13,7 +13,7 @@ Keep Coding is single-workflow and local-first, with an optional remote MCP adap
 | Workspace tools | Read/search/diff and apply phase-scoped patches | Escape the Git root or bypass phase scope |
 | Service | Coordinate Git, graph indexing, storage, workspace, and verification | Bypass the state machine |
 | Store | Persist contracts, phases, events, evidence, and graph | Execute shell commands |
-| Verifier | Enforce phase scope and execute declared checks | Promote phases directly |
+| Verifier | Enforce phase scope, scan changed files for secrets, and execute declared checks | Promote phases directly |
 | Evaluator | Run controlled paired experiments | Score subjective quality internally |
 
 ## State machine
@@ -23,6 +23,17 @@ A project moves through `PLANNING → ACTIVE → READY_TO_COMPLETE → COMPLETED
 Dependent phases become `READY` only in the same database transaction that records a passing checkpoint. Completion is rejected unless all phases are `COMPLETED`.
 
 At first phase start, Keep Coding stores a content-hash snapshot of the working tree. Scope verification compares against that snapshot, not `HEAD`, so pre-existing edits and files changed by earlier verified phases do not contaminate the current phase.
+
+## Verification pipeline
+
+Every checkpoint runs the following gates in order:
+
+1. compute the changed-file set from the phase baseline;
+2. enforce the phase's declared `allowedScope` patterns;
+3. scan every changed text file for private-key markers, provider token formats, suspicious secret assignments, and high-entropy credential candidates;
+4. execute the phase's declared acceptance commands only when scope and secret scanning pass.
+
+Secret scanning is an invariant rather than a plan option. A phase author cannot disable it or omit it from `acceptanceCommands`. Binary files and text files larger than 2 MiB are skipped to keep verification bounded. Findings store a rule identifier, path, line, non-reversible fingerprint, and redacted preview; raw secret values are never persisted in checkpoint evidence.
 
 ## Persistence
 

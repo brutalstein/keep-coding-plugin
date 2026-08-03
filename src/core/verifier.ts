@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import { minimatch } from "minimatch";
 import type { CommandEvidence, PhaseRecord, VerificationEvidence } from "../domain/model.js";
 import type { GitRepository } from "./git.js";
+import { scanChangedFiles } from "./secret-scan.js";
 
 const execAsync = promisify(exec);
 const MAX_OUTPUT = 8_000;
@@ -15,8 +16,9 @@ export class PhaseVerifier {
     const scopeViolations = phase.allowedScope.length === 0
       ? []
       : changedFiles.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false })));
+    const secretScan = await scanChangedFiles(git.root, changedFiles);
     const commands: CommandEvidence[] = [];
-    if (scopeViolations.length === 0) {
+    if (scopeViolations.length === 0 && secretScan.passed) {
       for (const command of phase.acceptanceCommands) {
         const evidence = await this.runCommand(command, git.root);
         commands.push(evidence);
@@ -25,10 +27,11 @@ export class PhaseVerifier {
     }
     const scopePassed = scopeViolations.length === 0;
     return {
-      passed: scopePassed && commands.length === phase.acceptanceCommands.length && commands.every((command) => command.passed),
+      passed: scopePassed && secretScan.passed && commands.length === phase.acceptanceCommands.length && commands.every((command) => command.passed),
       scopePassed,
       scopeViolations,
       changedFiles,
+      secretScan,
       commands,
       diffHash: await git.diffHash(),
       gitSha: await git.headSha()
