@@ -5,7 +5,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FailureRecord, PhaseDefinition, ProjectContract } from "../domain/model.js";
 
-interface Row extends Record<string, unknown> {}
+type Row = Record<string, unknown>;
 
 export interface PlaybookSuggestion {
   id: string;
@@ -20,14 +20,14 @@ export interface PlaybookSuggestion {
 export class PlaybookStore {
   private readonly db: DatabaseSync | null;
 
-  constructor(enabled = process.env.KEEP_CODING_PLAYBOOK === "1") {
+  constructor(enabled = process.env.KEEP_CODING_PLAYBOOK === "1", databasePath?: string) {
     if (!enabled) {
       this.db = null;
       return;
     }
-    const directory = path.join(os.homedir(), ".keep-coding");
-    mkdirSync(directory, { recursive: true });
-    this.db = new DatabaseSync(path.join(directory, "playbook.db"));
+    const target = databasePath ?? path.join(os.homedir(), ".keep-coding", "playbook.db");
+    mkdirSync(path.dirname(target), { recursive: true });
+    this.db = new DatabaseSync(target);
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA busy_timeout = 5000;
