@@ -13,15 +13,15 @@ export type PhaseStatus =
   | "COMPLETED";
 
 export interface BudgetLimits {
-  maxTokens?: number;
-  maxCostUsd?: number;
-  maxWallClockMs?: number;
+  maxTokens?: number | undefined;
+  maxCostUsd?: number | undefined;
+  maxWallClockMs?: number | undefined;
 }
 
 export interface BudgetUsage {
-  tokens?: number;
-  costUsd?: number;
-  wallClockMs?: number;
+  tokens?: number | undefined;
+  costUsd?: number | undefined;
+  wallClockMs?: number | undefined;
 }
 
 export interface ProjectContract {
@@ -31,8 +31,8 @@ export interface ProjectContract {
   deliverables: string[];
   invariants: string[];
   doneWhen: string[];
-  budget?: BudgetLimits;
-  criticGate?: "disabled" | "advisory" | "blocking";
+  budget?: BudgetLimits | undefined;
+  criticGate?: "disabled" | "advisory" | "blocking" | undefined;
 }
 
 export interface PhaseDefinition {
@@ -43,8 +43,8 @@ export interface PhaseDefinition {
   allowedScope: string[];
   acceptanceCommands: string[];
   maxAttempts: number;
-  budget?: BudgetLimits;
-  requiresApproval?: boolean;
+  budget?: BudgetLimits | undefined;
+  requiresApproval?: boolean | undefined;
 }
 
 export interface PhaseRecord extends PhaseDefinition {
@@ -74,8 +74,8 @@ export interface ProjectRecord {
 
 export interface PlanAmendment {
   reason: string;
-  addPhases?: PhaseDefinition[];
-  supersedePhaseIds?: string[];
+  addPhases?: PhaseDefinition[] | undefined;
+  supersedePhaseIds?: string[] | undefined;
 }
 
 export interface DecisionRecord {
