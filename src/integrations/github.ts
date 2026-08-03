@@ -11,6 +11,7 @@ export function generatePullRequestDescription(snapshot: ProjectSnapshot): strin
     ...checkpoint.verification.selectiveCommands,
     ...checkpoint.verification.commands
   ]).filter((command) => !command.passed);
+  const impactedTests = [...new Set(latestCheckpoints.flatMap((checkpoint) => checkpoint.verification.impactedTests))].sort();
 
   return [
     `## Summary`,
@@ -31,6 +32,7 @@ export function generatePullRequestDescription(snapshot: ProjectSnapshot): strin
     "",
     `- Secret findings in recorded checkpoints: ${secretFindings}`,
     `- Failed recorded commands: ${failedChecks.length}`,
+    impactedTests.length > 0 ? `- Impacted tests: ${impactedTests.map((test) => `\`${test}\``).join(", ")}` : "- Impacted tests: none recorded",
     "",
     "## Decisions",
     decisions.length > 0 ? decisions.map((decision) => `- **${decision.title}:** ${decision.rationale}`).join("\n") : "- No durable decisions recorded.",
