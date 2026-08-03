@@ -93,11 +93,21 @@ describe("critic adapter", () => {
     });
   });
 
-  it("rejects malformed command configuration", async () => {
+  it("records malformed command configuration instead of throwing", async () => {
     process.env.KEEP_CODING_CRITIC_COMMAND_JSON = JSON.stringify([process.execPath, 42]);
-    await expect(runCritic({ ...input, contract: contract("advisory") })).rejects.toThrow(/JSON string array/);
+    await expect(runCritic({ ...input, contract: contract("advisory") })).resolves.toMatchObject({
+      configured: false,
+      passed: false,
+      blocking: false,
+      findings: ["The advisory critic was skipped because its command configuration is invalid."]
+    });
 
     process.env.KEEP_CODING_CRITIC_COMMAND_JSON = "{}";
-    await expect(runCritic({ ...input, contract: contract("advisory") })).rejects.toThrow(/JSON string array/);
+    await expect(runCritic({ ...input, contract: contract("blocking") })).resolves.toMatchObject({
+      configured: false,
+      passed: false,
+      blocking: true,
+      findings: ["Fix KEEP_CODING_CRITIC_COMMAND_JSON before the checkpoint can pass."]
+    });
   });
 });
