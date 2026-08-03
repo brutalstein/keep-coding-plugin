@@ -13,8 +13,8 @@ function repository(): string {
   execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
   mkdirSync(path.join(root, "src", "a"), { recursive: true });
   mkdirSync(path.join(root, "src", "b"), { recursive: true });
-  writeFileSync(path.join(root, "src", "a", "value.js"), "export const valueA = 1;\n");
-  writeFileSync(path.join(root, "src", "b", "value.js"), "export const valueB = 1;\n");
+  writeFileSync(path.join(root, "src", "a", "value.js"), "const valueA = 1;\n");
+  writeFileSync(path.join(root, "src", "b", "value.js"), "const valueB = 1;\n");
   execFileSync("git", ["add", "."], { cwd: root });
   execFileSync("git", ["commit", "-qm", "initial"], { cwd: root });
   return root;
@@ -74,7 +74,7 @@ describe("evidence-gated parallel phase merges", () => {
     const featureA = prepared.find((workspace) => workspace.phaseId === "feature-a")!;
     const featureB = prepared.find((workspace) => workspace.phaseId === "feature-b")!;
     try {
-      commit(featureA, "src/a/value.js", "export const valueA = 2;\n");
+      commit(featureA, "src/a/value.js", "const valueA = 2;\n");
       const result = await service.mergeParallelPhase("feature-a", "Implement feature A");
       expect(result).toMatchObject({ merged: true, phase: { status: "COMPLETED" }, evidence: { passed: true } });
       expect(readFileSync(path.join(root, "src", "a", "value.js"), "utf8")).toContain("valueA = 2");
@@ -96,7 +96,7 @@ describe("evidence-gated parallel phase merges", () => {
     const featureA = prepared.find((workspace) => workspace.phaseId === "feature-a")!;
     const featureB = prepared.find((workspace) => workspace.phaseId === "feature-b")!;
     try {
-      commit(featureA, "src/a/value.js", "export const = ;\n");
+      commit(featureA, "src/a/value.js", "const = ;\n");
       const result = await service.mergeParallelPhase("feature-a", "Broken feature A");
       expect(result).toMatchObject({ merged: false, phase: { status: "FAILED" }, evidence: { passed: false } });
       expect(readFileSync(path.join(root, "src", "a", "value.js"), "utf8")).toContain("valueA = 1");
