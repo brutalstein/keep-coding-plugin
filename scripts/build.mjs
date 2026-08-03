@@ -11,7 +11,9 @@ await build({
   format: "esm",
   target: "node22",
   sourcemap: true,
-  banner: { js: "#!/usr/bin/env node" },
+  banner: {
+    js: "#!/usr/bin/env node\nimport { createRequire as __keepCodingCreateRequire } from 'node:module';\nconst require = __keepCodingCreateRequire(import.meta.url);"
+  },
   external: ["node:sqlite"]
 });
 await chmod(outfile, 0o755);
