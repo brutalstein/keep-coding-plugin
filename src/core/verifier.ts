@@ -26,6 +26,13 @@ export interface VerificationOptions {
   impactedTests?: string[] | undefined;
 }
 
+interface VerificationInput {
+  changedFiles: string[];
+  diff: string;
+  diffHash: string;
+  gitSha: string;
+}
+
 export class PhaseVerifier {
   constructor(private readonly commandTimeoutMs = 120_000) {}
 
@@ -35,13 +42,40 @@ export class PhaseVerifier {
     baseline?: Record<string, string>,
     options: VerificationOptions = {}
   ): Promise<VerificationEvidence> {
-    const changedFiles = baseline ? await git.changedFilesSince(baseline) : await git.changedFiles();
+    return this.verifyInput(git, phase, {
+      changedFiles: baseline ? await git.changedFilesSince(baseline) : await git.changedFiles(),
+      diff: await git.diffText(),
+      diffHash: await git.diffHash(),
+      gitSha: await git.headSha()
+    }, options);
+  }
+
+  async verifyCommittedRange(
+    git: GitRepository,
+    phase: PhaseRecord,
+    baseSha: string,
+    options: VerificationOptions = {}
+  ): Promise<VerificationEvidence> {
+    if (!await git.isClean()) throw new Error("parallel worktree must be clean; commit phase changes before verification");
+    return this.verifyInput(git, phase, {
+      changedFiles: await git.changedFilesBetween(baseSha),
+      diff: await git.diffTextBetween(baseSha),
+      diffHash: await git.diffHashBetween(baseSha),
+      gitSha: await git.headSha()
+    }, options);
+  }
+
+  private async verifyInput(
+    git: GitRepository,
+    phase: PhaseRecord,
+    input: VerificationInput,
+    options: VerificationOptions
+  ): Promise<VerificationEvidence> {
     const scopeViolations = phase.allowedScope.length === 0
       ? []
-      : changedFiles.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false })));
+      : input.changedFiles.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false })));
     const scopePassed = scopeViolations.length === 0;
-    const diff = await git.diffText();
-    const secretScan = scanUnifiedDiff(diff);
+    const secretScan = scanUnifiedDiff(input.diff);
     const budget = evaluateBudget(mergeBudgets(options.contract?.budget, phase.budget), options.usage ?? {});
     const impactedTests = [...new Set(options.impactedTests ?? [])].sort();
     const selectiveCommands: CommandEvidence[] = [];
@@ -62,8 +96,8 @@ export class PhaseVerifier {
     const critic = await runCritic({
       contract: options.contract ?? null,
       phase,
-      diff,
-      changedFiles
+      diff: input.diff,
+      changedFiles: input.changedFiles
     });
     const deterministicPassed =
       scopePassed &&
@@ -78,7 +112,7 @@ export class PhaseVerifier {
       passed: deterministicPassed && criticPassed,
       scopePassed,
       scopeViolations,
-      changedFiles,
+      changedFiles: input.changedFiles,
       commands,
       selectiveCommands,
       impactedTests,
@@ -86,8 +120,8 @@ export class PhaseVerifier {
       secretFindings: secretScan.findings,
       budget,
       critic,
-      diffHash: await git.diffHash(),
-      gitSha: await git.headSha(),
+      diffHash: input.diffHash,
+      gitSha: input.gitSha,
       checkpointCommitSha: null
     };
   }
