@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import path from "node:path";
 
@@ -86,10 +87,14 @@ export class GitRepository {
   async createWorktree(phaseId: string, baseSha: string): Promise<{ path: string; branch: string }> {
     const safe = phaseId.replace(/[^a-z0-9-]/gi, "-").toLowerCase();
     const shortSha = baseSha.slice(0, 8);
+    const repositoryKey = createHash("sha256").update(this.root).digest("hex").slice(0, 12);
     const branch = `keep-coding/${safe}-${shortSha}`;
-    const worktreePath = path.join(this.root, ".keep-coding", "worktrees", `${safe}-${shortSha}`);
+    const worktreePath = path.join(tmpdir(), "keep-coding-worktrees", repositoryKey, `${safe}-${shortSha}`);
     await mkdir(path.dirname(worktreePath), { recursive: true });
+    await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd: this.root, timeout: 30_000 }).catch(() => undefined);
     await rm(worktreePath, { recursive: true, force: true });
+    await execFileAsync("git", ["branch", "-D", branch], { cwd: this.root, timeout: 30_000 }).catch(() => undefined);
+    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 30_000 }).catch(() => undefined);
     await execFileAsync("git", ["worktree", "add", "-b", branch, worktreePath, baseSha], { cwd: this.root, timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
     return { path: worktreePath, branch };
   }
