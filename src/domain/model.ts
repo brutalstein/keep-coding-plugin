@@ -9,6 +9,7 @@ export type PhaseStatus =
   | "BLOCKED_BUDGET"
   | "AWAITING_APPROVAL"
   | "NEEDS_REVERIFICATION"
+  | "SUPERSEDED"
   | "COMPLETED";
 
 export interface BudgetLimits {
