@@ -73,11 +73,26 @@ export interface CommandEvidence {
   timedOut: boolean;
 }
 
+export interface SecretFinding {
+  ruleId: string;
+  file: string;
+  line: number;
+  fingerprint: string;
+  preview: string;
+}
+
+export interface SecretScanEvidence {
+  passed: boolean;
+  scannedFiles: string[];
+  findings: SecretFinding[];
+}
+
 export interface VerificationEvidence {
   passed: boolean;
   scopePassed: boolean;
   scopeViolations: string[];
   changedFiles: string[];
+  secretScan: SecretScanEvidence;
   commands: CommandEvidence[];
   diffHash: string;
   gitSha: string;
