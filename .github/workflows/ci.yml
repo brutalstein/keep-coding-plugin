@@ -5,7 +5,7 @@ on:
   pull_request:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   validate:
@@ -24,3 +24,14 @@ jobs:
           name: keep-coding-dist
           path: plugins/keep-coding/dist/keep-coding.mjs
           if-no-files-found: error
+      - name: Commit validated distributable
+        if: github.event_name == 'push' && github.actor != 'github-actions[bot]'
+        run: |
+          if git diff --quiet -- plugins/keep-coding/dist/keep-coding.mjs; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugins/keep-coding/dist/keep-coding.mjs
+          git commit -m "Build validated distributable"
+          git push
