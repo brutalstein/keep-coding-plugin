@@ -42,10 +42,14 @@ export class ParallelPhaseOrchestrator {
     }
   }
 
-  async merge(phaseId: string): Promise<{ phaseId: string; gitSha: string }> {
+  prepared(phaseId: string): WorktreeRecord {
     const encoded = this.store.getMetadata(`parallel_worktree:${phaseId}`);
     if (!encoded) throw new Error(`no prepared worktree for phase ${phaseId}`);
-    const record = parseWorktree(encoded);
+    return parseWorktree(encoded);
+  }
+
+  async merge(phaseId: string): Promise<{ phaseId: string; gitSha: string }> {
+    const record = this.prepared(phaseId);
     const gitSha = await this.git.mergePhaseWorktree(record);
     this.store.setMetadata(`parallel_worktree:${phaseId}`, "");
     this.store.appendEvent("parallel_worktree_merged", phaseId, { branch: record.branch, gitSha });
@@ -53,9 +57,7 @@ export class ParallelPhaseOrchestrator {
   }
 
   async discard(phaseId: string): Promise<{ phaseId: string; discarded: true }> {
-    const encoded = this.store.getMetadata(`parallel_worktree:${phaseId}`);
-    if (!encoded) throw new Error(`no prepared worktree for phase ${phaseId}`);
-    const record = parseWorktree(encoded);
+    const record = this.prepared(phaseId);
     await this.git.removePhaseWorktree(record);
     this.store.setMetadata(`parallel_worktree:${phaseId}`, "");
     this.store.appendEvent("parallel_worktree_discarded", phaseId, { branch: record.branch });
