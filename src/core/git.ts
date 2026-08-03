@@ -76,6 +76,20 @@ export class GitRepository {
       .sort();
   }
 
+  async isClean(): Promise<boolean> {
+    return (await this.changedFiles()).length === 0;
+  }
+
+  async changedFilesBetween(base: string, head = "HEAD"): Promise<string[]> {
+    const { stdout } = await execFileAsync("git", ["diff", "--name-only", "-z", `${base}..${head}`], {
+      cwd: this.root,
+      encoding: "buffer",
+      timeout: 30_000,
+      maxBuffer: 32 * 1024 * 1024
+    });
+    return [...new Set(splitNull(stdout))].filter(isProjectFile).sort();
+  }
+
   async allFiles(): Promise<string[]> {
     const { stdout } = await execFileAsync("git", ["ls-files", "-co", "--exclude-standard", "-z"], {
       cwd: this.root,
@@ -105,10 +119,27 @@ export class GitRepository {
     return [tracked, ...untrackedParts].filter(Boolean).join("\n").slice(0, maxBytes);
   }
 
+  async diffTextBetween(base: string, head = "HEAD", maxBytes = 4 * 1024 * 1024): Promise<string> {
+    const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff", "--unified=3", `${base}..${head}`], {
+      cwd: this.root,
+      encoding: "buffer",
+      timeout: 30_000,
+      maxBuffer: Math.max(maxBytes, 1024 * 1024)
+    });
+    return stdout.subarray(0, maxBytes).toString("utf8");
+  }
+
   async diffHash(): Promise<string> {
     const hash = createHash("sha256");
     hash.update(await this.diffText(64 * 1024 * 1024));
     for (const file of await this.changedFiles()) hash.update(`\0${file}`);
+    return hash.digest("hex");
+  }
+
+  async diffHashBetween(base: string, head = "HEAD"): Promise<string> {
+    const hash = createHash("sha256");
+    hash.update(await this.diffTextBetween(base, head, 64 * 1024 * 1024));
+    for (const file of await this.changedFilesBetween(base, head)) hash.update(`\0${file}`);
     return hash.digest("hex");
   }
 
@@ -189,6 +220,7 @@ export class GitRepository {
     const parent = path.join(path.dirname(this.root), `.${path.basename(this.root)}-keep-coding-worktrees`);
     const target = path.join(parent, safe);
     await mkdir(parent, { recursive: true });
+    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 15_000 }).catch(() => undefined);
     await rm(target, { recursive: true, force: true });
     const baseSha = await this.headSha();
     const branchExists = await execFileAsync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: this.root })
@@ -199,19 +231,28 @@ export class GitRepository {
   }
 
   async mergePhaseWorktree(record: WorktreeRecord): Promise<string> {
-    await execFileAsync("git", ["merge", "--no-ff", "--no-edit", record.branch], {
-      cwd: this.root,
-      encoding: "utf8",
-      timeout: 120_000,
-      maxBuffer: 32 * 1024 * 1024
-    });
-    await this.removePhaseWorktree(record);
-    return this.headSha();
+    try {
+      await execFileAsync("git", ["merge", "--no-ff", "--no-edit", record.branch], {
+        cwd: this.root,
+        encoding: "utf8",
+        timeout: 120_000,
+        maxBuffer: 32 * 1024 * 1024
+      });
+    } catch (error) {
+      await execFileAsync("git", ["merge", "--abort"], { cwd: this.root, timeout: 30_000 }).catch(() => undefined);
+      throw error;
+    }
+    const sha = await this.headSha();
+    await this.removePhaseWorktree(record, true);
+    return sha;
   }
 
-  async removePhaseWorktree(record: WorktreeRecord): Promise<void> {
+  async removePhaseWorktree(record: WorktreeRecord, deleteBranch = true): Promise<void> {
     await execFileAsync("git", ["worktree", "remove", "--force", record.path], { cwd: this.root, timeout: 60_000 }).catch(() => undefined);
     await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 15_000 }).catch(() => undefined);
+    if (deleteBranch) {
+      await execFileAsync("git", ["branch", "-D", record.branch], { cwd: this.root, timeout: 15_000 }).catch(() => undefined);
+    }
   }
 
   private async untrackedFiles(): Promise<string[]> {
