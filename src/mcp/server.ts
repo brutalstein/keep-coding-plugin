@@ -58,6 +58,7 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
         "Use amend_plan for versioned changes after implementation begins; never overwrite completed evidence.",
         "Every checkpoint enforces scope, secret scanning, budgets, deterministic commands, and optional critic evidence.",
         "Use request_approval for material human decisions and prepare_parallel_phases only for independent ready scopes.",
+        "Commit all worktree changes before merge_parallel_phase; the tool verifies the committed range before merging.",
         "In a remote ChatGPT app, inspect only through list_files, read_file, search_code, get_diff, and get_impact.",
         "Apply edits only with apply_patch after start_phase; patches are rejected outside the active phase allowedScope.",
         "Never claim completion while a phase is unfinished, FAILED, BLOCKED, AWAITING_APPROVAL, or NEEDS_REVERIFICATION."
@@ -134,8 +135,16 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
   register(server, options, "prepare_parallel_phases", "Create isolated Git worktrees for at least two independent READY phases.", rootSchema.extend({
     limit: z.number().int().min(2).max(8).default(2)
   }), async (service, input) => service.prepareParallelPhases(input.limit));
-  register(server, options, "merge_parallel_phase", "Merge one prepared phase worktree back into the primary repository.", rootSchema.extend({ phase_id: z.string().min(1) }),
-    async (service, input) => service.mergeParallelPhase(input.phase_id));
+  register(server, options, "merge_parallel_phase", "Verify one clean committed phase worktree and merge it only when all phase gates pass.", rootSchema.extend({
+    phase_id: z.string().min(1),
+    summary: z.string().min(1).default("Merge verified parallel phase"),
+    usage: usageSchema.default({})
+  }), async (service, input) => {
+    const phase = service.store.getPhase(input.phase_id);
+    if (!phase) throw new Error(`unknown phase: ${input.phase_id}`);
+    for (const command of phase.acceptanceCommands) options.validateAcceptanceCommand?.(command);
+    return service.mergeParallelPhase(input.phase_id, input.summary, input.usage);
+  });
   register(server, options, "discard_parallel_phase", "Remove one prepared phase worktree without merging it.", rootSchema.extend({ phase_id: z.string().min(1) }),
     async (service, input) => service.discardParallelPhase(input.phase_id));
   register(server, options, "suggest_phases", "Consult the opt-in cross-project playbook for reusable phase and failure patterns.", rootSchema.extend({
