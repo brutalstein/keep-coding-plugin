@@ -72,38 +72,40 @@ export async function createHttpMcpServer(config: HttpMcpConfig): Promise<HttpMc
     { onerror: (error) => process.stderr.write(`[keep-coding:mcp-http] ${error.message}\n`) }
   );
 
-  const server = createNodeServer(async (request, response) => {
-    try {
-      if (!isAllowedHost(request, allowedHosts)) {
-        sendJson(response, 421, { error: "Misdirected request" });
-        return;
+  const server = createNodeServer((request, response) => {
+    void (async () => {
+      try {
+        if (!isAllowedHost(request, allowedHosts)) {
+          sendJson(response, 421, { error: "Misdirected request" });
+          return;
+        }
+        const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+        if (pathname === "/healthz" && request.method === "GET") {
+          sendJson(response, 200, { status: "ok", service: "keep-coding" });
+          return;
+        }
+        if (pathname !== config.endpointPath) {
+          sendJson(response, 404, { error: "Not found" });
+          return;
+        }
+        if (!isAuthorized(request, config.bearerToken)) {
+          response.setHeader("WWW-Authenticate", "Bearer");
+          sendJson(response, 401, { error: "Unauthorized" });
+          return;
+        }
+        const body = await readBody(request, config.maxBodyBytes);
+        const webRequest = toWebRequest(request, body);
+        const webResponse = await handler.fetch(webRequest);
+        await writeWebResponse(response, webResponse);
+      } catch (error) {
+        if (error instanceof PayloadTooLargeError) {
+          sendJson(response, 413, { error: error.message });
+          return;
+        }
+        process.stderr.write(`[keep-coding:mcp-http] ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+        sendJson(response, 500, { error: "Internal server error" });
       }
-      const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
-      if (pathname === "/healthz" && request.method === "GET") {
-        sendJson(response, 200, { status: "ok", service: "keep-coding" });
-        return;
-      }
-      if (pathname !== config.endpointPath) {
-        sendJson(response, 404, { error: "Not found" });
-        return;
-      }
-      if (!isAuthorized(request, config.bearerToken)) {
-        response.setHeader("WWW-Authenticate", "Bearer");
-        sendJson(response, 401, { error: "Unauthorized" });
-        return;
-      }
-      const body = await readBody(request, config.maxBodyBytes);
-      const webRequest = toWebRequest(request, body);
-      const webResponse = await handler.fetch(webRequest);
-      await writeWebResponse(response, webResponse);
-    } catch (error) {
-      if (error instanceof PayloadTooLargeError) {
-        sendJson(response, 413, { error: error.message });
-        return;
-      }
-      process.stderr.write(`[keep-coding:mcp-http] ${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
-      sendJson(response, 500, { error: "Internal server error" });
-    }
+    })();
   });
 
   return {
@@ -165,9 +167,10 @@ async function writeWebResponse(response: ServerResponse, webResponse: Response)
   const reader = webResponse.body.getReader();
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!response.write(value)) await waitForDrain(response);
+      const result: unknown = await reader.read();
+      if (!isStreamReadResult(result)) throw new Error("MCP response stream returned an invalid chunk");
+      if (result.done) break;
+      if (!response.write(result.value)) await waitForDrain(response);
     }
   } finally {
     reader.releaseLock();
@@ -252,10 +255,20 @@ export function parseAllowedCommands(value: string | undefined): string[] {
   } catch {
     throw new Error("KEEP_CODING_ALLOWED_COMMANDS_JSON must be a JSON array of exact command strings");
   }
-  if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== "string" || entry.trim() === "" || entry !== entry.trim())) {
+  if (!isTrimmedStringArray(parsed)) {
     throw new Error("KEEP_CODING_ALLOWED_COMMANDS_JSON must be a JSON array of non-empty, trimmed command strings");
   }
   return [...new Set(parsed)];
+}
+
+function isTrimmedStringArray(value: unknown): value is string[] {
+  return Array.isArray(value)
+    && value.every((entry: unknown) => typeof entry === "string" && entry.trim() !== "" && entry === entry.trim());
+}
+
+function isStreamReadResult(value: unknown): value is { done: true } | { done: false; value: Uint8Array } {
+  if (typeof value !== "object" || value === null || !("done" in value) || typeof value.done !== "boolean") return false;
+  return value.done || ("value" in value && value.value instanceof Uint8Array);
 }
 
 function splitCommaSeparated(value: string | undefined): string[] {
