@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { minimatch } from "minimatch";
 import type {
   BudgetUsage,
   PhaseDefinition,
@@ -70,9 +71,11 @@ export class KeepCodingService {
     const planned = this.store.getPhase(phaseId);
     if (!planned) throw new Error(`unknown phase: ${phaseId}`);
     if (planned.requiresApproval) {
-      const approval = this.store.listApprovals().find((item) => item.phaseId === phaseId && item.status === "approved");
-      if (!approval) {
-        const requested = this.store.requestApproval(
+      const approvals = this.store.listApprovals().filter((item) => item.phaseId === phaseId);
+      const approved = approvals.find((item) => item.status === "approved");
+      if (!approved) {
+        const pending = approvals.find((item) => item.status === "pending");
+        const requested = pending ?? this.store.requestApproval(
           phaseId,
           `Approve phase ${phaseId}?`,
           `${planned.title}: ${planned.goal}`
@@ -133,7 +136,9 @@ export class KeepCodingService {
     const snapshot = this.store.getRestoreSnapshot(phaseId);
     const baseline = this.store.getPhaseBaseline(phaseId);
     if (!snapshot || !baseline) throw new Error(`phase ${phaseId} has no restore snapshot`);
-    const changedFiles = await this.git.changedFilesSince(baseline);
+    const changedFiles = (await this.git.changedFilesSince(baseline)).filter((file) =>
+      phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false }))
+    );
     const restoredFiles = await this.git.restoreScopeSnapshot(snapshot, changedFiles);
     this.store.appendEvent("phase_restored_to_baseline", phaseId, { restoredFiles });
     return { phaseId, restoredFiles, nextAction: "start_phase" };
@@ -178,6 +183,10 @@ export class KeepCodingService {
   }
 
   async completeProject(): Promise<Record<string, unknown>> {
+    const projectBeforeGate = this.store.getProject();
+    if (projectBeforeGate?.status !== "READY_TO_COMPLETE") {
+      throw new Error("project must be READY_TO_COMPLETE before the full-suite gate runs");
+    }
     const gate = await runCompletionGate(this.git.root);
     if (gate && !gate.passed) {
       this.store.appendEvent("project_completion_gate_failed", null, gate);
