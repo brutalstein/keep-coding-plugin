@@ -115,8 +115,8 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
   register(server, options, "record_decision", "Persist architectural rationale.", rootSchema.extend({
     phase_id: z.string().nullable().default(null), title: z.string().min(1), rationale: z.string().min(1), alternatives: z.array(z.string()).default([])
   }), async (service, input) => service.store.recordDecision({ phaseId: input.phase_id, title: input.title, rationale: input.rationale, alternatives: input.alternatives }));
-  register(server, options, "record_failure", "Deduplicate a failed approach.", rootSchema.extend({ phase_id: z.string().min(1), summary: z.string().min(1), fingerprint: z.string().optional() }),
-    async (service, input) => service.store.recordFailure(input.phase_id, input.summary, input.fingerprint));
+  register(server, options, "record_failure", "Deduplicate a failed approach and compound opt-in playbook memory.", rootSchema.extend({ phase_id: z.string().min(1), summary: z.string().min(1), fingerprint: z.string().optional() }),
+    async (service, input) => service.recordFailure(input.phase_id, input.summary, input.fingerprint));
   register(server, options, "checkpoint_phase", "Run scope, secret, budget, selective-test, command, and critic gates.", rootSchema.extend({ phase_id: z.string().min(1), summary: z.string().min(1) }),
     async (service, input) => {
       const phase = service.store.getPhase(input.phase_id);
