@@ -45,7 +45,7 @@ afterEach(() => {
 });
 
 describe("critic adapter", () => {
-  it("supports disabled and unconfigured advisory gates", async () => {
+  it("supports disabled and unconfigured advisory gates and fails closed for blocking", async () => {
     await expect(runCritic({ ...input, contract: contract("disabled") })).resolves.toMatchObject({
       configured: false,
       passed: true,
@@ -59,8 +59,9 @@ describe("critic adapter", () => {
     });
     await expect(runCritic({ ...input, contract: contract("blocking") })).resolves.toMatchObject({
       configured: false,
-      passed: true,
-      blocking: true
+      passed: false,
+      blocking: true,
+      findings: ["Configure KEEP_CODING_CRITIC_COMMAND_JSON or change criticGate to advisory."]
     });
   });
 
