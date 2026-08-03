@@ -48,15 +48,17 @@ export class PlaybookStore {
       ON CONFLICT(id) DO UPDATE SET keywords_json = excluded.keywords_json, phase_json = excluded.phase_json,
         success_count = phase_templates.success_count + 1, updated_at = excluded.updated_at
     `).run(id, phase.title, JSON.stringify(normalizedKeywords), JSON.stringify(phase), sourceProject, now, now);
-    return mustSuggestion(this.db.prepare("SELECT * FROM phase_templates WHERE id = ?").get(id) as Row | undefined, 1);
+    return mustSuggestion(this.db.prepare("SELECT * FROM phase_templates WHERE id = ?").get(id), 1);
   }
 
   rememberFailure(sourceProject: string, failure: FailureRecord): void {
     this.db.prepare(`
       INSERT INTO failure_patterns (fingerprint, summary, resolution, occurrences, source_project, updated_at)
       VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(fingerprint) DO UPDATE SET summary = excluded.summary, resolution = COALESCE(excluded.resolution, failure_patterns.resolution),
-        occurrences = failure_patterns.occurrences + excluded.occurrences, updated_at = excluded.updated_at
+      ON CONFLICT(fingerprint) DO UPDATE SET summary = excluded.summary,
+        resolution = COALESCE(excluded.resolution, failure_patterns.resolution),
+        occurrences = failure_patterns.occurrences + excluded.occurrences,
+        updated_at = excluded.updated_at
     `).run(failure.fingerprint, failure.summary, failure.resolution, failure.count, sourceProject, new Date().toISOString());
   }
 
@@ -74,10 +76,15 @@ export class PlaybookStore {
 
 function mustSuggestion(row: Row | undefined, score: number): PlaybookSuggestion {
   if (!row) throw new Error("playbook write failed");
-  return { id: String(row.id), title: String(row.title), score, phase: JSON.parse(String(row.phase_json)) as PhaseDefinition, sourceProject: String(row.source_project), successCount: Number(row.success_count) };
+  return {
+    id: String(row.id), title: String(row.title), score,
+    phase: JSON.parse(String(row.phase_json)) as PhaseDefinition,
+    sourceProject: String(row.source_project), successCount: Number(row.success_count)
+  };
 }
 
 function normalizeKeywords(value: string): string[] {
   const stop = new Set(["the", "and", "for", "with", "from", "this", "that", "phase", "build", "create", "bir", "ve", "ile", "için", "faz"]);
-  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop.has(term)).slice(0, 40);
+  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])]
+    .filter((term) => !stop.has(term)).slice(0, 40);
 }
