@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
@@ -50,8 +51,7 @@ describe("ChatGPT remote MCP transport", () => {
       expect(health.status).toBe(200);
       expect(await health.json()).toEqual({ status: "ok", service: "keep-coding" });
 
-      const wrongHost = await fetch(`${base}/healthz`, { headers: { host: "evil.example" } });
-      expect(wrongHost.status).toBe(421);
+      await expect(requestStatus(port, "/healthz", "evil.example")).resolves.toBe(421);
 
       const unauthorized = await fetch(`${base}/mcp`, { method: "POST", body: "{}" });
       expect(unauthorized.status).toBe(401);
@@ -89,3 +89,14 @@ describe("ChatGPT remote MCP transport", () => {
     }
   });
 });
+
+function requestStatus(port: number, pathname: string, host: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest({ hostname: "127.0.0.1", port, path: pathname, method: "GET", headers: { host } }, (response) => {
+      response.resume();
+      response.once("end", () => resolve(response.statusCode ?? 0));
+    });
+    request.once("error", reject);
+    request.end();
+  });
+}
