@@ -63,19 +63,13 @@ export interface PhaseRecord extends PhaseDefinition {
   baseSha: string | null;
   headSha: string | null;
   summary: string | null;
-  revision: number;
-  supersededBy: string | null;
-  approvedAt: string | null;
-  reverifyReason: string | null;
+  revision?: number;
+  supersededBy?: string | null;
+  approvedAt?: string | null;
+  reverifyReason?: string | null;
 }
 
-export interface PlanAmendment {
-  reason: string;
-  addPhases: PhaseDefinition[];
-  supersedePhaseIds: string[];
-  contractPatch?: Partial<ProjectContract>;
-}
-
+export interface PlanAmendment { reason: string; addPhases: PhaseDefinition[]; supersedePhaseIds: string[]; contractPatch?: Partial<ProjectContract> }
 export interface PlanRevisionRecord { version: number; contract: ProjectContract; amendment: PlanAmendment | null; createdAt: string }
 
 export interface ProjectRecord {
@@ -143,10 +137,10 @@ export interface ProjectSnapshot {
   phases: PhaseRecord[];
   decisions: DecisionRecord[];
   failures: FailureRecord[];
-  approvals: ApprovalRecord[];
+  approvals?: ApprovalRecord[];
   checkpoints: CheckpointRecord[];
-  planRevisions: PlanRevisionRecord[];
-  worktrees: WorktreeRecord[];
-  budgetUsage: Record<string, BudgetUsage>;
+  planRevisions?: PlanRevisionRecord[];
+  worktrees?: WorktreeRecord[];
+  budgetUsage?: Record<string, BudgetUsage>;
   recentEvents: EventRecord[];
 }
