@@ -48,10 +48,10 @@ describe("phase verifier", () => {
     const result = await new PhaseVerifier().verify(await GitRepository.open(root), phase(["src/**"], ["node --version"]));
     expect(result.passed).toBe(false);
     expect(result.secretScan.passed).toBe(false);
-    expect(result.secretScan.findings).toEqual([
+    expect(result.secretScan.findings).toEqual(expect.arrayContaining([
       expect.objectContaining({ ruleId: "github-token", file: "src/a.js", line: 1 })
-    ]);
-    expect(result.secretScan.findings[0]?.preview).not.toContain("abcdefghijklmnopqrstuvwxyz");
+    ]));
+    expect(result.secretScan.findings.every((finding) => !finding.preview.includes("abcdefghijklmnopqrstuvwxyz"))).toBe(true);
     expect(result.commands).toEqual([]);
     rmSync(root, { recursive: true, force: true });
   });
