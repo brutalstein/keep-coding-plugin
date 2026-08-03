@@ -141,6 +141,20 @@ export async function indexRepository(store: ProjectStore, git: GitRepository): 
       }
     }
   }
+
+  for (const checkpoint of store.listCheckpoints()) {
+    for (const changedFile of checkpoint.changedFiles) {
+      const normalized = toPosix(changedFile);
+      if (!fileSet.has(normalized)) continue;
+      store.upsertGraphEdge({
+        sourceId: `phase:${checkpoint.phaseId}`,
+        targetId: `file:${normalized}`,
+        type: "modifies",
+        metadata: { checkpointId: checkpoint.id, diffHash: checkpoint.verification.diffHash }
+      });
+    }
+  }
+
   store.appendEvent("repository_indexed", null, { ...result });
   return result;
 }
