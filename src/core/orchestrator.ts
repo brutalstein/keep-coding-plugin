@@ -1,11 +1,11 @@
 import type { PhaseRecord, VerificationEvidence } from "../domain/model.js";
-import type { ProjectStore } from "../storage/store.js";
+import type { PlatformStore } from "../storage/platform-store.js";
 import { generateCommitMessage } from "../integrations/github.js";
 import { GitRepository } from "./git.js";
 import { PhaseVerifier } from "./verifier.js";
 
 export class ParallelOrchestrator {
-  constructor(private readonly git: GitRepository, private readonly store: ProjectStore) {}
+  constructor(private readonly git: GitRepository, private readonly store: PlatformStore) {}
 
   eligiblePhases(limit = 4): PhaseRecord[] {
     const candidates = this.store.readyPhases().filter((phase) => phase.parallelSafe);
@@ -25,8 +25,12 @@ export class ParallelOrchestrator {
     }) ?? this.eligiblePhases();
     if (requested.length < 2) throw new Error("parallel execution requires at least two independent READY phases");
     if (requested.some((phase) => phase.status !== "READY" || !phase.parallelSafe)) throw new Error("every parallel phase must be READY and parallelSafe");
-    for (let left = 0; left < requested.length; left += 1) for (let right = left + 1; right < requested.length; right += 1) {
-      if (!scopesIndependent(requested[left]!.allowedScope, requested[right]!.allowedScope)) throw new Error(`parallel phase scopes overlap: ${requested[left]!.id}, ${requested[right]!.id}`);
+    for (let left = 0; left < requested.length; left += 1) {
+      for (let right = left + 1; right < requested.length; right += 1) {
+        if (!scopesIndependent(requested[left]!.allowedScope, requested[right]!.allowedScope)) {
+          throw new Error(`parallel phase scopes overlap: ${requested[left]!.id}, ${requested[right]!.id}`);
+        }
+      }
     }
     const baseSha = await this.git.headSha();
     const worktrees = [];
@@ -35,7 +39,10 @@ export class ParallelOrchestrator {
       const isolated = await GitRepository.open(created.path);
       this.store.setPhaseBaseline(phase.id, await isolated.workingTreeSnapshot());
       this.store.startPhase(phase.id, baseSha, true);
-      const record = { phaseId: phase.id, path: created.path, branch: created.branch, status: "active" as const, baseSha, createdAt: new Date().toISOString() };
+      const record = {
+        phaseId: phase.id, path: created.path, branch: created.branch, status: "active" as const,
+        baseSha, createdAt: new Date().toISOString()
+      };
       this.store.setWorktree(record);
       worktrees.push(record);
     }
@@ -53,7 +60,9 @@ export class ParallelOrchestrator {
     const evidence = await new PhaseVerifier().verify(isolated, { ...phase, status: "VERIFYING" }, {
       ...(baseline ? { baseline } : {}),
       budget: this.store.budgetEvidence(phaseId),
-      contract: this.store.getProject()?.contract ?? { goal: phase.goal, nonGoals: [], constraints: [], deliverables: [phase.goal], invariants: [], doneWhen: phase.acceptanceCommands }
+      contract: this.store.getProject()?.contract ?? {
+        goal: phase.goal, nonGoals: [], constraints: [], deliverables: [phase.goal], invariants: [], doneWhen: phase.acceptanceCommands
+      }
     });
     if (!evidence.passed) {
       this.store.finishVerification(phaseId, summary, evidence);
@@ -73,7 +82,8 @@ export class ParallelOrchestrator {
 function scopesIndependent(left: string[], right: string[]): boolean {
   const roots = (scope: string): string => scope.replace(/^!/, "").split(/[/*?{[]/, 1)[0] ?? "";
   return left.every((a) => right.every((b) => {
-    const x = roots(a); const y = roots(b);
+    const x = roots(a);
+    const y = roots(b);
     return x !== "" && y !== "" && !x.startsWith(y) && !y.startsWith(x);
   }));
 }
