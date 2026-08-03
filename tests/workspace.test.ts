@@ -43,7 +43,8 @@ describe("remote workspace tools", () => {
       }]);
       await service.startPhase("update-source");
 
-      await expect(service.workspace.listFiles()).resolves.toMatchObject({ files: expect.arrayContaining(["src/app.ts"]) });
+      const listed = await service.workspace.listFiles();
+      expect(listed.files).toContain("src/app.ts");
       await expect(service.workspace.readTextFile("src/app.ts", 1, 1)).resolves.toMatchObject({ content: "1: export const value = 1;" });
       await expect(service.workspace.searchCode("value")).resolves.toMatchObject({
         matches: [{ path: "src/app.ts", line: 1, text: "export const value = 1;" }]
@@ -62,9 +63,8 @@ describe("remote workspace tools", () => {
         applied: true,
         files: ["src/app.ts"]
       });
-      await expect(service.workspace.diff()).resolves.toMatchObject({
-        diff: expect.stringContaining("export const value = 2;")
-      });
+      const currentDiff = await service.workspace.diff();
+      expect(currentDiff.diff).toContain("export const value = 2;");
 
       const outOfScope = [
         "diff --git a/README.md b/README.md",
