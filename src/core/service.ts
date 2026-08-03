@@ -1,4 +1,4 @@
-import type { PhaseDefinition, PlanAmendment, ProjectContract } from "../domain/model.js";
+import type { FailureRecord, PhaseDefinition, PlanAmendment, ProjectContract } from "../domain/model.js";
 import { PlatformStore } from "../storage/platform-store.js";
 import { PlaybookStore } from "../storage/playbook.js";
 import { compileContext } from "./context.js";
@@ -49,6 +49,16 @@ export class KeepCodingService {
     this.store.setPhaseBaseline(phaseId, await this.git.workingTreeSnapshot());
     const phase = this.store.startPhase(phaseId, await this.git.headSha());
     return { phase, context: this.context(), nextAction: "implement_and_checkpoint" };
+  }
+
+  recordFailure(phaseId: string, summary: string, fingerprint?: string): FailureRecord {
+    const failure = this.store.recordFailure(phaseId, summary, fingerprint);
+    const project = this.store.getProject();
+    if (!project?.contract?.playbookOptIn) return failure;
+    const playbook = new PlaybookStore();
+    try { playbook.rememberFailure(project.root, failure); }
+    finally { playbook.close(); }
+    return failure;
   }
 
   async checkpoint(phaseId: string, summary: string): Promise<Record<string, unknown>> {
