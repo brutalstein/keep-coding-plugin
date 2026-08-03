@@ -6,7 +6,7 @@ import { type DbRow, approvalFromRow, must, now, text, usageFromRow, worktreeFro
 export interface RuntimeHost {
   db: DatabaseSync;
   project(): { id: string; contract: ProjectContract | null } | null;
-  phase(id: string): { budget?: BudgetLimits } | null;
+  phase(id: string): { budget?: BudgetLimits | undefined } | null;
   event(type: string, phaseId: string | null, payload: Record<string, unknown>): number;
 }
 
