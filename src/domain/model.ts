@@ -43,6 +43,10 @@ export interface ProjectContract {
   playbookOptIn?: boolean | undefined;
 }
 
+export type ProjectContractPatch = {
+  [Key in keyof ProjectContract]?: ProjectContract[Key] | undefined;
+};
+
 export interface PhaseDefinition {
   id: string;
   title: string;
@@ -77,7 +81,7 @@ export interface PlanAmendment {
   reason: string;
   addPhases: PhaseDefinition[];
   supersedePhaseIds: string[];
-  contractPatch?: Partial<ProjectContract> | undefined;
+  contractPatch?: ProjectContractPatch | undefined;
 }
 export interface PlanRevisionRecord { version: number; contract: ProjectContract; amendment: PlanAmendment | null; createdAt: string }
 
