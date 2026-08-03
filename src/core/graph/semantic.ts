@@ -104,7 +104,9 @@ function parsePython(content: string): SemanticDocument {
     const imported = importMatch?.[1] ?? importMatch?.[2];
     if (imported) imports.add(imported);
     const declaration = /^\s*(class|(?:async\s+)?def)\s+([A-Za-z_]\w*)/.exec(line);
-    if (!declaration?.[2]) continue;
+    const declarationKind = declaration?.[1] ?? "";
+    const declarationName = declaration?.[2];
+    if (!declarationName) continue;
     const indentation = line.match(/^\s*/)?.[0].length ?? 0;
     const body: string[] = [];
     for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
@@ -119,11 +121,11 @@ function parsePython(content: string): SemanticDocument {
       for (const match of bodyLine.matchAll(/\b([A-Za-z_]\w*)\b/g)) if (match[1]) references.add(match[1]);
     }
     symbols.push({
-      name: declaration[2],
-      kind: declaration[1].includes("def") ? "function" : "class",
+      name: declarationName,
+      kind: declarationKind.includes("def") ? "function" : "class",
       line: index + 1,
       calls: [...calls].sort(),
-      references: [...references].filter((name) => name !== declaration[2]).sort()
+      references: [...references].filter((name) => name !== declarationName).sort()
     });
   }
   return { parser: "python-structural-ast", imports: [...imports].sort(), symbols: symbols.slice(0, 1_000) };
