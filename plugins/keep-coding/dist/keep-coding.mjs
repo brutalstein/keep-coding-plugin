@@ -211840,6 +211840,18 @@ async function indexRepository(store, git) {
       }
     }
   }
+  for (const checkpoint of store.listCheckpoints()) {
+    for (const changedFile of checkpoint.changedFiles) {
+      const normalized = toPosix(changedFile);
+      if (!fileSet.has(normalized)) continue;
+      store.upsertGraphEdge({
+        sourceId: `phase:${checkpoint.phaseId}`,
+        targetId: `file:${normalized}`,
+        type: "modifies",
+        metadata: { checkpointId: checkpoint.id, diffHash: checkpoint.verification.diffHash }
+      });
+    }
+  }
   store.appendEvent("repository_indexed", null, { ...result });
   return result;
 }
@@ -214765,6 +214777,18 @@ var GitRepository = class _GitRepository {
     ]);
     return [.../* @__PURE__ */ new Set([...splitNull(tracked.stdout), ...splitNull(untracked.stdout)])].filter(isProjectFile).sort();
   }
+  async isClean() {
+    return (await this.changedFiles()).length === 0;
+  }
+  async changedFilesBetween(base, head = "HEAD") {
+    const { stdout } = await execFileAsync("git", ["diff", "--name-only", "-z", `${base}..${head}`], {
+      cwd: this.root,
+      encoding: "buffer",
+      timeout: 3e4,
+      maxBuffer: 32 * 1024 * 1024
+    });
+    return [...new Set(splitNull(stdout))].filter(isProjectFile).sort();
+  }
   async allFiles() {
     const { stdout } = await execFileAsync("git", ["ls-files", "-co", "--exclude-standard", "-z"], {
       cwd: this.root,
@@ -214794,10 +214818,25 @@ ${content.split("\n").map((line) => `+${line}`).join("\n")}`);
     }
     return [tracked, ...untrackedParts].filter(Boolean).join("\n").slice(0, maxBytes);
   }
+  async diffTextBetween(base, head = "HEAD", maxBytes = 4 * 1024 * 1024) {
+    const { stdout } = await execFileAsync("git", ["diff", "--no-ext-diff", "--unified=3", `${base}..${head}`], {
+      cwd: this.root,
+      encoding: "buffer",
+      timeout: 3e4,
+      maxBuffer: Math.max(maxBytes, 1024 * 1024)
+    });
+    return stdout.subarray(0, maxBytes).toString("utf8");
+  }
   async diffHash() {
     const hash = createHash4("sha256");
     hash.update(await this.diffText(64 * 1024 * 1024));
     for (const file of await this.changedFiles()) hash.update(`\0${file}`);
+    return hash.digest("hex");
+  }
+  async diffHashBetween(base, head = "HEAD") {
+    const hash = createHash4("sha256");
+    hash.update(await this.diffTextBetween(base, head, 64 * 1024 * 1024));
+    for (const file of await this.changedFilesBetween(base, head)) hash.update(`\0${file}`);
     return hash.digest("hex");
   }
   async workingTreeSnapshot() {
@@ -214877,6 +214916,7 @@ ${content.split("\n").map((line) => `+${line}`).join("\n")}`);
     const parent = path6.join(path6.dirname(this.root), `.${path6.basename(this.root)}-keep-coding-worktrees`);
     const target = path6.join(parent, safe);
     await mkdir(parent, { recursive: true });
+    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 15e3 }).catch(() => void 0);
     await rm(target, { recursive: true, force: true });
     const baseSha = await this.headSha();
     const branchExists = await execFileAsync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: this.root }).then(() => true).catch(() => false);
@@ -214885,18 +214925,27 @@ ${content.split("\n").map((line) => `+${line}`).join("\n")}`);
     return { phaseId, branch, path: target, baseSha };
   }
   async mergePhaseWorktree(record2) {
-    await execFileAsync("git", ["merge", "--no-ff", "--no-edit", record2.branch], {
-      cwd: this.root,
-      encoding: "utf8",
-      timeout: 12e4,
-      maxBuffer: 32 * 1024 * 1024
-    });
-    await this.removePhaseWorktree(record2);
-    return this.headSha();
+    try {
+      await execFileAsync("git", ["merge", "--no-ff", "--no-edit", record2.branch], {
+        cwd: this.root,
+        encoding: "utf8",
+        timeout: 12e4,
+        maxBuffer: 32 * 1024 * 1024
+      });
+    } catch (error2) {
+      await execFileAsync("git", ["merge", "--abort"], { cwd: this.root, timeout: 3e4 }).catch(() => void 0);
+      throw error2;
+    }
+    const sha = await this.headSha();
+    await this.removePhaseWorktree(record2, true);
+    return sha;
   }
-  async removePhaseWorktree(record2) {
+  async removePhaseWorktree(record2, deleteBranch = true) {
     await execFileAsync("git", ["worktree", "remove", "--force", record2.path], { cwd: this.root, timeout: 6e4 }).catch(() => void 0);
     await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 15e3 }).catch(() => void 0);
+    if (deleteBranch) {
+      await execFileAsync("git", ["branch", "-D", record2.branch], { cwd: this.root, timeout: 15e3 }).catch(() => void 0);
+    }
   }
   async untrackedFiles() {
     const { stdout } = await execFileAsync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
@@ -214957,19 +215006,20 @@ var ParallelPhaseOrchestrator = class {
       throw error2;
     }
   }
-  async merge(phaseId) {
+  prepared(phaseId) {
     const encoded = this.store.getMetadata(`parallel_worktree:${phaseId}`);
     if (!encoded) throw new Error(`no prepared worktree for phase ${phaseId}`);
-    const record2 = parseWorktree(encoded);
+    return parseWorktree(encoded);
+  }
+  async merge(phaseId) {
+    const record2 = this.prepared(phaseId);
     const gitSha = await this.git.mergePhaseWorktree(record2);
     this.store.setMetadata(`parallel_worktree:${phaseId}`, "");
     this.store.appendEvent("parallel_worktree_merged", phaseId, { branch: record2.branch, gitSha });
     return { phaseId, gitSha };
   }
   async discard(phaseId) {
-    const encoded = this.store.getMetadata(`parallel_worktree:${phaseId}`);
-    if (!encoded) throw new Error(`no prepared worktree for phase ${phaseId}`);
-    const record2 = parseWorktree(encoded);
+    const record2 = this.prepared(phaseId);
     await this.git.removePhaseWorktree(record2);
     this.store.setMetadata(`parallel_worktree:${phaseId}`, "");
     this.store.appendEvent("parallel_worktree_discarded", phaseId, { branch: record2.branch });
@@ -215019,12 +215069,13 @@ async function runCritic(input) {
   if (gate === "disabled") return { configured: false, passed: true, blocking: false, summary: "Critic gate disabled.", findings: [] };
   const command2 = parseCommand(process.env.KEEP_CODING_CRITIC_COMMAND_JSON);
   if (command2.length === 0) {
+    const blocking = gate === "blocking";
     return {
       configured: false,
-      passed: true,
-      blocking: gate === "blocking",
-      summary: "No critic adapter configured; deterministic gates remain authoritative.",
-      findings: []
+      passed: !blocking,
+      blocking,
+      summary: blocking ? "Blocking critic gate requested, but no critic adapter is configured." : "No critic adapter configured; deterministic gates remain authoritative.",
+      findings: blocking ? ["Configure KEEP_CODING_CRITIC_COMMAND_JSON or change criticGate to advisory."] : []
     };
   }
   const [executable, ...args] = command2;
@@ -215167,11 +215218,26 @@ var PhaseVerifier = class {
   }
   commandTimeoutMs;
   async verify(git, phase, baseline, options = {}) {
-    const changedFiles = baseline ? await git.changedFilesSince(baseline) : await git.changedFiles();
-    const scopeViolations = phase.allowedScope.length === 0 ? [] : changedFiles.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false })));
+    return this.verifyInput(git, phase, {
+      changedFiles: baseline ? await git.changedFilesSince(baseline) : await git.changedFiles(),
+      diff: await git.diffText(),
+      diffHash: await git.diffHash(),
+      gitSha: await git.headSha()
+    }, options);
+  }
+  async verifyCommittedRange(git, phase, baseSha, options = {}) {
+    if (!await git.isClean()) throw new Error("parallel worktree must be clean; commit phase changes before verification");
+    return this.verifyInput(git, phase, {
+      changedFiles: await git.changedFilesBetween(baseSha),
+      diff: await git.diffTextBetween(baseSha),
+      diffHash: await git.diffHashBetween(baseSha),
+      gitSha: await git.headSha()
+    }, options);
+  }
+  async verifyInput(git, phase, input, options) {
+    const scopeViolations = phase.allowedScope.length === 0 ? [] : input.changedFiles.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false })));
     const scopePassed = scopeViolations.length === 0;
-    const diff = await git.diffText();
-    const secretScan = scanUnifiedDiff(diff);
+    const secretScan = scanUnifiedDiff(input.diff);
     const budget = evaluateBudget(mergeBudgets(options.contract?.budget, phase.budget), options.usage ?? {});
     const impactedTests = [...new Set(options.impactedTests ?? [])].sort();
     const selectiveCommands = [];
@@ -215190,8 +215256,8 @@ var PhaseVerifier = class {
     const critic = await runCritic({
       contract: options.contract ?? null,
       phase,
-      diff,
-      changedFiles
+      diff: input.diff,
+      changedFiles: input.changedFiles
     });
     const deterministicPassed = scopePassed && secretScan.passed && (budget?.passed ?? true) && selectiveCommands.every((command2) => command2.passed) && commands.length === phase.acceptanceCommands.length && commands.every((command2) => command2.passed);
     const criticPassed = !critic.blocking || critic.passed;
@@ -215199,7 +215265,7 @@ var PhaseVerifier = class {
       passed: deterministicPassed && criticPassed,
       scopePassed,
       scopeViolations,
-      changedFiles,
+      changedFiles: input.changedFiles,
       commands,
       selectiveCommands,
       impactedTests,
@@ -215207,8 +215273,8 @@ var PhaseVerifier = class {
       secretFindings: secretScan.findings,
       budget,
       critic,
-      diffHash: await git.diffHash(),
-      gitSha: await git.headSha(),
+      diffHash: input.diffHash,
+      gitSha: input.gitSha,
       checkpointCommitSha: null
     };
   }
@@ -215558,14 +215624,16 @@ var KeepCodingService = class _KeepCodingService {
     if (!phase) throw new Error(`unknown phase: ${phaseId}`);
     const baseline = this.store.getPhaseBaseline(phaseId) ?? void 0;
     const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
+    const impactedFiles = expandImpactedFiles(this.store, changedFiles);
     const impactedTests = this.store.impactedTests(changedFiles);
-    const impactedCompletedPhases = this.store.completedPhasesImpactedByFiles(changedFiles, phaseId);
+    const impactedCompletedPhases = this.store.completedPhasesImpactedByFiles(impactedFiles, phaseId);
+    const measuredUsage = withMeasuredWallClock(usage, phase.startedAt);
     this.store.markVerifying(phaseId);
     const verifying = this.store.getPhase(phaseId);
     if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
     const evidence = await new PhaseVerifier().verify(this.git, verifying, baseline, {
       contract: this.store.getProject()?.contract,
-      usage,
+      usage: measuredUsage,
       impactedTests
     });
     if (evidence.passed) {
@@ -215583,6 +215651,7 @@ var KeepCodingService = class _KeepCodingService {
     return {
       phase: updated,
       evidence,
+      impactedFiles,
       impactedCompletedPhases,
       project: this.store.getProject(),
       canRestore: !evidence.passed && this.store.getRestoreSnapshot(phaseId) !== null,
@@ -215625,12 +215694,86 @@ var KeepCodingService = class _KeepCodingService {
   }
   async prepareParallelPhases(limit) {
     const workspaces = await this.orchestrator.prepare(limit);
-    return { workspaces, nextAction: "run_each_phase_in_its_worktree" };
+    return { workspaces, nextAction: "run_each_phase_in_its_worktree_and_commit_changes" };
   }
-  async mergeParallelPhase(phaseId) {
-    const merged = await this.orchestrator.merge(phaseId);
-    await indexRepository(this.store, this.git);
-    return { ...merged, nextAction: "start_phase_and_checkpoint" };
+  async mergeParallelPhase(phaseId, summary = "Merge verified parallel phase", usage = {}) {
+    const phase = this.store.getPhase(phaseId);
+    if (!phase) throw new Error(`unknown phase: ${phaseId}`);
+    if (phase.requiresApproval && !this.store.listApprovals().some((approval) => approval.phaseId === phaseId && approval.status === "approved")) {
+      const pending = this.store.listApprovals().find((approval2) => approval2.phaseId === phaseId && approval2.status === "pending");
+      const approval = pending ?? this.store.requestApproval(phaseId, `Approve phase ${phaseId}?`, `${phase.title}: ${phase.goal}`);
+      return { phase: this.store.getPhase(phaseId), approval, nextAction: "resolve_approval" };
+    }
+    const record2 = this.orchestrator.prepared(phaseId);
+    const worktreeGit = await GitRepository.open(record2.path);
+    const changedFiles = await worktreeGit.changedFilesBetween(record2.baseSha);
+    const impactedFiles = expandImpactedFiles(this.store, changedFiles);
+    const impactedTests = this.store.impactedTests(changedFiles);
+    const impactedCompletedPhases = this.store.completedPhasesImpactedByFiles(impactedFiles, phaseId);
+    const started = this.store.startPhase(phaseId, record2.baseSha);
+    const measuredUsage = withMeasuredWallClock(usage, started.startedAt);
+    this.store.markVerifying(phaseId);
+    const verifying = this.store.getPhase(phaseId);
+    if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
+    const evidence = await new PhaseVerifier().verifyCommittedRange(worktreeGit, verifying, record2.baseSha, {
+      contract: this.store.getProject()?.contract,
+      usage: measuredUsage,
+      impactedTests
+    });
+    if (!evidence.passed) {
+      const updated = this.store.finishVerification(phaseId, summary, evidence);
+      return {
+        phase: updated,
+        evidence,
+        impactedFiles,
+        impactedCompletedPhases,
+        merged: false,
+        worktree: record2,
+        nextAction: "repair_and_commit_the_parallel_worktree"
+      };
+    }
+    const mergeStarted = performance.now();
+    try {
+      const merged = await this.orchestrator.merge(phaseId);
+      evidence.checkpointCommitSha = merged.gitSha;
+      evidence.gitSha = merged.gitSha;
+      const updated = this.store.finishVerification(phaseId, summary, evidence);
+      await indexRepository(this.store, this.git);
+      this.store.markNeedsReverification(impactedCompletedPhases, phaseId);
+      const project = this.store.getProject();
+      if (project?.contract) this.playbook.rememberPhase(updated, project.contract);
+      return {
+        phase: updated,
+        evidence,
+        impactedFiles,
+        impactedCompletedPhases,
+        merged: true,
+        gitSha: merged.gitSha,
+        nextAction: this.store.currentPhase() ? "continue_with_ready_phase" : "complete_project"
+      };
+    } catch (error2) {
+      evidence.passed = false;
+      evidence.commands.push({
+        command: `git merge --no-ff ${record2.branch}`,
+        exitCode: null,
+        passed: false,
+        durationMs: Math.round(performance.now() - mergeStarted),
+        stdout: "",
+        stderr: error2 instanceof Error ? error2.message : String(error2),
+        timedOut: false
+      });
+      const updated = this.store.finishVerification(phaseId, `${summary}: merge failed`, evidence);
+      this.store.recordFailure(phaseId, `Parallel worktree merge failed: ${error2 instanceof Error ? error2.message : String(error2)}`);
+      return {
+        phase: updated,
+        evidence,
+        impactedFiles,
+        impactedCompletedPhases,
+        merged: false,
+        worktree: record2,
+        nextAction: "resolve_merge_conflict_in_the_parallel_worktree"
+      };
+    }
   }
   async discardParallelPhase(phaseId) {
     return this.orchestrator.discard(phaseId);
@@ -215651,6 +215794,19 @@ ${gate.output}`);
     return { project, fullSuiteGate: gate, nextAction: "report_completion" };
   }
 };
+function expandImpactedFiles(store, changedFiles) {
+  const impacted = new Set(changedFiles);
+  for (const file of changedFiles) {
+    for (const related of store.getImpact(file, 4).files) impacted.add(related);
+  }
+  return [...impacted].sort();
+}
+function withMeasuredWallClock(usage, startedAt) {
+  if (usage.wallClockMs !== void 0 || !startedAt) return usage;
+  const started = Date.parse(startedAt);
+  if (!Number.isFinite(started)) return usage;
+  return { ...usage, wallClockMs: Math.max(0, Date.now() - started) };
+}
 async function runCompletionGate(root) {
   const packageJson = await readJson2(path9.join(root, "package.json"));
   const scripts = isRecord2(packageJson?.scripts) ? packageJson.scripts : {};
@@ -237674,6 +237830,7 @@ function createServer2(options = {}) {
         "Use amend_plan for versioned changes after implementation begins; never overwrite completed evidence.",
         "Every checkpoint enforces scope, secret scanning, budgets, deterministic commands, and optional critic evidence.",
         "Use request_approval for material human decisions and prepare_parallel_phases only for independent ready scopes.",
+        "Commit all worktree changes before merge_parallel_phase; the tool verifies the committed range before merging.",
         "In a remote ChatGPT app, inspect only through list_files, read_file, search_code, get_diff, and get_impact.",
         "Apply edits only with apply_patch after start_phase; patches are rejected outside the active phase allowedScope.",
         "Never claim completion while a phase is unfinished, FAILED, BLOCKED, AWAITING_APPROVAL, or NEEDS_REVERIFICATION."
@@ -237798,14 +237955,16 @@ function createServer2(options = {}) {
   register2(server2, options, "prepare_parallel_phases", "Create isolated Git worktrees for at least two independent READY phases.", rootSchema.extend({
     limit: number2().int().min(2).max(8).default(2)
   }), async (service, input) => service.prepareParallelPhases(input.limit));
-  register2(
-    server2,
-    options,
-    "merge_parallel_phase",
-    "Merge one prepared phase worktree back into the primary repository.",
-    rootSchema.extend({ phase_id: string2().min(1) }),
-    async (service, input) => service.mergeParallelPhase(input.phase_id)
-  );
+  register2(server2, options, "merge_parallel_phase", "Verify one clean committed phase worktree and merge it only when all phase gates pass.", rootSchema.extend({
+    phase_id: string2().min(1),
+    summary: string2().min(1).default("Merge verified parallel phase"),
+    usage: usageSchema.default({})
+  }), async (service, input) => {
+    const phase = service.store.getPhase(input.phase_id);
+    if (!phase) throw new Error(`unknown phase: ${input.phase_id}`);
+    for (const command2 of phase.acceptanceCommands) options.validateAcceptanceCommand?.(command2);
+    return service.mergeParallelPhase(input.phase_id, input.summary, input.usage);
+  });
   register2(
     server2,
     options,
