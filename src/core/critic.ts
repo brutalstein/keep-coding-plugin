@@ -13,12 +13,15 @@ export async function runCritic(input: CriticInput): Promise<CriticEvidence> {
   if (gate === "disabled") return { configured: false, passed: true, blocking: false, summary: "Critic gate disabled.", findings: [] };
   const command = parseCommand(process.env.KEEP_CODING_CRITIC_COMMAND_JSON);
   if (command.length === 0) {
+    const blocking = gate === "blocking";
     return {
       configured: false,
-      passed: true,
-      blocking: gate === "blocking",
-      summary: "No critic adapter configured; deterministic gates remain authoritative.",
-      findings: []
+      passed: !blocking,
+      blocking,
+      summary: blocking
+        ? "Blocking critic gate requested, but no critic adapter is configured."
+        : "No critic adapter configured; deterministic gates remain authoritative.",
+      findings: blocking ? ["Configure KEEP_CODING_CRITIC_COMMAND_JSON or change criticGate to advisory."] : []
     };
   }
   const [executable, ...args] = command;
