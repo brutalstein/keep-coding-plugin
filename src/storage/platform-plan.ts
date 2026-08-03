@@ -27,14 +27,18 @@ export function amendPlan(host: PlanHost, amendment: PlanAmendment): void {
     const phase = must(existing.get(id), `unknown superseded phase: ${id}`);
     if (["IN_PROGRESS", "VERIFYING"].includes(phase.status)) throw new Error("an in-progress phase cannot be superseded");
   }
+
   const version = project.planVersion + 1;
+  const replacement = amendment.addPhases[0]?.id ?? null;
   const nextContract = mergeContract(contract, amendment.contractPatch ?? {});
   const startOrdinal = host.phases().reduce((maximum, phase) => Math.max(maximum, phase.ordinal + 1), 0);
+
   for (const id of amendment.supersedePhaseIds) {
-    const replacement = amendment.addPhases[0]?.id ?? null;
     host.db.prepare("UPDATE phases SET status = 'SUPERSEDED', superseded_by = ? WHERE id = ?").run(replacement, id);
     if (replacement) host.graphEdge({ sourceId: `phase:${replacement}`, targetId: `phase:${id}`, type: "supersedes", metadata: { version } });
   }
+  if (replacement) redirectDependencies(host.db, amendment.supersedePhaseIds, replacement);
+
   const insert = host.db.prepare(`
     INSERT INTO phases (id, ordinal, title, goal, status, dependencies_json, allowed_scope_json,
       acceptance_commands_json, max_attempts, attempts, started_at, completed_at, base_sha, head_sha,
@@ -43,20 +47,26 @@ export function amendPlan(host: PlanHost, amendment: PlanAmendment): void {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, NULL, ?, ?, ?, NULL)
   `);
   amendment.addPhases.forEach((phase, index) => {
-    const ready = phase.dependencies.every((dependency) => ["COMPLETED", "SUPERSEDED"].includes(existing.get(dependency)?.status ?? ""));
-    insert.run(phase.id, startOrdinal + index, phase.title, phase.goal, ready ? "READY" : "PENDING",
+    const ready = phase.dependencies.every((dependency) => dependencySatisfied(host.db, dependency));
+    insert.run(
+      phase.id, startOrdinal + index, phase.title, phase.goal, ready ? "READY" : "PENDING",
       JSON.stringify(phase.dependencies), JSON.stringify(phase.allowedScope), JSON.stringify(phase.acceptanceCommands),
       phase.maxAttempts, version, phase.requiresApproval ? 1 : 0, phase.approvalPrompt ?? null,
-      JSON.stringify(phase.budget ?? {}), phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0);
+      JSON.stringify(phase.budget ?? {}), phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0
+    );
     host.graphNode({ id: `phase:${phase.id}`, type: "phase", label: phase.title, path: null, symbol: null, contentHash: null, metadata: { revision: version, goal: phase.goal } });
     for (const dependency of phase.dependencies) host.graphEdge({ sourceId: `phase:${phase.id}`, targetId: `phase:${dependency}`, type: "depends_on", metadata: { version } });
   });
-  const current = host.phases().find((phase) => ["READY", "REVERIFY_REQUIRED", "AWAITING_APPROVAL"].includes(phase.status))?.id ?? null;
+
+  const currentRow = host.db.prepare("SELECT id FROM phases WHERE status IN ('READY','REVERIFY_REQUIRED','AWAITING_APPROVAL') ORDER BY ordinal LIMIT 1").get() as DbRow | undefined;
+  const current = currentRow ? text(currentRow.id) : null;
   host.db.prepare("UPDATE project SET contract_json = ?, plan_version = ?, status = 'ACTIVE', current_phase_id = ?, updated_at = ?")
     .run(JSON.stringify(nextContract), version, current, now());
   host.db.prepare("INSERT INTO plan_revisions (version, contract_json, amendment_json, created_at) VALUES (?, ?, ?, ?)")
     .run(version, JSON.stringify(nextContract), JSON.stringify(amendment), now());
-  host.event("plan_amended", null, { version, reason: amendment.reason, added: amendment.addPhases.map((phase) => phase.id), superseded: amendment.supersedePhaseIds });
+  host.event("plan_amended", null, {
+    version, reason: amendment.reason, added: amendment.addPhases.map((phase) => phase.id), superseded: amendment.supersedePhaseIds
+  });
 }
 
 export function listPlanRevisions(db: DatabaseSync): PlanRevisionRecord[] {
@@ -71,6 +81,21 @@ export function writePhaseOptions(db: DatabaseSync, phase: PhaseDefinition, revi
     .run(revision, phase.requiresApproval ? 1 : 0, phase.approvalPrompt ?? null, JSON.stringify(phase.budget ?? {}), phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0, phase.id);
 }
 
+function redirectDependencies(db: DatabaseSync, superseded: string[], replacement: string): void {
+  const rows = db.prepare("SELECT id, dependencies_json FROM phases WHERE status != 'SUPERSEDED'").all() as DbRow[];
+  for (const row of rows) {
+    const dependencies = json<string[]>(row.dependencies_json);
+    if (!dependencies.some((dependency) => superseded.includes(dependency))) continue;
+    const redirected = [...new Set(dependencies.map((dependency) => superseded.includes(dependency) ? replacement : dependency))];
+    db.prepare("UPDATE phases SET dependencies_json = ? WHERE id = ?").run(JSON.stringify(redirected), text(row.id));
+  }
+}
+
+function dependencySatisfied(db: DatabaseSync, id: string): boolean {
+  const row = db.prepare("SELECT status FROM phases WHERE id = ?").get(id) as DbRow | undefined;
+  return Boolean(row && ["COMPLETED", "SUPERSEDED"].includes(text(row.status)));
+}
+
 function validateDefinitions(phases: PhaseDefinition[], existing: Map<string, PhaseRecord>): void {
   const ids = new Set<string>();
   for (const phase of phases) {
@@ -80,7 +105,9 @@ function validateDefinitions(phases: PhaseDefinition[], existing: Map<string, Ph
     if (phase.acceptanceCommands.some((command) => /^(true|echo\b|exit\s+0)$/i.test(command.trim()))) throw new Error(`phase ${phase.id} contains a no-op command`);
     ids.add(phase.id);
   }
-  for (const phase of phases) for (const dependency of phase.dependencies) if (!ids.has(dependency) && !existing.has(dependency)) throw new Error(`unknown dependency: ${dependency}`);
+  for (const phase of phases) for (const dependency of phase.dependencies) {
+    if (!ids.has(dependency) && !existing.has(dependency)) throw new Error(`unknown dependency: ${dependency}`);
+  }
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const byId = new Map(phases.map((phase) => [phase.id, phase]));
@@ -96,5 +123,9 @@ function validateDefinitions(phases: PhaseDefinition[], existing: Map<string, Ph
 }
 
 function mergeContract(contract: ProjectContract, patch: Partial<ProjectContract>): ProjectContract {
-  return { ...contract, ...patch, ...(patch.budget ? { budget: { ...contract.budget, ...patch.budget } } : {}), ...(patch.critic ? { critic: { ...contract.critic, ...patch.critic } } : {}) };
+  return {
+    ...contract, ...patch,
+    ...(patch.budget ? { budget: { ...contract.budget, ...patch.budget } } : {}),
+    ...(patch.critic ? { critic: { ...contract.critic, ...patch.critic } } : {})
+  };
 }
