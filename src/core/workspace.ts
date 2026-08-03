@@ -103,7 +103,7 @@ export class WorkspaceTools {
     const candidate = path.resolve(root, ...repositoryPath.split("/"));
     const canonical = await realpath(candidate);
     const relative = path.relative(root, canonical);
-    if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+    if (relative === "" || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       throw new Error(`path escapes repository: ${relativePath}`);
     }
     return canonical;
