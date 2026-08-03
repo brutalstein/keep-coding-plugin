@@ -172,13 +172,90 @@ export class KeepCodingService {
 
   async prepareParallelPhases(limit?: number): Promise<Record<string, unknown>> {
     const workspaces = await this.orchestrator.prepare(limit);
-    return { workspaces, nextAction: "run_each_phase_in_its_worktree" };
+    return { workspaces, nextAction: "run_each_phase_in_its_worktree_and_commit_changes" };
   }
 
-  async mergeParallelPhase(phaseId: string): Promise<Record<string, unknown>> {
-    const merged = await this.orchestrator.merge(phaseId);
-    await indexRepository(this.store, this.git);
-    return { ...merged, nextAction: "start_phase_and_checkpoint" };
+  async mergeParallelPhase(phaseId: string, summary = "Merge verified parallel phase", usage: BudgetUsage = {}): Promise<Record<string, unknown>> {
+    const phase = this.store.getPhase(phaseId);
+    if (!phase) throw new Error(`unknown phase: ${phaseId}`);
+    if (phase.requiresApproval && !this.store.listApprovals().some((approval) => approval.phaseId === phaseId && approval.status === "approved")) {
+      const pending = this.store.listApprovals().find((approval) => approval.phaseId === phaseId && approval.status === "pending");
+      const approval = pending ?? this.store.requestApproval(phaseId, `Approve phase ${phaseId}?`, `${phase.title}: ${phase.goal}`);
+      return { phase: this.store.getPhase(phaseId), approval, nextAction: "resolve_approval" };
+    }
+
+    const record = this.orchestrator.prepared(phaseId);
+    const worktreeGit = await GitRepository.open(record.path);
+    const changedFiles = await worktreeGit.changedFilesBetween(record.baseSha);
+    const impactedFiles = expandImpactedFiles(this.store, changedFiles);
+    const impactedTests = this.store.impactedTests(changedFiles);
+    const impactedCompletedPhases = this.store.completedPhasesImpactedByFiles(impactedFiles, phaseId);
+    const started = this.store.startPhase(phaseId, record.baseSha);
+    const measuredUsage = withMeasuredWallClock(usage, started.startedAt);
+    this.store.markVerifying(phaseId);
+    const verifying = this.store.getPhase(phaseId);
+    if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
+
+    const evidence = await new PhaseVerifier().verifyCommittedRange(worktreeGit, verifying, record.baseSha, {
+      contract: this.store.getProject()?.contract,
+      usage: measuredUsage,
+      impactedTests
+    });
+    if (!evidence.passed) {
+      const updated = this.store.finishVerification(phaseId, summary, evidence);
+      return {
+        phase: updated,
+        evidence,
+        impactedFiles,
+        impactedCompletedPhases,
+        merged: false,
+        worktree: record,
+        nextAction: "repair_and_commit_the_parallel_worktree"
+      };
+    }
+
+    const mergeStarted = performance.now();
+    try {
+      const merged = await this.orchestrator.merge(phaseId);
+      evidence.checkpointCommitSha = merged.gitSha;
+      evidence.gitSha = merged.gitSha;
+      const updated = this.store.finishVerification(phaseId, summary, evidence);
+      await indexRepository(this.store, this.git);
+      this.store.markNeedsReverification(impactedCompletedPhases, phaseId);
+      const project = this.store.getProject();
+      if (project?.contract) this.playbook.rememberPhase(updated, project.contract);
+      return {
+        phase: updated,
+        evidence,
+        impactedFiles,
+        impactedCompletedPhases,
+        merged: true,
+        gitSha: merged.gitSha,
+        nextAction: this.store.currentPhase() ? "continue_with_ready_phase" : "complete_project"
+      };
+    } catch (error) {
+      evidence.passed = false;
+      evidence.commands.push({
+        command: `git merge --no-ff ${record.branch}`,
+        exitCode: null,
+        passed: false,
+        durationMs: Math.round(performance.now() - mergeStarted),
+        stdout: "",
+        stderr: error instanceof Error ? error.message : String(error),
+        timedOut: false
+      });
+      const updated = this.store.finishVerification(phaseId, `${summary}: merge failed`, evidence);
+      this.store.recordFailure(phaseId, `Parallel worktree merge failed: ${error instanceof Error ? error.message : String(error)}`);
+      return {
+        phase: updated,
+        evidence,
+        impactedFiles,
+        impactedCompletedPhases,
+        merged: false,
+        worktree: record,
+        nextAction: "resolve_merge_conflict_in_the_parallel_worktree"
+      };
+    }
   }
 
   async discardParallelPhase(phaseId: string): Promise<Record<string, unknown>> {
