@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added an opt-in Streamable HTTP MCP transport for custom ChatGPT apps.
+- Added canonical allowed-root, Host, request-size, bearer, and exact acceptance-command policies for remote deployments.
+- Added bounded remote repository tools for file listing, text reads, code search, Git diff inspection, and phase-scoped unified patches.
+- Added ChatGPT deployment documentation, security guidance, and HTTP/workspace tests.
+
 ## 0.1.0 — 2026-08-02
 
 - First GitHub-ready product version.
@@ -8,4 +15,3 @@
 - Added scope- and command-gated checkpoints with bounded output and timeouts.
 - Added paired A/B worktree runner with Wilson intervals and exact McNemar statistics.
 - Added strict TypeScript, linting, coverage gates, protocol tests, documentation, and CI.
-

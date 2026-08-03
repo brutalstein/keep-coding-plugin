@@ -9,7 +9,7 @@ export default defineConfig({
       provider: "v8",
       reporter: ["text", "json-summary"],
       include: ["src/**/*.ts"],
-      exclude: ["src/entry.ts", "src/mcp/server.ts"],
+      exclude: ["src/entry.ts", "src/mcp/server.ts", "src/mcp/http.ts"],
       thresholds: {
         lines: 80,
         functions: 80,

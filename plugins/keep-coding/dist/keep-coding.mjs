@@ -7,7 +7,7 @@ var __export = (target, all) => {
 
 // src/hooks/handler.ts
 import { existsSync } from "node:fs";
-import path5 from "node:path";
+import path6 from "node:path";
 
 // src/core/detector.ts
 var LARGE_PROJECT_TERMS = [
@@ -2870,17 +2870,169 @@ function truncate(value) {
 ${value.slice(-half)}`;
 }
 
-// src/core/service.ts
-var KeepCodingService = class _KeepCodingService {
+// src/core/workspace.ts
+import { spawn } from "node:child_process";
+import { readFile as readFile3, realpath, stat as stat2 } from "node:fs/promises";
+import path5 from "node:path";
+var MAX_READ_BYTES = 1048576;
+var MAX_SEARCH_BYTES = 32 * 1024 * 1024;
+var MAX_PATCH_BYTES = 256 * 1024;
+var MAX_DIFF_CHARS = 1e5;
+var MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
+var WorkspaceTools = class {
   constructor(git, store) {
     this.git = git;
     this.store = store;
+    this.canonicalRoot = realpath(git.root);
   }
   git;
   store;
+  canonicalRoot;
+  async listFiles(maxFiles = 500) {
+    const files = await this.git.allFiles();
+    return { files: files.slice(0, maxFiles), truncated: files.length > maxFiles };
+  }
+  async readTextFile(relativePath, startLine = 1, endLine = 400) {
+    if (startLine < 1 || endLine < startLine) throw new Error("line range is invalid");
+    const safePath = await this.resolveExistingFile(relativePath);
+    const info = await stat2(safePath);
+    if (!info.isFile()) throw new Error(`not a regular file: ${relativePath}`);
+    if (info.size > MAX_READ_BYTES) throw new Error(`file exceeds ${MAX_READ_BYTES} bytes: ${relativePath}`);
+    const buffer = await readFile3(safePath);
+    if (buffer.includes(0)) throw new Error(`binary files cannot be read as text: ${relativePath}`);
+    const lines = buffer.toString("utf8").split(/\r?\n/);
+    const boundedEnd = Math.min(endLine, lines.length);
+    return {
+      path: normalizeRepositoryPath(relativePath),
+      startLine,
+      endLine: boundedEnd,
+      totalLines: lines.length,
+      content: lines.slice(startLine - 1, boundedEnd).map((line, index) => `${startLine + index}: ${line}`).join("\n")
+    };
+  }
+  async searchCode(query, maxResults = 100) {
+    const needle = query.toLowerCase();
+    const matches = [];
+    let inspectedBytes = 0;
+    for (const file of await this.git.allFiles()) {
+      const safePath = await this.resolveExistingFile(file).catch(() => null);
+      if (safePath === null) continue;
+      const info = await stat2(safePath).catch(() => null);
+      if (info === null || !info.isFile() || info.size > MAX_READ_BYTES) continue;
+      inspectedBytes += info.size;
+      if (inspectedBytes > MAX_SEARCH_BYTES) return { matches, truncated: true };
+      const buffer = await readFile3(safePath);
+      if (buffer.includes(0)) continue;
+      const lines = buffer.toString("utf8").split(/\r?\n/);
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index] ?? "";
+        if (!line.toLowerCase().includes(needle)) continue;
+        matches.push({ path: file, line: index + 1, text: line.slice(0, 500) });
+        if (matches.length >= maxResults) return { matches, truncated: true };
+      }
+    }
+    return { matches, truncated: false };
+  }
+  async diff(maxChars = 3e4) {
+    const result = await runGit(this.git.root, ["diff", "--no-ext-diff", "--unified=3", "--", ".", ":(exclude).keep-coding/**"]);
+    const changedFiles = await this.git.changedFiles();
+    const trackedChanged = new Set((await runGit(this.git.root, ["diff", "--name-only", "--", ".", ":(exclude).keep-coding/**"])).stdout.split(/\r?\n/).filter(Boolean));
+    const untracked = changedFiles.filter((file) => !trackedChanged.has(file));
+    const suffix = untracked.length === 0 ? "" : `
+
+Untracked files:
+${untracked.map((file) => `- ${file}`).join("\n")}`;
+    const value = `${result.stdout}${suffix}`;
+    const limit = Math.min(maxChars, MAX_DIFF_CHARS);
+    return { diff: value.slice(0, limit), changedFiles, truncated: value.length > limit };
+  }
+  async applyPatch(phaseId, patchText) {
+    const patchBytes = Buffer.byteLength(patchText);
+    if (patchBytes === 0) throw new Error("patch must not be empty");
+    if (patchBytes > MAX_PATCH_BYTES) throw new Error(`patch exceeds ${MAX_PATCH_BYTES} bytes`);
+    if (/^(?:new file mode|old mode) 120000$/m.test(patchText)) {
+      throw new Error("symbolic-link patches are not allowed through remote workspace tools");
+    }
+    const phase = this.store.getPhase(phaseId);
+    if (!phase) throw new Error(`unknown phase: ${phaseId}`);
+    if (phase.status !== "IN_PROGRESS") throw new Error(`phase ${phaseId} is not in progress`);
+    const files = extractPatchPaths(patchText);
+    if (files.length === 0) throw new Error("patch does not contain any supported file changes");
+    const violations = files.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true })));
+    if (violations.length > 0) throw new Error(`patch changes files outside phase scope: ${violations.join(", ")}`);
+    await runGit(this.git.root, ["apply", "--check", "--recount", "--whitespace=error", "-"], patchText);
+    await runGit(this.git.root, ["apply", "--recount", "--whitespace=error", "-"], patchText);
+    this.store.appendEvent("workspace_patch_applied", phaseId, { files, patchBytes });
+    return { applied: true, phaseId, files, diffHash: await this.git.diffHash() };
+  }
+  async resolveExistingFile(relativePath) {
+    const repositoryPath = normalizeRepositoryPath(relativePath);
+    const root = await this.canonicalRoot;
+    const candidate = path5.resolve(root, ...repositoryPath.split("/"));
+    const canonical = await realpath(candidate);
+    const relative = path5.relative(root, canonical);
+    if (relative === "" || relative === ".." || relative.startsWith(`..${path5.sep}`) || path5.isAbsolute(relative)) {
+      throw new Error(`path escapes repository: ${relativePath}`);
+    }
+    return canonical;
+  }
+};
+function extractPatchPaths(patchText) {
+  const files = /* @__PURE__ */ new Set();
+  for (const line of patchText.split(/\r?\n/)) {
+    const match2 = /^(?:---|\+\+\+) (?:a|b)\/(.+)$/.exec(line);
+    if (!match2) continue;
+    files.add(normalizeRepositoryPath(match2[1] ?? ""));
+  }
+  return [...files].sort();
+}
+function normalizeRepositoryPath(value) {
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");
+  const protectedPath = normalized === ".git" || normalized.startsWith(".git/") || normalized === ".keep-coding" || normalized.startsWith(".keep-coding/");
+  if (normalized === "" || protectedPath || path5.posix.isAbsolute(normalized)) {
+    throw new Error(`invalid repository path: ${value}`);
+  }
+  const parts = normalized.split("/");
+  if (parts.some((part) => part === "" || part === "." || part === "..")) throw new Error(`invalid repository path: ${value}`);
+  return parts.join("/");
+}
+async function runGit(cwd, args, input) {
+  return new Promise((resolve, reject) => {
+    const child = spawn("git", args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+    const stdout = [];
+    const stderr = [];
+    let outputBytes = 0;
+    const collect = (target) => (chunk) => {
+      outputBytes += chunk.byteLength;
+      if (outputBytes <= MAX_GIT_OUTPUT_BYTES) target.push(chunk);
+    };
+    child.stdout.on("data", collect(stdout));
+    child.stderr.on("data", collect(stderr));
+    child.once("error", reject);
+    child.once("close", (code) => {
+      const result = { stdout: Buffer.concat(stdout).toString("utf8"), stderr: Buffer.concat(stderr).toString("utf8") };
+      if (code === 0) resolve(result);
+      else reject(new Error(`git ${args[0] ?? "command"} failed (${code ?? "signal"}): ${result.stderr.trim() || result.stdout.trim()}`));
+    });
+    if (input === void 0) child.stdin.end();
+    else child.stdin.end(input, "utf8");
+  });
+}
+
+// src/core/service.ts
+var KeepCodingService = class _KeepCodingService {
+  constructor(git, store, workspace) {
+    this.git = git;
+    this.store = store;
+    this.workspace = workspace;
+  }
+  git;
+  store;
+  workspace;
   static async open(projectRoot) {
     const git = await GitRepository.open(projectRoot);
-    return new _KeepCodingService(git, new ProjectStore(git.root));
+    const store = new ProjectStore(git.root);
+    return new _KeepCodingService(git, store, new WorkspaceTools(git, store));
   }
   close() {
     this.store.close();
@@ -2925,7 +3077,7 @@ async function handleHook(event, input) {
   const candidate = typeof input.cwd === "string" ? input.cwd : process.cwd();
   const git = await GitRepository.open(candidate).catch(() => null);
   if (!git) return { continue: true };
-  const stateExists = existsSync(path5.join(git.root, ".keep-coding", "state.db"));
+  const stateExists = existsSync(path6.join(git.root, ".keep-coding", "state.db"));
   if (event === "UserPromptSubmit" && !stateExists) {
     const prompt = typeof input.prompt === "string" ? input.prompt : "";
     const detection = detectLargeProject(prompt);
@@ -2983,6 +3135,11 @@ async function withService(root, operation) {
     service.close();
   }
 }
+
+// src/mcp/http.ts
+import { timingSafeEqual } from "node:crypto";
+import { createServer as createNodeServer } from "node:http";
+import path9 from "node:path";
 
 // node_modules/@modelcontextprotocol/server/dist/chunk-Br0eD_fh.mjs
 var __create = Object.create;
@@ -3284,10 +3441,10 @@ function mergeDefs(...defs) {
 function cloneDef(schema) {
   return mergeDefs(schema._zod.def);
 }
-function getElementAtPath(obj, path7) {
-  if (!path7)
+function getElementAtPath(obj, path11) {
+  if (!path11)
     return obj;
-  return path7.reduce((acc, key) => acc?.[key], obj);
+  return path11.reduce((acc, key) => acc?.[key], obj);
 }
 function promiseAllObject(promisesObj) {
   const keys = Object.keys(promisesObj);
@@ -3696,11 +3853,11 @@ function explicitlyAborted(x, startIndex = 0) {
   }
   return false;
 }
-function prefixIssues(path7, issues) {
+function prefixIssues(path11, issues) {
   return issues.map((iss) => {
     var _a4;
     (_a4 = iss).path ?? (_a4.path = []);
-    iss.path.unshift(path7);
+    iss.path.unshift(path11);
     return iss;
   });
 }
@@ -3847,16 +4004,16 @@ function flattenError(error2, mapper = (issue2) => issue2.message) {
 }
 function formatError(error2, mapper = (issue2) => issue2.message) {
   const fieldErrors = { _errors: [] };
-  const processError = (error3, path7 = []) => {
+  const processError = (error3, path11 = []) => {
     for (const issue2 of error3.issues) {
       if (issue2.code === "invalid_union" && issue2.errors.length) {
-        issue2.errors.map((issues) => processError({ issues }, [...path7, ...issue2.path]));
+        issue2.errors.map((issues) => processError({ issues }, [...path11, ...issue2.path]));
       } else if (issue2.code === "invalid_key") {
-        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path11, ...issue2.path]);
       } else if (issue2.code === "invalid_element") {
-        processError({ issues: issue2.issues }, [...path7, ...issue2.path]);
+        processError({ issues: issue2.issues }, [...path11, ...issue2.path]);
       } else {
-        const fullpath = [...path7, ...issue2.path];
+        const fullpath = [...path11, ...issue2.path];
         if (fullpath.length === 0) {
           fieldErrors._errors.push(mapper(issue2));
         } else {
@@ -8663,6 +8820,7 @@ config(en_default());
 
 // node_modules/@modelcontextprotocol/core/dist/auth-CUe6YdwF.mjs
 var LATEST_PROTOCOL_VERSION = "2025-11-25";
+var DEFAULT_NEGOTIATED_PROTOCOL_VERSION = "2025-03-26";
 var SUPPORTED_PROTOCOL_VERSIONS = [
   LATEST_PROTOCOL_VERSION,
   "2025-06-18",
@@ -9736,6 +9894,10 @@ var SdkHttpError = class extends SdkError {
     return this.data.statusText;
   }
 };
+var REQUIRED_CLIENT_CAPABILITIES_BY_METHOD = {};
+function requiredClientCapabilitiesForRequest(method) {
+  return Object.hasOwn(REQUIRED_CLIENT_CAPABILITIES_BY_METHOD, method) ? REQUIRED_CLIENT_CAPABILITIES_BY_METHOD[method] : void 0;
+}
 function isPlainObject$7(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -9776,6 +9938,7 @@ function missingClientCapabilities(required2, declared) {
   return Object.keys(missing).length > 0 ? missing : void 0;
 }
 var FIRST_MODERN_PROTOCOL_VERSION = "2026-07-28";
+var SUPPORTED_MODERN_PROTOCOL_VERSIONS = [FIRST_MODERN_PROTOCOL_VERSION];
 function isModernProtocolVersion(version2) {
   return version2 >= FIRST_MODERN_PROTOCOL_VERSION;
 }
@@ -12220,9 +12383,9 @@ var rev2026Codec = {
     });
     const parsed = buildSchemas2026().RequestMetaEnvelopeSchema.safeParse(meta2);
     if (!parsed.success) for (const issue2 of parsed.error.issues) {
-      const path7 = issue2.path.map(String);
-      const key = path7.length > 0 ? path7.join(".") : "_meta";
-      if (path7.length === 1 && issues.some((existing) => existing.key === key && existing.problem === "missing")) continue;
+      const path11 = issue2.path.map(String);
+      const key = path11.length > 0 ? path11.join(".") : "_meta";
+      if (path11.length === 1 && issues.some((existing) => existing.key === key && existing.problem === "missing")) continue;
       issues.push({
         key,
         problem: issue2.message
@@ -12334,6 +12497,25 @@ function isSpecNotificationMethod(method) {
   return ALL_CODECS.some((codec) => codec.hasNotificationMethod(method));
 }
 var ALL_CODECS = [rev2025Codec, rev2026Codec];
+function isPlainObject$3(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function requestMetaOf(params) {
+  if (!isPlainObject$3(params)) return void 0;
+  const meta2 = params["_meta"];
+  return isPlainObject$3(meta2) ? meta2 : void 0;
+}
+function hasEnvelopeClaim(params) {
+  const meta2 = requestMetaOf(params);
+  return meta2 !== void 0 && PROTOCOL_VERSION_META_KEY in meta2;
+}
+function envelopeClaimVersion(params) {
+  const value = requestMetaOf(params)?.[PROTOCOL_VERSION_META_KEY];
+  return typeof value === "string" ? value : void 0;
+}
+function validateEnvelopeMeta(meta2) {
+  return codecForVersion(MODERN_WIRE_REVISION).validateEnvelopeMeta(meta2);
+}
 var schemas_exports2 = /* @__PURE__ */ __exportAll({
   AnnotationsSchema: () => AnnotationsSchema,
   AudioContentSchema: () => AudioContentSchema,
@@ -12507,12 +12689,14 @@ var isJSONRPCNotification = (value) => JSONRPCNotificationSchema.safeParse(value
 var isJSONRPCResultResponse = (value) => JSONRPCResultResponseSchema.safeParse(value).success;
 var isJSONRPCErrorResponse = (value) => JSONRPCErrorResponseSchema.safeParse(value).success;
 var isInputRequiredResult = (value) => typeof value === "object" && value !== null && !Array.isArray(value) && value.resultType === "input_required";
+var isInitializeRequest = (value) => InitializeRequestSchema.safeParse(value).success;
 function assertCompleteRequestPrompt(request) {
   if (request.params.ref.type !== "ref/prompt") throw new TypeError(`Expected CompleteRequestPrompt, but got ${request.params.ref.type}`);
 }
 function assertCompleteRequestResourceTemplate(request) {
   if (request.params.ref.type !== "ref/resource") throw new TypeError(`Expected CompleteRequestResourceTemplate, but got ${request.params.ref.type}`);
 }
+var MCP_PARAM_HEADER_PREFIX = "Mcp-Param-";
 var X_MCP_HEADER_KEY = "x-mcp-header";
 var RFC9110_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 var PERMITTED_X_MCP_HEADER_TYPES = /* @__PURE__ */ new Set([
@@ -12524,29 +12708,29 @@ var PERMITTED_X_MCP_HEADER_TYPES = /* @__PURE__ */ new Set([
 function scanXMcpHeaderDeclarations(inputSchema) {
   const declarations = [];
   const seenLower = /* @__PURE__ */ new Map();
-  const visit = (node, path7, reachable) => {
+  const visit = (node, path11, reachable) => {
     if (node === null || typeof node !== "object") return void 0;
     const schema = node;
     if (X_MCP_HEADER_KEY in schema) {
-      if (!reachable || path7.length === 0) return `${pathName(path7)}: x-mcp-header is only permitted on properties statically reachable via a chain of 'properties' keys (not under items, additionalProperties, oneOf/anyOf/allOf/not, if/then/else, or $ref)`;
+      if (!reachable || path11.length === 0) return `${pathName(path11)}: x-mcp-header is only permitted on properties statically reachable via a chain of 'properties' keys (not under items, additionalProperties, oneOf/anyOf/allOf/not, if/then/else, or $ref)`;
       const raw = schema[X_MCP_HEADER_KEY];
-      if (typeof raw !== "string" || raw.length === 0) return `${pathName(path7)}: x-mcp-header MUST be a non-empty string`;
-      if (!RFC9110_TOKEN.test(raw)) return `${pathName(path7)}: x-mcp-header '${raw}' is not a valid RFC 9110 token (no spaces, control characters or HTTP delimiters)`;
+      if (typeof raw !== "string" || raw.length === 0) return `${pathName(path11)}: x-mcp-header MUST be a non-empty string`;
+      if (!RFC9110_TOKEN.test(raw)) return `${pathName(path11)}: x-mcp-header '${raw}' is not a valid RFC 9110 token (no spaces, control characters or HTTP delimiters)`;
       const type = typeof schema.type === "string" ? schema.type : void 0;
-      if (type === void 0 || !PERMITTED_X_MCP_HEADER_TYPES.has(type)) return `${pathName(path7)}: x-mcp-header is only permitted on primitive-typed properties (string, integer, boolean); got ${type ?? "<none>"}`;
+      if (type === void 0 || !PERMITTED_X_MCP_HEADER_TYPES.has(type)) return `${pathName(path11)}: x-mcp-header is only permitted on primitive-typed properties (string, integer, boolean); got ${type ?? "<none>"}`;
       const lower = raw.toLowerCase();
       const prior = seenLower.get(lower);
       if (prior !== void 0) return `x-mcp-header '${raw}' is not case-insensitively unique (also declared as '${prior}')`;
       seenLower.set(lower, raw);
       declarations.push({
-        path: path7,
+        path: path11,
         headerName: raw,
         type
       });
     }
     const properties = schema.properties;
     if (properties !== null && typeof properties === "object") for (const [key, child] of Object.entries(properties)) {
-      const fault$1 = visit(child, [...path7, key], reachable);
+      const fault$1 = visit(child, [...path11, key], reachable);
       if (fault$1 !== void 0) return fault$1;
     }
     for (const k of NON_REACHABLE_SUBSCHEMA_KEYWORDS) {
@@ -12554,7 +12738,7 @@ function scanXMcpHeaderDeclarations(inputSchema) {
       if (sub === void 0) continue;
       const branches = Array.isArray(sub) ? sub : sub !== null && typeof sub === "object" && OBJECT_VALUED_SUBSCHEMA_KEYWORDS.has(k) ? Object.values(sub) : [sub];
       for (const branch of branches) {
-        const fault$1 = visit(branch, [...path7, `<${k}>`], false);
+        const fault$1 = visit(branch, [...path11, `<${k}>`], false);
         if (fault$1 !== void 0) return fault$1;
       }
     }
@@ -12594,8 +12778,74 @@ var OBJECT_VALUED_SUBSCHEMA_KEYWORDS = /* @__PURE__ */ new Set([
   "$defs",
   "definitions"
 ]);
-function pathName(path7) {
-  return path7.length === 0 ? "<root>" : path7.join(".");
+function pathName(path11) {
+  return path11.length === 0 ? "<root>" : path11.join(".");
+}
+var BASE64_SENTINEL_PREFIX = "=?base64?";
+var BASE64_SENTINEL_SUFFIX = "?=";
+var BASE64_CANONICAL = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+var CANONICAL_DECIMAL = /^-?\d+(\.\d+)?$/;
+function mcpParamPrimitiveToString(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "boolean") return value ? "true" : "false";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return void 0;
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) return void 0;
+    return String(value);
+  }
+}
+function base64ToUtf8(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.codePointAt(i);
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+function decodeMcpParamValue(value) {
+  if (!(value.startsWith(BASE64_SENTINEL_PREFIX) && value.endsWith(BASE64_SENTINEL_SUFFIX))) return value;
+  const b64 = value.slice(9, value.length - 2);
+  if (!BASE64_CANONICAL.test(b64)) return void 0;
+  try {
+    return base64ToUtf8(b64);
+  } catch {
+    return;
+  }
+}
+function valueAtPath(root, path11) {
+  let node = root;
+  for (const key of path11) {
+    if (node === null || typeof node !== "object") return void 0;
+    node = node[key];
+  }
+  return node;
+}
+function validateMcpParamHeaders(declarations, args, headers) {
+  for (const decl of declarations) {
+    const headerKey = `${MCP_PARAM_HEADER_PREFIX}${decl.headerName}`;
+    const headerValue = headers.get(headerKey);
+    const bodyRaw = valueAtPath(args, decl.path);
+    if (bodyRaw === void 0 || bodyRaw === null) continue;
+    const bodyString = mcpParamPrimitiveToString(bodyRaw);
+    if (bodyString === void 0) continue;
+    if (headerValue === null) return paramHeaderMismatchRejection("param-header-missing", headerKey, `the body carries ${pathName(decl.path)}=${JSON.stringify(bodyRaw)} but the ${headerKey} header is absent`);
+    const decoded = decodeMcpParamValue(headerValue);
+    if (decoded === void 0) return paramHeaderMismatchRejection("param-header-invalid-encoding", headerKey, `the ${headerKey} header carries an invalid Base64 sentinel value`);
+    if (!((decl.type === "integer" || decl.type === "number") && CANONICAL_DECIMAL.test(decoded) && typeof bodyRaw === "number" ? Number(decoded) === bodyRaw : decoded === bodyString)) return paramHeaderMismatchRejection("param-header-mismatch", headerKey, `the ${headerKey} header decodes to ${JSON.stringify(decoded)} but the body carries ${pathName(decl.path)}=${JSON.stringify(bodyRaw)}`);
+  }
+}
+function paramHeaderMismatchRejection(cell, header2, body) {
+  return {
+    kind: "reject",
+    rung: "param-header-validation",
+    cell,
+    httpStatus: 400,
+    code: HEADER_MISMATCH_ERROR_CODE,
+    message: `Bad Request: the request headers and body disagree: ${body}`,
+    data: { mismatch: {
+      header: header2,
+      body
+    } },
+    settled: true
+  };
 }
 var HEADER_MISMATCH_ERROR_CODE = -32020;
 var INBOUND_VALIDATION_LADDER = [
@@ -12684,6 +12934,217 @@ var LADDER_ERROR_HTTP_STATUS = {
   [ProtocolErrorCode.MissingRequiredClientCapability]: 400,
   [HEADER_MISMATCH_ERROR_CODE]: 400
 };
+function httpStatusForErrorCode(code, origin) {
+  if (origin === "in-band") return code === ProtocolErrorCode.MissingRequiredClientCapability ? 400 : 200;
+  return LADDER_ERROR_HTTP_STATUS[code] ?? 400;
+}
+function rejection(rung, cell, httpStatus, error2, settled) {
+  return {
+    kind: "reject",
+    rung,
+    cell,
+    httpStatus,
+    code: error2.code,
+    message: error2.message,
+    ...error2.data !== void 0 && { data: error2.data },
+    settled
+  };
+}
+function crossCheckMismatch(cell, header2, body, rung = "era-classification") {
+  return rejection(rung, cell, 400, new ProtocolError(HEADER_MISMATCH_ERROR_CODE, `Bad Request: the request headers and body disagree: ${body}`, { mismatch: {
+    header: header2,
+    body
+  } }), true);
+}
+var MCP_NAME_HEADER_SOURCE = {
+  "tools/call": "name",
+  "prompts/get": "name",
+  "resources/read": "uri"
+};
+function stripHttpOws(value) {
+  let start = 0;
+  while (start < value.length) {
+    const code = value.codePointAt(start);
+    if (code !== 9 && code !== 32) break;
+    start += 1;
+  }
+  let end = value.length;
+  while (end > start) {
+    const code = value.codePointAt(end - 1);
+    if (code !== 9 && code !== 32) break;
+    end -= 1;
+  }
+  return start === 0 && end === value.length ? value : value.slice(start, end);
+}
+function validateStandardRequestHeaders(request, route) {
+  if (route.messageKind !== "request") return;
+  const method = route.message.method;
+  if (request.mcpMethodHeader === void 0) return crossCheckMismatch("method-header-missing", "(missing)", `the body names method ${method} but the required Mcp-Method header is absent`, "standard-header-validation");
+  const sourceField = Object.hasOwn(MCP_NAME_HEADER_SOURCE, method) ? MCP_NAME_HEADER_SOURCE[method] : void 0;
+  if (sourceField === void 0) return;
+  const sourceValue = route.message.params?.[sourceField];
+  const bodyValue = typeof sourceValue === "string" ? sourceValue : void 0;
+  if (request.mcpNameHeader === void 0) {
+    if (bodyValue === void 0) return;
+    return crossCheckMismatch("name-header-missing", "(missing)", `the body carries params.${sourceField}="${bodyValue}" but the required Mcp-Name header is absent`, "standard-header-validation");
+  }
+  const normalizedNameHeader = stripHttpOws(request.mcpNameHeader);
+  const decoded = decodeMcpParamValue(normalizedNameHeader);
+  if (decoded === void 0) return crossCheckMismatch("name-header-invalid-encoding", normalizedNameHeader, "the Mcp-Name header carries an invalid Base64 sentinel value", "standard-header-validation");
+  if (bodyValue !== void 0 && decoded !== bodyValue) return crossCheckMismatch("name-header-mismatch", normalizedNameHeader, `the body carries params.${sourceField}="${bodyValue}" but the Mcp-Name header names "${decoded}"`, "standard-header-validation");
+}
+function isPlainObject$2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function classificationForClaim(claimedVersion) {
+  if (claimedVersion === void 0) return { era: "modern" };
+  return {
+    era: isModernProtocolVersion(claimedVersion) ? "modern" : "legacy",
+    revision: claimedVersion
+  };
+}
+function carriesValidModernEnvelopeClaim(params) {
+  if (!hasEnvelopeClaim(params)) return false;
+  const claimedVersion = envelopeClaimVersion(params);
+  if (claimedVersion === void 0 || !isModernProtocolVersion(claimedVersion)) return false;
+  const meta2 = requestMetaOf(params);
+  return meta2 !== void 0 && validateEnvelopeMeta(meta2).length === 0;
+}
+function classifyBatch(body) {
+  if (body.length === 0) return rejection("jsonrpc-shape", "empty-batch", 400, new ProtocolError(ProtocolErrorCode.InvalidRequest, "Bad Request: empty JSON-RPC batch"), true);
+  for (const element of body) {
+    if (hasEnvelopeClaim(isPlainObject$2(element) ? element["params"] : void 0)) return rejection("jsonrpc-shape", "batch-with-modern-element", 400, new ProtocolError(ProtocolErrorCode.InvalidRequest, "Bad Request: JSON-RPC batches may not contain requests for protocol revision 2026-07-28 or later"), true);
+    if (!(isJSONRPCRequest(element) || isJSONRPCNotification(element) || isJSONRPCResultResponse(element) || isJSONRPCErrorResponse(element))) return rejection("jsonrpc-shape", "batch-with-invalid-element", 400, new ProtocolError(ProtocolErrorCode.InvalidRequest, "Bad Request: JSON-RPC batch contains an invalid message"), true);
+  }
+  return {
+    kind: "legacy",
+    reason: "batch"
+  };
+}
+function classifyRequestBody(request, body) {
+  const params = body.params;
+  const method = body.method;
+  const headerVersion = request.protocolVersionHeader;
+  const headerNamesModern = headerVersion !== void 0 && isModernProtocolVersion(headerVersion);
+  if (method === "initialize" && !carriesValidModernEnvelopeClaim(params)) {
+    if (headerNamesModern) return crossCheckMismatch("initialize-with-modern-header", headerVersion, "an initialize request (legacy handshake) was sent with a modern MCP-Protocol-Version header");
+    const requestedVersion = isPlainObject$2(params) && typeof params["protocolVersion"] === "string" ? params["protocolVersion"] : void 0;
+    return {
+      kind: "legacy",
+      reason: "initialize",
+      ...requestedVersion !== void 0 && { requestedVersion }
+    };
+  }
+  if (hasEnvelopeClaim(params)) {
+    const meta2 = requestMetaOf(params);
+    const firstIssue = (meta2 === void 0 ? [] : validateEnvelopeMeta(meta2))[0];
+    if (firstIssue !== void 0) return rejection("envelope", "envelope-invalid", 400, new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid _meta envelope for protocol revision 2026-07-28: ${firstIssue.key}: ${firstIssue.problem}`, { envelope: firstIssue }), true);
+    const claimedVersion = envelopeClaimVersion(params);
+    if (headerVersion !== void 0 && claimedVersion !== void 0 && headerVersion !== claimedVersion) return crossCheckMismatch("header-body-version-mismatch", headerVersion, `the body envelope names protocol version ${claimedVersion} but the MCP-Protocol-Version header names ${headerVersion}`);
+    if (request.mcpMethodHeader !== void 0 && request.mcpMethodHeader !== method) return crossCheckMismatch("method-header-mismatch", request.mcpMethodHeader, `the body names method ${method} but the Mcp-Method header names ${request.mcpMethodHeader}`);
+    return {
+      kind: "modern",
+      messageKind: "request",
+      message: body,
+      classification: classificationForClaim(claimedVersion)
+    };
+  }
+  if (headerNamesModern) {
+    const meta2 = requestMetaOf(params);
+    const missingFromEnvelope = validateEnvelopeMeta(meta2 ?? {}).filter((issue2) => issue2.problem === "missing").map((issue2) => issue2.key);
+    const missing = meta2 === void 0 ? ["_meta"] : missingFromEnvelope.length > 0 ? missingFromEnvelope : [PROTOCOL_VERSION_META_KEY];
+    return rejection("envelope", "modern-header-without-claim", 400, new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid params: the MCP-Protocol-Version header names protocol revision ${headerVersion}, but the request is missing the required per-request envelope key(s): ${missing.join(", ")}`, { envelope: { missing } }), true);
+  }
+  return {
+    kind: "legacy",
+    reason: "no-claim",
+    ...headerVersion !== void 0 && { requestedVersion: headerVersion }
+  };
+}
+function classifyNotificationBody(request, body) {
+  const params = body.params;
+  const method = body.method;
+  const headerVersion = request.protocolVersionHeader;
+  const headerNamesModern = headerVersion !== void 0 && isModernProtocolVersion(headerVersion);
+  if (hasEnvelopeClaim(params)) {
+    const claimedVersion = envelopeClaimVersion(params);
+    if (claimedVersion === void 0) {
+      const meta2 = requestMetaOf(params);
+      const claimIssue = (meta2 === void 0 ? [] : validateEnvelopeMeta(meta2)).find((issue2) => issue2.key === PROTOCOL_VERSION_META_KEY) ?? {
+        key: PROTOCOL_VERSION_META_KEY,
+        problem: "expected a protocol version string"
+      };
+      return rejection("envelope", "notification-envelope-invalid", 400, new ProtocolError(ProtocolErrorCode.InvalidParams, `Invalid _meta envelope for protocol revision 2026-07-28: ${claimIssue.key}: ${claimIssue.problem}`, { envelope: claimIssue }), true);
+    }
+    if (headerVersion !== void 0 && headerVersion !== claimedVersion) return crossCheckMismatch("notification-header-body-version-mismatch", headerVersion, `the notification envelope names protocol version ${claimedVersion} but the MCP-Protocol-Version header names ${headerVersion}`);
+    const classification = classificationForClaim(claimedVersion);
+    if (classification.era === "modern" && request.mcpMethodHeader !== void 0 && request.mcpMethodHeader !== method) return crossCheckMismatch("notification-method-header-mismatch", request.mcpMethodHeader, `the notification body names method ${method} but the Mcp-Method header names ${request.mcpMethodHeader}`);
+    return {
+      kind: "modern",
+      messageKind: "notification",
+      message: body,
+      classification
+    };
+  }
+  if (headerNamesModern) {
+    if (request.mcpMethodHeader !== void 0 && request.mcpMethodHeader !== method) return crossCheckMismatch("notification-method-header-mismatch", request.mcpMethodHeader, `the notification body names method ${method} but the Mcp-Method header names ${request.mcpMethodHeader}`);
+    return {
+      kind: "modern",
+      messageKind: "notification",
+      message: body,
+      classification: {
+        era: "modern",
+        revision: headerVersion
+      }
+    };
+  }
+  return {
+    kind: "legacy",
+    reason: "notification",
+    ...headerVersion !== void 0 && { requestedVersion: headerVersion }
+  };
+}
+function classifyInboundRequest(request) {
+  request = {
+    ...request,
+    ...request.protocolVersionHeader !== void 0 && { protocolVersionHeader: stripHttpOws(request.protocolVersionHeader) },
+    ...request.mcpMethodHeader !== void 0 && { mcpMethodHeader: stripHttpOws(request.mcpMethodHeader) },
+    ...request.mcpNameHeader !== void 0 && { mcpNameHeader: stripHttpOws(request.mcpNameHeader) }
+  };
+  if (request.httpMethod.toUpperCase() !== "POST") return {
+    kind: "legacy",
+    reason: "http-method"
+  };
+  const body = request.body;
+  if (Array.isArray(body)) return classifyBatch(body);
+  if (isJSONRPCResultResponse(body) || isJSONRPCErrorResponse(body)) return {
+    kind: "legacy",
+    reason: "response"
+  };
+  if (isPlainObject$2(body) && isJSONRPCRequest(body)) return classifyRequestBody(request, body);
+  if (isPlainObject$2(body) && isJSONRPCNotification(body)) return classifyNotificationBody(request, body);
+  return rejection("jsonrpc-shape", "invalid-json-rpc-body", 400, new ProtocolError(ProtocolErrorCode.InvalidRequest, "Bad Request: the request body is not a valid JSON-RPC message"), true);
+}
+function modernOnlyStrictRejection(route, supportedVersions) {
+  switch (route.reason) {
+    case "http-method":
+      return rejection("http-method", "modern-only-method-not-allowed", 405, new ProtocolError(-32e3, "Method not allowed."), true);
+    case "batch":
+      return rejection("jsonrpc-shape", "modern-only-batch-not-supported", 400, new ProtocolError(ProtocolErrorCode.InvalidRequest, "Bad Request: JSON-RPC batches are not supported by this endpoint"), true);
+    case "response":
+      return rejection("jsonrpc-shape", "modern-only-response-post", 400, new ProtocolError(ProtocolErrorCode.InvalidRequest, "Bad Request: JSON-RPC responses cannot be posted to this endpoint"), true);
+    case "notification":
+      return;
+    case "initialize":
+    case "no-claim": {
+      const requested = route.requestedVersion;
+      return rejection("era-classification", "modern-only-missing-envelope", 400, requested === void 0 ? new ProtocolError(ProtocolErrorCode.UnsupportedProtocolVersion, "Unsupported protocol version: the request did not name a protocol version", { supported: [...supportedVersions] }) : new UnsupportedProtocolVersionError({
+        supported: [...supportedVersions],
+        requested
+      }), true);
+    }
+  }
+}
 function parseSchema(schema, data) {
   return safeParse2(schema, data);
 }
@@ -12845,7 +13306,7 @@ var PROPERTY_KEYS_BY_TYPE = {
   array: shapeKeys([UntitledMultiSelectEnumSchemaSchema, TitledMultiSelectEnumSchemaSchema])
 };
 var SUPPORTED_STRING_FORMATS = new Set(StringSchemaSchema.shape.format.unwrap().options);
-function walkProperty(node, path7, vendor, unsupported) {
+function walkProperty(node, path11, vendor, unsupported) {
   if (!isJsonObject(node)) return node;
   const allowedKeys = typeof node.type === "string" && Object.hasOwn(PROPERTY_KEYS_BY_TYPE, node.type) ? PROPERTY_KEYS_BY_TYPE[node.type] : void 0;
   if (allowedKeys === void 0) return node;
@@ -12853,8 +13314,8 @@ function walkProperty(node, path7, vendor, unsupported) {
   for (const [key, value] of Object.entries(node)) if (allowedKeys.has(key) || isAnnotationOnlyJsonSchemaKeyword(key)) pruned[key] = value;
   else if (key === "pattern" && node.type === "string" && typeof node.format === "string") {
     if (!SUPPORTED_STRING_FORMATS.has(node.format)) pruned[key] = value;
-    else if (typeof value !== "string" || !isLibraryFormatPattern(node.format, value, vendor)) unsupported.push(`${path7}.${key}`);
-  } else unsupported.push(`${path7}.${key}`);
+    else if (typeof value !== "string" || !isLibraryFormatPattern(node.format, value, vendor)) unsupported.push(`${path11}.${key}`);
+  } else unsupported.push(`${path11}.${key}`);
   return pruned;
 }
 function walkRequestedSchema(converted, vendor) {
@@ -12871,11 +13332,11 @@ function describeUnsupportedProperties(pruned, fallback) {
   const offenders = Object.entries(pruned.properties).filter(([, node]) => !parseSchema(PrimitiveSchemaDefinitionSchema, node).success).map(([name]) => `properties.${name}`);
   return offenders.length > 0 ? offenders.join(", ") : fallback;
 }
-function findDroppedConstraintPaths(original, parsed, path7 = "") {
-  if (Array.isArray(original) && Array.isArray(parsed)) return original.flatMap((item, index) => findDroppedConstraintPaths(item, parsed[index], `${path7}[${index}]`));
+function findDroppedConstraintPaths(original, parsed, path11 = "") {
+  if (Array.isArray(original) && Array.isArray(parsed)) return original.flatMap((item, index) => findDroppedConstraintPaths(item, parsed[index], `${path11}[${index}]`));
   if (!isJsonObject(original) || !isJsonObject(parsed)) return [];
   return Object.entries(original).flatMap(([key, value]) => {
-    const childPath = path7 ? `${path7}.${key}` : key;
+    const childPath = path11 ? `${path11}.${key}` : key;
     if (!Object.prototype.hasOwnProperty.call(parsed, key)) return isAnnotationOnlyJsonSchemaKeyword(key) ? [] : [childPath];
     return findDroppedConstraintPaths(value, parsed[key], childPath);
   });
@@ -13245,6 +13706,9 @@ function withRequestStateValue(ctx, value) {
   };
 }
 var writeNegotiatedProtocolVersion;
+function setNegotiatedProtocolVersion(instance, version2) {
+  writeNegotiatedProtocolVersion(instance, version2);
+}
 var Protocol = class {
   _transport;
   _requestMessageId = 0;
@@ -14064,6 +14528,20 @@ var require_content_type = /* @__PURE__ */ __commonJSMin(((exports) => {
   }
 }));
 var import_content_type = /* @__PURE__ */ __toESM(require_content_type(), 1);
+function mediaTypeEssence(header2) {
+  if (!header2) return;
+  try {
+    return import_content_type.parse(header2).type;
+  } catch {
+    const essence = (header2.split(";", 1)[0] ?? "").trim().toLowerCase();
+    if (essence === "" || header2.slice(essence.length).includes(",")) return;
+    return essence;
+  }
+}
+function isJsonContentType(header2) {
+  if (header2 === "application/json") return true;
+  return mediaTypeEssence(header2) === "application/json";
+}
 var STDIO_DEFAULT_MAX_BUFFER_SIZE = 10 * 1024 * 1024;
 var ReadBuffer = class {
   _buffer;
@@ -16950,8 +17428,8 @@ var require_utils = /* @__PURE__ */ __commonJSMin(((exports, module) => {
     for (let i = 0; i < str.length; i++) if (str[i] === token) ind++;
     return ind;
   }
-  function removeDotSegments(path7) {
-    let input = path7;
+  function removeDotSegments(path11) {
+    let input = path11;
     const output = [];
     let nextSlash = -1;
     let len = 0;
@@ -17104,8 +17582,8 @@ var require_schemes = /* @__PURE__ */ __commonJSMin(((exports, module) => {
       wsComponent.secure = void 0;
     }
     if (wsComponent.resourceName) {
-      const [path7, query] = wsComponent.resourceName.split("?");
-      wsComponent.path = path7 && path7 !== "/" ? path7 : void 0;
+      const [path11, query] = wsComponent.resourceName.split("?");
+      wsComponent.path = path11 && path11 !== "/" ? path11 : void 0;
       wsComponent.query = query;
       wsComponent.resourceName = void 0;
     }
@@ -21187,7 +21665,232 @@ function isCompletable(schema) {
 function getCompleter(schema) {
   return schema[COMPLETABLE_SYMBOL]?.complete;
 }
+var DEFAULT_SSE_KEEP_ALIVE_MS = 15e3;
 var MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
+function armSseKeepAlive(intervalMs, onTick) {
+  if (!Number.isFinite(intervalMs) || intervalMs < 1) return;
+  const timer = setInterval(onTick, Math.min(intervalMs, MAX_TIMER_DELAY_MS));
+  timer.unref?.();
+  return timer;
+}
+var InMemoryServerEventBus = class {
+  _listeners = /* @__PURE__ */ new Set();
+  /**
+  * @param onerror - Optional callback for errors thrown by listeners
+  *   during dispatch.
+  */
+  constructor(onerror) {
+    this.onerror = onerror;
+  }
+  publish(event) {
+    for (const listener of this._listeners) try {
+      listener(event);
+    } catch (error2) {
+      this.onerror?.(error2 instanceof Error ? error2 : new Error(String(error2)));
+    }
+  }
+  subscribe(listener) {
+    this._listeners.add(listener);
+    let live = true;
+    return () => {
+      if (!live) return;
+      live = false;
+      this._listeners.delete(listener);
+    };
+  }
+  /** The number of currently registered listeners (test/introspection only — the routers track capacity via their own open-subscription set). */
+  get listenerCount() {
+    return this._listeners.size;
+  }
+};
+function createServerNotifier(bus) {
+  return {
+    toolsChanged: () => bus.publish({ kind: "tools_list_changed" }),
+    promptsChanged: () => bus.publish({ kind: "prompts_list_changed" }),
+    resourcesChanged: () => bus.publish({ kind: "resources_list_changed" }),
+    resourceUpdated: (uri) => bus.publish({
+      kind: "resource_updated",
+      uri
+    })
+  };
+}
+function listenFilterAccepts(filter2, event) {
+  switch (event.kind) {
+    case "tools_list_changed":
+      return filter2.toolsListChanged === true;
+    case "prompts_list_changed":
+      return filter2.promptsListChanged === true;
+    case "resources_list_changed":
+      return filter2.resourcesListChanged === true;
+    case "resource_updated":
+      return filter2.resourceSubscriptions !== void 0 && filter2.resourceSubscriptions.includes(event.uri);
+  }
+}
+function honoredSubset(requested, capabilities) {
+  const honored = {};
+  const allow = (bit) => capabilities === void 0 || bit === true;
+  if (requested.toolsListChanged === true && allow(capabilities?.tools?.listChanged)) honored.toolsListChanged = true;
+  if (requested.promptsListChanged === true && allow(capabilities?.prompts?.listChanged)) honored.promptsListChanged = true;
+  if (requested.resourcesListChanged === true && allow(capabilities?.resources?.listChanged)) honored.resourcesListChanged = true;
+  if (requested.resourceSubscriptions !== void 0 && requested.resourceSubscriptions.length > 0 && allow(capabilities?.resources?.subscribe)) honored.resourceSubscriptions = [...requested.resourceSubscriptions];
+  return honored;
+}
+function serverEventToNotification(event) {
+  switch (event.kind) {
+    case "tools_list_changed":
+      return { method: "notifications/tools/list_changed" };
+    case "prompts_list_changed":
+      return { method: "notifications/prompts/list_changed" };
+    case "resources_list_changed":
+      return { method: "notifications/resources/list_changed" };
+    case "resource_updated":
+      return {
+        method: "notifications/resources/updated",
+        params: { uri: event.uri }
+      };
+  }
+}
+var DEFAULT_MAX_SUBSCRIPTIONS = 1024;
+function jsonRpcError(id, code, message) {
+  return Response.json({
+    jsonrpc: "2.0",
+    error: {
+      code,
+      message
+    },
+    id
+  }, { status: 200 });
+}
+function stampSubscriptionId(notification, subscriptionId) {
+  return {
+    method: notification.method,
+    params: {
+      ...notification.params,
+      _meta: {
+        ...notification.params?._meta,
+        [SUBSCRIPTION_ID_META_KEY]: subscriptionId
+      }
+    }
+  };
+}
+function parseListenFilter(message) {
+  const outcome = codecForVersion(MODERN_WIRE_REVISION).validateRequest("subscriptions/listen", message);
+  return outcome.ok ? outcome.value.params?.notifications : void 0;
+}
+function createListenRouter(options) {
+  const { bus, onerror } = options;
+  const maxSubscriptions = options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS;
+  const keepAliveMs = options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS;
+  const open = /* @__PURE__ */ new Set();
+  function serve(message, signal, capabilities, serverInfo) {
+    if (open.size >= maxSubscriptions) {
+      onerror?.(/* @__PURE__ */ new Error(`subscriptions/listen refused: subscription limit reached (${maxSubscriptions})`));
+      return jsonRpcError(message.id, -32603, "Subscription limit reached");
+    }
+    const filter2 = parseListenFilter(message);
+    if (filter2 === void 0) return jsonRpcError(message.id, -32602, "Invalid params: 'notifications' is required and must be a valid SubscriptionFilter");
+    const honored = honoredSubset(filter2, capabilities);
+    const subscriptionId = message.id;
+    const encoder = new TextEncoder();
+    let controller;
+    let closed = false;
+    let unsubscribe;
+    let keepAliveTimer;
+    let abortCleanup;
+    const writeFrame = (frame) => {
+      if (closed) return;
+      try {
+        controller.enqueue(encoder.encode(frame));
+      } catch (error2) {
+        onerror?.(error2 instanceof Error ? error2 : new Error(String(error2)));
+      }
+    };
+    const writeNotification = (method, params) => {
+      writeFrame(`event: message
+data: ${JSON.stringify({
+        jsonrpc: "2.0",
+        method,
+        params
+      })}
+
+`);
+    };
+    const teardown = (graceful) => {
+      if (closed) return;
+      if (graceful) writeFrame(`event: message
+data: ${JSON.stringify({
+        jsonrpc: "2.0",
+        id: subscriptionId,
+        result: {
+          resultType: "complete",
+          _meta: {
+            [SUBSCRIPTION_ID_META_KEY]: subscriptionId,
+            [SERVER_INFO_META_KEY]: serverInfo
+          }
+        }
+      })}
+
+`);
+      closed = true;
+      try {
+        unsubscribe?.();
+      } catch (error2) {
+        onerror?.(error2 instanceof Error ? error2 : new Error(String(error2)));
+      }
+      if (keepAliveTimer !== void 0) clearInterval(keepAliveTimer);
+      abortCleanup?.();
+      open.delete(teardown);
+      try {
+        controller.close();
+      } catch {
+      }
+    };
+    const readable = new ReadableStream({
+      start(streamController) {
+        controller = streamController;
+        const ack = stampSubscriptionId({
+          method: "notifications/subscriptions/acknowledged",
+          params: { notifications: honored }
+        }, subscriptionId);
+        writeNotification(ack.method, ack.params);
+        unsubscribe = bus.subscribe((event) => {
+          if (closed || !listenFilterAccepts(honored, event)) return;
+          const note = stampSubscriptionId(serverEventToNotification(event), subscriptionId);
+          writeNotification(note.method, note.params);
+        });
+        keepAliveTimer = armSseKeepAlive(keepAliveMs, () => writeFrame(": keepalive\n\n"));
+        open.add(teardown);
+      },
+      cancel() {
+        teardown(false);
+      }
+    });
+    if (signal !== void 0) if (signal.aborted) teardown(false);
+    else {
+      const onAbort = () => teardown(false);
+      signal.addEventListener("abort", onAbort, { once: true });
+      abortCleanup = () => signal.removeEventListener("abort", onAbort);
+    }
+    return new Response(readable, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no"
+      }
+    });
+  }
+  return {
+    serve,
+    closeAll() {
+      for (const teardown of open) teardown(true);
+    },
+    get openCount() {
+      return open.size;
+    }
+  };
+}
 var DEFAULT_LEGACY_SHIM_MAX_ROUNDS = 8;
 var DEFAULT_LEGACY_SHIM_ROUND_TIMEOUT_MS = 6e5;
 function resolveLegacyShimOptions(options) {
@@ -21325,6 +22028,15 @@ var INPUT_REQUIRED_CAPABLE_METHODS = /* @__PURE__ */ new Set([
 var writeClientIdentity;
 var installDiscoverHandler;
 var readServerIdentity;
+function seedClientIdentityFromEnvelope(server, identity) {
+  writeClientIdentity(server, identity);
+}
+function installModernOnlyHandlers(server, servedModernVersions) {
+  installDiscoverHandler(server, servedModernVersions);
+}
+function serverIdentityOf(server) {
+  return readServerIdentity(server);
+}
 var Server = class extends Protocol {
   _clientCapabilities;
   _clientVersion;
@@ -22510,6 +23222,1180 @@ function unwrapOptionalSchema(schema) {
   return schema.def?.innerType ?? schema;
 }
 
+// node_modules/@modelcontextprotocol/server/dist/index.mjs
+var PerRequestHTTPServerTransport = class {
+  onclose;
+  onerror;
+  onmessage;
+  _classification;
+  _responseMode;
+  _started = false;
+  _used = false;
+  _closed = false;
+  _terminalDelivered = false;
+  /**
+  * `true` only while the inbound message is being delivered synchronously
+  * to the connected protocol layer. The pre-handler gates (the era
+  * registry gate, the edge→instance handoff check, the missing-handler
+  * rejection) answer inside this window; request handlers always run
+  * after it (the protocol layer defers them to a microtask). An error
+  * sent inside the window is therefore ladder-originated, and an error
+  * sent after it is handler-produced.
+  */
+  _dispatchWindowOpen = false;
+  _requestId;
+  _deferredResponse;
+  _sse;
+  _abortCleanup;
+  _keepAliveMs;
+  constructor(options) {
+    this._classification = options.classification;
+    this._responseMode = options.responseMode ?? "auto";
+    this._keepAliveMs = options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS;
+  }
+  async start() {
+    if (this._started) throw new Error("PerRequestHTTPServerTransport is already started");
+    this._started = true;
+  }
+  /**
+  * Serves the single exchange: delivers the classified message to the
+  * connected server instance and resolves with the HTTP response.
+  *
+  * Throws when called a second time (the transport is strictly
+  * single-use), or before a server has been connected to the transport.
+  * The returned promise rejects with a connection-closed error when the
+  * transport is closed before a response was produced (for example because
+  * the client disconnected).
+  */
+  async handleMessage(message, extra) {
+    if (this._used) throw new Error("PerRequestHTTPServerTransport serves exactly one exchange; construct a new transport per request");
+    if (!this._started || this.onmessage === void 0) throw new Error("PerRequestHTTPServerTransport is not connected: connect a server to this transport before handling a message");
+    if (this._closed) throw new Error("PerRequestHTTPServerTransport is closed");
+    this._used = true;
+    const signal = extra?.request?.signal;
+    if (signal?.aborted) {
+      await this.close();
+      throw new SdkError(SdkErrorCode.ConnectionClosed, "The request was aborted before it could be handled");
+    }
+    const messageExtra = {
+      classification: this._classification,
+      ...extra?.request !== void 0 && { request: extra.request },
+      ...extra?.authInfo !== void 0 && { authInfo: extra.authInfo }
+    };
+    if (isJSONRPCRequest(message)) {
+      this._requestId = message.id;
+      let resolve;
+      let reject;
+      const promise = new Promise((promiseResolve, promiseReject) => {
+        resolve = promiseResolve;
+        reject = promiseReject;
+      });
+      this._deferredResponse = {
+        promise,
+        resolve,
+        reject,
+        settled: false
+      };
+      if (signal !== void 0) {
+        const onAbort = () => void this.close();
+        signal.addEventListener("abort", onAbort, { once: true });
+        this._abortCleanup = () => signal.removeEventListener("abort", onAbort);
+      }
+      this._dispatchWindowOpen = true;
+      try {
+        this.onmessage(message, messageExtra);
+      } finally {
+        this._dispatchWindowOpen = false;
+      }
+      if (this._responseMode === "sse" && !this._closed && !this._deferredResponse.settled) this.upgradeToSse();
+      return promise;
+    }
+    this.onmessage(message, messageExtra);
+    return new Response(null, { status: 202 });
+  }
+  async send(message, options) {
+    if (this._closed) return;
+    const isResponse = isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message);
+    const relatedId = isResponse ? message.id : options?.relatedRequestId;
+    if (this._requestId === void 0 || relatedId === void 0 || relatedId !== this._requestId) {
+      if (isResponse) this.onerror?.(/* @__PURE__ */ new Error(`Received a response for an unknown request id: ${String(message.id)}`));
+      return;
+    }
+    if (isResponse) {
+      if (this._terminalDelivered) return;
+      this._terminalDelivered = true;
+      const errorCode = isJSONRPCErrorResponse(message) ? message.error.code : void 0;
+      const ladderStatus = errorCode !== void 0 && (this._dispatchWindowOpen || errorCode === ProtocolErrorCode.MissingRequiredClientCapability) ? LADDER_ERROR_HTTP_STATUS[errorCode] : void 0;
+      if (ladderStatus !== void 0 && this._sse === void 0) {
+        this.settleResponse(Response.json(message, {
+          status: ladderStatus,
+          headers: { "Content-Type": "application/json" }
+        }));
+        queueMicrotask(() => void this.close());
+        return;
+      }
+      if (this._sse !== void 0 || this._responseMode === "sse") {
+        if (this._sse === void 0) this.upgradeToSse();
+        this.writeMessageFrame(message);
+        this.finalizeStream();
+        return;
+      }
+      this.settleResponse(Response.json(message, {
+        status: 200,
+        headers: { "Content-Type": "application/json" }
+      }));
+      queueMicrotask(() => void this.close());
+      return;
+    }
+    if (this._responseMode === "json") return;
+    if (this._sse === void 0) this.upgradeToSse();
+    this.writeMessageFrame(message);
+  }
+  /**
+  * Writes an SSE comment frame (a keep-alive heartbeat). Dropped when the
+  * exchange is not currently streaming.
+  */
+  writeCommentFrame(comment) {
+    if (this._closed || this._sse === void 0 || this._sse.closed) return;
+    const frame = comment.split("\n").map((line) => `: ${line}`).join("\n");
+    this.writeFrame(`${frame}
+
+`);
+  }
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+    this._abortCleanup?.();
+    this._abortCleanup = void 0;
+    if (this._sse?.keepAliveTimer !== void 0) clearInterval(this._sse.keepAliveTimer);
+    if (this._sse !== void 0 && !this._sse.closed) {
+      this._sse.closed = true;
+      try {
+        this._sse.controller.close();
+      } catch {
+      }
+    }
+    if (this._deferredResponse !== void 0 && !this._deferredResponse.settled) {
+      this._deferredResponse.settled = true;
+      this._deferredResponse.reject(new SdkError(SdkErrorCode.ConnectionClosed, "Connection closed before a response was produced"));
+    }
+    this.onclose?.();
+  }
+  settleResponse(response) {
+    if (this._deferredResponse === void 0 || this._deferredResponse.settled) return;
+    this._deferredResponse.settled = true;
+    this._deferredResponse.resolve(response);
+  }
+  upgradeToSse() {
+    let controller;
+    const readable = new ReadableStream({
+      start: (streamController) => {
+        controller = streamController;
+      },
+      cancel: () => {
+        this.close();
+      }
+    });
+    this._sse = {
+      controller,
+      encoder: new TextEncoder(),
+      closed: false
+    };
+    this._sse.keepAliveTimer = armSseKeepAlive(this._keepAliveMs, () => this.writeCommentFrame("keepalive"));
+    this.settleResponse(new Response(readable, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no"
+      }
+    }));
+  }
+  finalizeStream() {
+    if (this._sse?.keepAliveTimer !== void 0) clearInterval(this._sse.keepAliveTimer);
+    if (this._sse !== void 0 && !this._sse.closed) {
+      this._sse.closed = true;
+      try {
+        this._sse.controller.close();
+      } catch {
+      }
+    }
+    queueMicrotask(() => void this.close());
+  }
+  writeMessageFrame(message) {
+    this.writeFrame(`event: message
+data: ${JSON.stringify(message)}
+
+`);
+  }
+  writeFrame(frame) {
+    if (this._sse === void 0 || this._sse.closed) return;
+    try {
+      this._sse.controller.enqueue(this._sse.encoder.encode(frame));
+    } catch (error2) {
+      this.onerror?.(/* @__PURE__ */ new Error(`Failed to write to the response stream: ${error2}`));
+    }
+  }
+};
+async function invoke(server, message, ctx) {
+  const transport = new PerRequestHTTPServerTransport({
+    classification: ctx.classification,
+    ...ctx.responseMode !== void 0 && { responseMode: ctx.responseMode },
+    ...ctx.keepAliveMs !== void 0 && { keepAliveMs: ctx.keepAliveMs }
+  });
+  await server.connect(transport);
+  return transport.handleMessage(message, {
+    ...ctx.request !== void 0 && { request: ctx.request },
+    ...ctx.authInfo !== void 0 && { authInfo: ctx.authInfo }
+  });
+}
+var WebStandardStreamableHTTPServerTransport = class {
+  sessionIdGenerator;
+  _started = false;
+  _closed = false;
+  _streamMapping = /* @__PURE__ */ new Map();
+  _requestToStreamMapping = /* @__PURE__ */ new Map();
+  _requestResponseMap = /* @__PURE__ */ new Map();
+  _initialized = false;
+  _enableJsonResponse = false;
+  _standaloneSseStreamId = "_GET_stream";
+  _eventStore;
+  _onsessioninitialized;
+  _onsessionclosed;
+  _allowedHosts;
+  _allowedOrigins;
+  _enableDnsRebindingProtection;
+  _retryInterval;
+  _supportedProtocolVersions;
+  _keepAliveMs;
+  sessionId;
+  onclose;
+  onerror;
+  onmessage;
+  constructor(options = {}) {
+    this.sessionIdGenerator = options.sessionIdGenerator;
+    this._enableJsonResponse = options.enableJsonResponse ?? false;
+    this._eventStore = options.eventStore;
+    this._onsessioninitialized = options.onsessioninitialized;
+    this._onsessionclosed = options.onsessionclosed;
+    this._allowedHosts = options.allowedHosts;
+    this._allowedOrigins = options.allowedOrigins;
+    this._enableDnsRebindingProtection = options.enableDnsRebindingProtection ?? false;
+    this._retryInterval = options.retryInterval;
+    this._supportedProtocolVersions = options.supportedProtocolVersions ?? SUPPORTED_PROTOCOL_VERSIONS;
+    this._keepAliveMs = options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS;
+  }
+  startKeepAlive(controller, encoder) {
+    if (this._closed) return void 0;
+    const timer = armSseKeepAlive(this._keepAliveMs, () => {
+      try {
+        controller.enqueue(encoder.encode(": keepalive\n\n"));
+      } catch {
+        if (timer !== void 0) clearInterval(timer);
+      }
+    });
+    return timer;
+  }
+  /**
+  * Starts the transport. This is required by the {@linkcode Transport} interface but is a no-op
+  * for the Streamable HTTP transport as connections are managed per-request.
+  */
+  async start() {
+    if (this._started) throw new Error("Transport already started");
+    this._started = true;
+  }
+  /**
+  * Sets the supported protocol versions for header validation.
+  * Called by the server during {@linkcode server/server.Server.connect | connect()} to pass its supported versions.
+  */
+  setSupportedProtocolVersions(versions) {
+    this._supportedProtocolVersions = versions;
+  }
+  /**
+  * Helper to create a JSON error response
+  */
+  createJsonErrorResponse(status, code, message, options) {
+    const error2 = {
+      code,
+      message
+    };
+    if (options?.data !== void 0) error2.data = options.data;
+    return Response.json({
+      jsonrpc: "2.0",
+      error: error2,
+      id: null
+    }, {
+      status,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers
+      }
+    });
+  }
+  /**
+  * Validates request headers for DNS rebinding protection.
+  * @returns Error response if validation fails, `undefined` if validation passes.
+  */
+  validateRequestHeaders(req) {
+    if (!this._enableDnsRebindingProtection) return;
+    if (this._allowedHosts && this._allowedHosts.length > 0) {
+      const hostHeader = req.headers.get("host");
+      if (!hostHeader || !this._allowedHosts.includes(hostHeader)) {
+        const error2 = `Invalid Host header: ${hostHeader}`;
+        this.onerror?.(new Error(error2));
+        return this.createJsonErrorResponse(403, -32e3, error2);
+      }
+    }
+    if (this._allowedOrigins && this._allowedOrigins.length > 0) {
+      const originHeader = req.headers.get("origin");
+      if (originHeader && !this._allowedOrigins.includes(originHeader)) {
+        const error2 = `Invalid Origin header: ${originHeader}`;
+        this.onerror?.(new Error(error2));
+        return this.createJsonErrorResponse(403, -32e3, error2);
+      }
+    }
+  }
+  /**
+  * Handles an incoming HTTP request, whether `GET`, `POST`, or `DELETE`
+  * Returns a `Response` object (Web Standard)
+  */
+  async handleRequest(req, options) {
+    if (this._closed) return this.createJsonErrorResponse(404, -32001, "Session not found");
+    const validationError = this.validateRequestHeaders(req);
+    if (validationError) return validationError;
+    switch (req.method) {
+      case "POST":
+        return this.handlePostRequest(req, options);
+      case "GET":
+        return this.handleGetRequest(req);
+      case "DELETE":
+        return this.handleDeleteRequest(req);
+      default:
+        return this.handleUnsupportedRequest();
+    }
+  }
+  /**
+  * Returns true if the client's protocol version supports empty SSE data in
+  * priming events (the fix shipped with protocol version `2025-11-25`).
+  *
+  * The version is checked for membership in this transport instance's
+  * supported protocol versions rather than with an open-ended
+  * `>= '2025-11-25'` comparison: the value may come from an `initialize`
+  * request body, which (unlike the `MCP-Protocol-Version` header) is not
+  * validated against `supportedProtocolVersions` before reaching this
+  * check. An unknown future version string must not silently enable
+  * behavior reserved for versions this transport actually supports.
+  */
+  supportsEmptySSEData(protocolVersion) {
+    return this._supportedProtocolVersions.includes(protocolVersion) && protocolVersion >= "2025-11-25";
+  }
+  /**
+  * Writes a priming event to establish resumption capability.
+  * Only sends if `eventStore` is configured (opt-in for resumability) and
+  * the client's protocol version supports empty SSE data (a supported
+  * version that is >= `2025-11-25`).
+  */
+  async writePrimingEvent(controller, encoder, streamId, protocolVersion) {
+    if (!this._eventStore) return;
+    if (!this.supportsEmptySSEData(protocolVersion)) return;
+    const primingEventId = await this._eventStore.storeEvent(streamId, {});
+    let primingEvent = `id: ${primingEventId}
+data: 
+
+`;
+    if (this._retryInterval !== void 0) primingEvent = `id: ${primingEventId}
+retry: ${this._retryInterval}
+data: 
+
+`;
+    controller.enqueue(encoder.encode(primingEvent));
+  }
+  /**
+  * Handles `GET` requests for SSE stream
+  */
+  async handleGetRequest(req) {
+    if (!req.headers.get("accept")?.includes("text/event-stream")) {
+      this.onerror?.(/* @__PURE__ */ new Error("Not Acceptable: Client must accept text/event-stream"));
+      return this.createJsonErrorResponse(406, -32e3, "Not Acceptable: Client must accept text/event-stream");
+    }
+    const sessionError = this.validateSession(req);
+    if (sessionError) return sessionError;
+    const protocolError = this.validateProtocolVersion(req);
+    if (protocolError) return protocolError;
+    if (this._eventStore) {
+      const lastEventId = req.headers.get("last-event-id");
+      if (lastEventId) return this.replayEvents(lastEventId);
+    }
+    if (this._streamMapping.get(this._standaloneSseStreamId) !== void 0) {
+      this.onerror?.(/* @__PURE__ */ new Error("Conflict: Only one SSE stream is allowed per session"));
+      return this.createJsonErrorResponse(409, -32e3, "Conflict: Only one SSE stream is allowed per session");
+    }
+    const encoder = new TextEncoder();
+    let streamController;
+    let keepAliveTimer;
+    const readable = new ReadableStream({
+      start: (controller) => {
+        streamController = controller;
+      },
+      cancel: () => {
+        if (keepAliveTimer !== void 0) clearInterval(keepAliveTimer);
+        if (this._streamMapping.get(this._standaloneSseStreamId)?.controller === streamController) this._streamMapping.delete(this._standaloneSseStreamId);
+      }
+    });
+    const headers = {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no"
+    };
+    if (this.sessionId !== void 0) headers["mcp-session-id"] = this.sessionId;
+    this._streamMapping.set(this._standaloneSseStreamId, {
+      controller: streamController,
+      encoder,
+      cleanup: () => {
+        if (keepAliveTimer !== void 0) clearInterval(keepAliveTimer);
+        this._streamMapping.delete(this._standaloneSseStreamId);
+        try {
+          streamController.close();
+        } catch {
+        }
+      }
+    });
+    keepAliveTimer = this.startKeepAlive(streamController, encoder);
+    return new Response(readable, { headers });
+  }
+  /**
+  * Replays events that would have been sent after the specified event ID
+  * Only used when resumability is enabled
+  */
+  async replayEvents(lastEventId) {
+    if (!this._eventStore) {
+      this.onerror?.(/* @__PURE__ */ new Error("Event store not configured"));
+      return this.createJsonErrorResponse(400, -32e3, "Event store not configured");
+    }
+    try {
+      let streamId;
+      if (this._eventStore.getStreamIdForEventId) {
+        streamId = await this._eventStore.getStreamIdForEventId(lastEventId);
+        if (!streamId) {
+          this.onerror?.(/* @__PURE__ */ new Error("Invalid event ID format"));
+          return this.createJsonErrorResponse(400, -32e3, "Invalid event ID format");
+        }
+        if (this._streamMapping.get(streamId) !== void 0) {
+          this.onerror?.(/* @__PURE__ */ new Error("Conflict: Stream already has an active connection"));
+          return this.createJsonErrorResponse(409, -32e3, "Conflict: Stream already has an active connection");
+        }
+      }
+      const headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no"
+      };
+      if (this.sessionId !== void 0) headers["mcp-session-id"] = this.sessionId;
+      const encoder = new TextEncoder();
+      let streamController;
+      let keepAliveTimer;
+      let cancelled = false;
+      let replayedStreamId;
+      const readable = new ReadableStream({
+        start: (controller) => {
+          streamController = controller;
+        },
+        cancel: () => {
+          cancelled = true;
+          if (keepAliveTimer !== void 0) clearInterval(keepAliveTimer);
+          if (replayedStreamId !== void 0 && this._streamMapping.get(replayedStreamId)?.controller === streamController) this._streamMapping.delete(replayedStreamId);
+        }
+      });
+      const replayedEventIds = /* @__PURE__ */ new Set();
+      replayedStreamId = await this._eventStore.replayEventsAfter(lastEventId, { send: async (eventId, message) => {
+        replayedEventIds.add(eventId);
+        if (!this.writeSSEEvent(streamController, encoder, message, eventId)) try {
+          streamController.close();
+        } catch {
+        }
+      } });
+      if (this._closed || cancelled) {
+        try {
+          streamController.close();
+        } catch {
+        }
+        return this.createJsonErrorResponse(404, -32001, "Session not found");
+      }
+      this._streamMapping.get(replayedStreamId)?.cleanup();
+      this._streamMapping.set(replayedStreamId, {
+        controller: streamController,
+        encoder,
+        replayedEventIds,
+        cleanup: () => {
+          if (keepAliveTimer !== void 0) clearInterval(keepAliveTimer);
+          this._streamMapping.delete(replayedStreamId);
+          try {
+            streamController.close();
+          } catch {
+          }
+        }
+      });
+      if (replayedStreamId !== this._standaloneSseStreamId) {
+        if (![...this._requestToStreamMapping.values()].includes(replayedStreamId)) {
+          this._streamMapping.delete(replayedStreamId);
+          try {
+            streamController.close();
+          } catch {
+          }
+        }
+      }
+      if (this._streamMapping.get(replayedStreamId)?.controller === streamController) keepAliveTimer = this.startKeepAlive(streamController, encoder);
+      return new Response(readable, { headers });
+    } catch (error2) {
+      this.onerror?.(error2);
+      return this.createJsonErrorResponse(500, -32e3, "Error replaying events");
+    }
+  }
+  /**
+  * Writes an event to an SSE stream via controller with proper formatting
+  */
+  writeSSEEvent(controller, encoder, message, eventId) {
+    try {
+      let eventData = `event: message
+`;
+      if (eventId) eventData += `id: ${eventId}
+`;
+      eventData += `data: ${JSON.stringify(message)}
+
+`;
+      controller.enqueue(encoder.encode(eventData));
+      return true;
+    } catch (error2) {
+      this.onerror?.(error2);
+      return false;
+    }
+  }
+  /**
+  * Handles unsupported requests (`PUT`, `PATCH`, etc.)
+  */
+  handleUnsupportedRequest() {
+    this.onerror?.(/* @__PURE__ */ new Error("Method not allowed."));
+    return Response.json({
+      jsonrpc: "2.0",
+      error: {
+        code: -32e3,
+        message: "Method not allowed."
+      },
+      id: null
+    }, {
+      status: 405,
+      headers: {
+        Allow: "GET, POST, DELETE",
+        "Content-Type": "application/json"
+      }
+    });
+  }
+  /**
+  * Handles `POST` requests containing JSON-RPC messages
+  */
+  async handlePostRequest(req, options) {
+    try {
+      const acceptHeader = req.headers.get("accept");
+      if (!acceptHeader?.includes("application/json") || !acceptHeader.includes("text/event-stream")) {
+        this.onerror?.(/* @__PURE__ */ new Error("Not Acceptable: Client must accept both application/json and text/event-stream"));
+        return this.createJsonErrorResponse(406, -32e3, "Not Acceptable: Client must accept both application/json and text/event-stream");
+      }
+      if (!isJsonContentType(req.headers.get("content-type"))) {
+        this.onerror?.(/* @__PURE__ */ new Error("Unsupported Media Type: Content-Type must be application/json"));
+        return this.createJsonErrorResponse(415, -32e3, "Unsupported Media Type: Content-Type must be application/json");
+      }
+      const request = req;
+      let rawMessage;
+      if (options?.parsedBody === void 0) try {
+        rawMessage = await req.json();
+      } catch (error2) {
+        this.onerror?.(error2);
+        return this.createJsonErrorResponse(400, -32700, "Parse error: Invalid JSON");
+      }
+      else rawMessage = options.parsedBody;
+      let messages;
+      try {
+        messages = Array.isArray(rawMessage) ? rawMessage.map((msg) => JSONRPCMessageSchema.parse(msg)) : [JSONRPCMessageSchema.parse(rawMessage)];
+      } catch (error2) {
+        this.onerror?.(error2);
+        return this.createJsonErrorResponse(400, -32700, "Parse error: Invalid JSON-RPC message");
+      }
+      if (this._closed) return this.createJsonErrorResponse(404, -32001, "Session not found");
+      const isInitializationRequest = messages.some((element) => isInitializeRequest(element));
+      if (isInitializationRequest) {
+        if (this._initialized && this.sessionId !== void 0) {
+          this.onerror?.(/* @__PURE__ */ new Error("Invalid Request: Server already initialized"));
+          return this.createJsonErrorResponse(400, -32600, "Invalid Request: Server already initialized");
+        }
+        if (messages.length > 1) {
+          this.onerror?.(/* @__PURE__ */ new Error("Invalid Request: Only one initialization request is allowed"));
+          return this.createJsonErrorResponse(400, -32600, "Invalid Request: Only one initialization request is allowed");
+        }
+        this.sessionId = this.sessionIdGenerator?.();
+        this._initialized = true;
+        if (this.sessionId && this._onsessioninitialized) await Promise.resolve(this._onsessioninitialized(this.sessionId));
+      }
+      if (!isInitializationRequest) {
+        const sessionError = this.validateSession(req);
+        if (sessionError) return sessionError;
+        const protocolError = this.validateProtocolVersion(req);
+        if (protocolError) return protocolError;
+      }
+      if (this._closed) return this.createJsonErrorResponse(404, -32001, "Session not found");
+      if (!messages.some((element) => isJSONRPCRequest(element))) {
+        for (const message of messages) this.onmessage?.(message, {
+          authInfo: options?.authInfo,
+          request
+        });
+        return new Response(null, { status: 202 });
+      }
+      const streamId = crypto.randomUUID();
+      const initRequest = messages.find((m) => isInitializeRequest(m));
+      const clientProtocolVersion = initRequest ? initRequest.params.protocolVersion : req.headers.get("mcp-protocol-version") ?? DEFAULT_NEGOTIATED_PROTOCOL_VERSION;
+      if (this._enableJsonResponse) return new Promise((resolve) => {
+        this._streamMapping.set(streamId, {
+          resolveJson: resolve,
+          cleanup: () => {
+            this._streamMapping.delete(streamId);
+          }
+        });
+        for (const message of messages) if (isJSONRPCRequest(message)) this._requestToStreamMapping.set(message.id, streamId);
+        for (const message of messages) this.onmessage?.(message, {
+          authInfo: options?.authInfo,
+          request
+        });
+      });
+      const encoder = new TextEncoder();
+      let streamController;
+      let keepAliveTimer;
+      const readable = new ReadableStream({
+        start: (controller) => {
+          streamController = controller;
+        },
+        cancel: () => {
+          if (keepAliveTimer !== void 0) clearInterval(keepAliveTimer);
+          if (this._streamMapping.get(streamId)?.controller === streamController) this._streamMapping.delete(streamId);
+        }
+      });
+      const headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "X-Accel-Buffering": "no"
+      };
+      if (this.sessionId !== void 0) headers["mcp-session-id"] = this.sessionId;
+      for (const message of messages) if (isJSONRPCRequest(message)) {
+        this._streamMapping.set(streamId, {
+          controller: streamController,
+          encoder,
+          cleanup: () => {
+            if (keepAliveTimer !== void 0) clearInterval(keepAliveTimer);
+            this._streamMapping.delete(streamId);
+            try {
+              streamController.close();
+            } catch {
+            }
+          }
+        });
+        this._requestToStreamMapping.set(message.id, streamId);
+      }
+      await this.writePrimingEvent(streamController, encoder, streamId, clientProtocolVersion);
+      for (const message of messages) {
+        let closeSSEStream;
+        let closeStandaloneSSEStream;
+        if (isJSONRPCRequest(message) && this._eventStore && this.supportsEmptySSEData(clientProtocolVersion)) {
+          closeSSEStream = () => {
+            this.closeSSEStream(message.id);
+          };
+          closeStandaloneSSEStream = () => {
+            this.closeStandaloneSSEStream();
+          };
+        }
+        this.onmessage?.(message, {
+          authInfo: options?.authInfo,
+          request,
+          closeSSEStream,
+          closeStandaloneSSEStream
+        });
+      }
+      if (this._streamMapping.get(streamId)?.controller === streamController) keepAliveTimer = this.startKeepAlive(streamController, encoder);
+      return new Response(readable, {
+        status: 200,
+        headers
+      });
+    } catch (error2) {
+      this.onerror?.(error2);
+      return this.createJsonErrorResponse(400, -32700, "Parse error", { data: String(error2) });
+    }
+  }
+  /**
+  * Handles `DELETE` requests to terminate sessions
+  */
+  async handleDeleteRequest(req) {
+    const sessionError = this.validateSession(req);
+    if (sessionError) return sessionError;
+    const protocolError = this.validateProtocolVersion(req);
+    if (protocolError) return protocolError;
+    try {
+      await Promise.resolve(this._onsessionclosed?.(this.sessionId));
+      return new Response(null, { status: 200 });
+    } finally {
+      await this.close();
+    }
+  }
+  /**
+  * Validates session ID for non-initialization requests.
+  * Returns `Response` error if invalid, `undefined` otherwise
+  */
+  validateSession(req) {
+    if (this.sessionIdGenerator === void 0) return;
+    if (!this._initialized) {
+      this.onerror?.(/* @__PURE__ */ new Error("Bad Request: Server not initialized"));
+      return this.createJsonErrorResponse(400, -32e3, "Bad Request: Server not initialized");
+    }
+    const sessionId = req.headers.get("mcp-session-id");
+    if (!sessionId) {
+      this.onerror?.(/* @__PURE__ */ new Error("Bad Request: Mcp-Session-Id header is required"));
+      return this.createJsonErrorResponse(400, -32e3, "Bad Request: Mcp-Session-Id header is required");
+    }
+    if (sessionId !== this.sessionId) {
+      this.onerror?.(/* @__PURE__ */ new Error("Session not found"));
+      return this.createJsonErrorResponse(404, -32001, "Session not found");
+    }
+  }
+  /**
+  * Validates the `MCP-Protocol-Version` header on incoming requests.
+  *
+  * For initialization: Version negotiation handles unknown versions gracefully
+  * (server responds with its supported version).
+  *
+  * For subsequent requests with `MCP-Protocol-Version` header:
+  * - Accept if in supported list
+  * - 400 if unsupported
+  *
+  * For HTTP requests without the `MCP-Protocol-Version` header:
+  * - Accept and default to the version negotiated at initialization
+  */
+  validateProtocolVersion(req) {
+    const protocolVersion = req.headers.get("mcp-protocol-version");
+    if (protocolVersion !== null && !this._supportedProtocolVersions.includes(protocolVersion)) {
+      const error2 = `Bad Request: Unsupported protocol version: ${protocolVersion} (supported versions: ${this._supportedProtocolVersions.join(", ")})`;
+      this.onerror?.(new Error(error2));
+      return this.createJsonErrorResponse(400, -32e3, error2);
+    }
+  }
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+    for (const { cleanup } of this._streamMapping.values()) cleanup();
+    this._streamMapping.clear();
+    this._requestResponseMap.clear();
+    this.onclose?.();
+  }
+  /**
+  * Close an SSE stream for a specific request, triggering client reconnection.
+  * Use this to implement polling behavior during long-running operations -
+  * client will reconnect after the retry interval specified in the priming event.
+  */
+  closeSSEStream(requestId) {
+    const streamId = this._requestToStreamMapping.get(requestId);
+    if (!streamId) return;
+    const stream = this._streamMapping.get(streamId);
+    if (stream) stream.cleanup();
+  }
+  /**
+  * Close the standalone `GET` SSE stream, triggering client reconnection.
+  * Use this to implement polling behavior for server-initiated notifications.
+  */
+  closeStandaloneSSEStream() {
+    const stream = this._streamMapping.get(this._standaloneSseStreamId);
+    if (stream) stream.cleanup();
+  }
+  async send(message, options) {
+    let requestId = options?.relatedRequestId;
+    if (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) requestId = message.id;
+    if (requestId === void 0) {
+      if (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) throw new Error("Cannot send a response on a standalone SSE stream unless resuming a previous client request");
+      let eventId;
+      if (this._eventStore) eventId = await this._eventStore.storeEvent(this._standaloneSseStreamId, message);
+      const standaloneSse = this._streamMapping.get(this._standaloneSseStreamId);
+      if (standaloneSse === void 0) return;
+      if (standaloneSse.controller && standaloneSse.encoder && (eventId === void 0 || !standaloneSse.replayedEventIds?.has(eventId))) this.writeSSEEvent(standaloneSse.controller, standaloneSse.encoder, message, eventId);
+      return;
+    }
+    const streamId = this._requestToStreamMapping.get(requestId);
+    if (!streamId) throw new Error(`No connection established for request ID: ${String(requestId)}`);
+    let stream = this._streamMapping.get(streamId);
+    if (!this._enableJsonResponse) {
+      let eventId;
+      if (this._eventStore) {
+        eventId = await this._eventStore.storeEvent(streamId, message);
+        stream = this._streamMapping.get(streamId);
+      }
+      if (stream?.controller && stream?.encoder && (eventId === void 0 || !stream.replayedEventIds?.has(eventId))) this.writeSSEEvent(stream.controller, stream.encoder, message, eventId);
+    }
+    if (isJSONRPCResultResponse(message) || isJSONRPCErrorResponse(message)) {
+      this._requestResponseMap.set(requestId, message);
+      const relatedIds = [...this._requestToStreamMapping.entries()].filter(([_, sid]) => sid === streamId).map(([id]) => id);
+      if (relatedIds.every((id) => this._requestResponseMap.has(id))) {
+        if (!stream) {
+          if (this._enableJsonResponse) throw new Error(`No connection established for request ID: ${String(requestId)}`);
+          if (!this._eventStore) {
+            this.onerror?.(/* @__PURE__ */ new Error(`Response for request ID ${String(requestId)} is undeliverable: per-request stream is disconnected and no eventStore is configured`));
+            for (const id of relatedIds) {
+              this._requestResponseMap.delete(id);
+              this._requestToStreamMapping.delete(id);
+            }
+            return;
+          }
+          for (const id of relatedIds) {
+            this._requestResponseMap.delete(id);
+            this._requestToStreamMapping.delete(id);
+          }
+          return;
+        }
+        if (this._enableJsonResponse && stream.resolveJson) {
+          const headers = { "Content-Type": "application/json" };
+          if (this.sessionId !== void 0) headers["mcp-session-id"] = this.sessionId;
+          const responses = relatedIds.map((id) => this._requestResponseMap.get(id));
+          if (responses.length === 1) stream.resolveJson(Response.json(responses[0], {
+            status: 200,
+            headers
+          }));
+          else stream.resolveJson(Response.json(responses, {
+            status: 200,
+            headers
+          }));
+          stream.cleanup();
+        } else stream.cleanup();
+        for (const id of relatedIds) {
+          this._requestResponseMap.delete(id);
+          this._requestToStreamMapping.delete(id);
+        }
+      }
+    }
+  }
+};
+function echoableRequestId(body) {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) return null;
+  const { method, id } = body;
+  if (typeof method !== "string") return null;
+  return typeof id === "string" || typeof id === "number" ? id : null;
+}
+function jsonRpcErrorResponse(httpStatus, code, message, data, id = null) {
+  return Response.json({
+    jsonrpc: "2.0",
+    error: {
+      code,
+      message,
+      ...data !== void 0 && { data }
+    },
+    id
+  }, { status: httpStatus });
+}
+function rejectionResponse(rejection2, id = null) {
+  return jsonRpcErrorResponse(rejection2.httpStatus, rejection2.code, rejection2.message, rejection2.data, id);
+}
+function toError(value) {
+  return value instanceof Error ? value : new Error(String(value));
+}
+function internalServerErrorResponse(id = null) {
+  return jsonRpcErrorResponse(500, -32603, "Internal server error", void 0, id);
+}
+function createLegacyStatelessFallback(factory, onerror, keepAliveMs) {
+  return async (request, options) => {
+    if (request.method.toUpperCase() !== "POST") return jsonRpcErrorResponse(405, -32e3, "Method not allowed.");
+    try {
+      const product = await factory({
+        era: "legacy",
+        ...options?.authInfo !== void 0 && { authInfo: options.authInfo },
+        requestInfo: request
+      });
+      const transport = new WebStandardStreamableHTTPServerTransport({
+        sessionIdGenerator: void 0,
+        ...keepAliveMs !== void 0 && { keepAliveMs }
+      });
+      await product.connect(transport);
+      const teardown = () => {
+        transport.close().catch(() => {
+        });
+        product.close().catch(() => {
+        });
+      };
+      request.signal?.addEventListener("abort", teardown, { once: true });
+      const response = await transport.handleRequest(request, {
+        ...options?.authInfo !== void 0 && { authInfo: options.authInfo },
+        ...options?.parsedBody !== void 0 && { parsedBody: options.parsedBody }
+      });
+      if (response.body === null || mediaTypeEssence(response.headers.get("content-type")) !== "text/event-stream") {
+        teardown();
+        return response;
+      }
+      const reader = response.body.getReader();
+      let toreDown = false;
+      const completeExchange = () => {
+        if (!toreDown) {
+          toreDown = true;
+          teardown();
+        }
+      };
+      const monitoredBody = new ReadableStream({
+        pull: async (controller) => {
+          try {
+            const { done, value } = await reader.read();
+            if (done) {
+              completeExchange();
+              controller.close();
+              return;
+            }
+            if (value !== void 0) controller.enqueue(value);
+          } catch (error2) {
+            completeExchange();
+            controller.error(error2);
+          }
+        },
+        cancel: (reason) => {
+          completeExchange();
+          return reader.cancel(reason).catch(() => {
+          });
+        }
+      });
+      return new Response(monitoredBody, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      });
+    } catch (error2) {
+      try {
+        onerror?.(toError(error2));
+      } catch {
+      }
+      return internalServerErrorResponse(echoableRequestId(options?.parsedBody));
+    }
+  };
+}
+async function classifyEntryRequest(request, providedParsedBody, needsForward = true) {
+  const httpMethod = request.method.toUpperCase();
+  let body;
+  let parsedBody = providedParsedBody;
+  let forwardRequest = request;
+  let unparseable = false;
+  if (httpMethod === "POST") {
+    if (parsedBody === void 0) {
+      if (needsForward) forwardRequest = request.clone();
+      let bodyText;
+      try {
+        bodyText = await request.text();
+      } catch {
+        return { step: "unreadable-body" };
+      }
+      try {
+        body = bodyText.length === 0 ? void 0 : JSON.parse(bodyText);
+      } catch {
+        unparseable = true;
+      }
+      if (!unparseable && body !== void 0) parsedBody = body;
+    } else body = parsedBody;
+    if (unparseable || body === void 0) return {
+      step: "no-json-body",
+      forwardRequest
+    };
+  }
+  return {
+    step: "classified",
+    outcome: classifyInboundRequest({
+      httpMethod,
+      protocolVersionHeader: request.headers.get("mcp-protocol-version") ?? void 0,
+      mcpMethodHeader: request.headers.get("mcp-method") ?? void 0,
+      mcpNameHeader: request.headers.get("mcp-name") ?? void 0,
+      ...body !== void 0 && { body }
+    }),
+    body,
+    parsedBody,
+    forwardRequest
+  };
+}
+function createMcpHandler(factory, options = {}) {
+  const { legacy, onerror, responseMode } = options;
+  if (typeof legacy === "function") throw new TypeError("The 'legacy' option only accepts 'stateless' or 'reject', not a handler function. To serve 2025-era traffic with your own handler, route in user land with the exported isLegacyRequest(request) predicate in front of a strict (legacy: 'reject') handler.");
+  const inflight = /* @__PURE__ */ new Set();
+  let closed = false;
+  const reportError = (error2) => {
+    try {
+      onerror?.(error2);
+    } catch {
+    }
+  };
+  const bus = options.bus ?? new InMemoryServerEventBus(reportError);
+  const notify = createServerNotifier(bus);
+  const listenRouter = createListenRouter({
+    bus,
+    maxSubscriptions: options.maxSubscriptions ?? DEFAULT_MAX_SUBSCRIPTIONS,
+    keepAliveMs: options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS,
+    onerror: reportError
+  });
+  if (responseMode === "json") console.warn("responseMode: 'json' drops mid-call notifications. subscriptions/listen streams are always served over SSE regardless; other notifications emitted before a result are dropped.");
+  const legacyHandler = legacy === "reject" ? void 0 : createLegacyStatelessFallback(factory, reportError, options.keepAliveMs);
+  async function serveModern(route, request, authInfo) {
+    const claimedRevision = route.classification.revision;
+    if (claimedRevision === void 0 || !SUPPORTED_MODERN_PROTOCOL_VERSIONS.includes(claimedRevision)) {
+      const error2 = new UnsupportedProtocolVersionError({
+        supported: [...SUPPORTED_MODERN_PROTOCOL_VERSIONS],
+        requested: claimedRevision ?? "unknown"
+      });
+      reportError(error2);
+      return jsonRpcErrorResponse(400, error2.code, error2.message, error2.data, echoableRequestId(route.message));
+    }
+    const stdHeaderRejection = validateStandardRequestHeaders({
+      httpMethod: request.method,
+      mcpMethodHeader: request.headers.get("mcp-method") ?? void 0,
+      mcpNameHeader: request.headers.get("mcp-name") ?? void 0
+    }, route);
+    if (stdHeaderRejection !== void 0) {
+      reportError(/* @__PURE__ */ new Error(`Rejected inbound request (${stdHeaderRejection.cell}): ${stdHeaderRejection.message}`));
+      return rejectionResponse(stdHeaderRejection, echoableRequestId(route.message));
+    }
+    const meta2 = route.messageKind === "request" ? requestMetaOf(route.message.params) : void 0;
+    const declaredClientCapabilities = meta2?.[CLIENT_CAPABILITIES_META_KEY];
+    if (route.messageKind === "request") {
+      const required2 = requiredClientCapabilitiesForRequest(route.message.method);
+      if (required2 !== void 0) {
+        const missing = missingClientCapabilities(required2, declaredClientCapabilities);
+        if (missing !== void 0) {
+          const error2 = new MissingRequiredClientCapabilityError({ requiredCapabilities: missing });
+          reportError(error2);
+          return jsonRpcErrorResponse(httpStatusForErrorCode(error2.code, "ladder"), error2.code, error2.message, error2.data, route.message.id);
+        }
+      }
+    }
+    const product = await factory({
+      era: "modern",
+      ...authInfo !== void 0 && { authInfo },
+      requestInfo: request
+    });
+    const server = product instanceof McpServer ? product.server : product;
+    if (route.messageKind === "request" && route.message.method === "subscriptions/listen") {
+      const capabilities = server.getCapabilities();
+      const serverInfo = serverIdentityOf(server);
+      product.close().catch(reportError);
+      return listenRouter.serve(route.message, request.signal, capabilities, serverInfo);
+    }
+    if (route.messageKind === "request" && route.message.method === "tools/call" && product instanceof McpServer) {
+      const callParams = route.message.params;
+      const toolName = typeof callParams?.name === "string" ? callParams.name : void 0;
+      const inputSchema = toolName === void 0 ? void 0 : product.toolInputSchemaJson(toolName);
+      if (inputSchema !== void 0) {
+        const scan = scanXMcpHeaderDeclarations(inputSchema);
+        if (scan.valid && scan.declarations.length > 0) {
+          const rejection2 = validateMcpParamHeaders(scan.declarations, callParams?.arguments, request.headers);
+          if (rejection2 !== void 0) {
+            product.close().catch(reportError);
+            reportError(/* @__PURE__ */ new Error(`Rejected inbound request (${rejection2.cell}): ${rejection2.message}`));
+            return rejectionResponse(rejection2, route.message.id);
+          }
+        }
+      }
+    }
+    setNegotiatedProtocolVersion(server, claimedRevision);
+    installModernOnlyHandlers(server, SUPPORTED_MODERN_PROTOCOL_VERSIONS);
+    if (meta2 !== void 0) seedClientIdentityFromEnvelope(server, {
+      clientInfo: meta2[CLIENT_INFO_META_KEY],
+      clientCapabilities: declaredClientCapabilities
+    });
+    const previousOnClose = server.onclose;
+    inflight.add(server);
+    server.onclose = () => {
+      inflight.delete(server);
+      previousOnClose?.();
+    };
+    try {
+      const response = await invoke(product, route.message, {
+        classification: route.classification,
+        request,
+        ...authInfo !== void 0 && { authInfo },
+        ...responseMode !== void 0 && { responseMode },
+        ...options.keepAliveMs !== void 0 && { keepAliveMs: options.keepAliveMs }
+      });
+      if (route.messageKind === "notification") queueMicrotask(() => void server.close().catch(() => {
+      }));
+      return response;
+    } catch (error2) {
+      if (error2 instanceof SdkError && error2.code === SdkErrorCode.ConnectionClosed) return new Response(null, { status: 499 });
+      await server.close().catch(() => {
+      });
+      inflight.delete(server);
+      reportError(toError(error2));
+      return internalServerErrorResponse(echoableRequestId(route.message));
+    }
+  }
+  async function serveLegacyRoute(route, forwardRequest, authInfo, parsedBody) {
+    if (legacyHandler !== void 0) return legacyHandler(forwardRequest, {
+      ...authInfo !== void 0 && { authInfo },
+      ...parsedBody !== void 0 && { parsedBody }
+    });
+    const strict = modernOnlyStrictRejection(route, SUPPORTED_MODERN_PROTOCOL_VERSIONS);
+    if (strict === void 0) return new Response(null, { status: 202 });
+    reportError(/* @__PURE__ */ new Error(`Rejected 2025-era request on a modern-only endpoint (${strict.cell}): ${strict.message}`));
+    return rejectionResponse(strict, echoableRequestId(parsedBody));
+  }
+  async function handle(request, requestOptions) {
+    const authInfo = requestOptions?.authInfo;
+    if (request.method.toUpperCase() === "POST" && !isJsonContentType(request.headers.get("content-type"))) {
+      reportError(/* @__PURE__ */ new Error("Unsupported Media Type: Content-Type must be application/json"));
+      return jsonRpcErrorResponse(415, -32e3, "Unsupported Media Type: Content-Type must be application/json");
+    }
+    const classified = await classifyEntryRequest(request, requestOptions?.parsedBody);
+    if (classified.step === "unreadable-body") return jsonRpcErrorResponse(400, -32700, "Parse error: the request body could not be read");
+    if (classified.step === "no-json-body") {
+      if (legacyHandler !== void 0) return legacyHandler(classified.forwardRequest, { ...authInfo !== void 0 && { authInfo } });
+      return jsonRpcErrorResponse(400, -32700, "Parse error: the request body is not valid JSON");
+    }
+    const { outcome, body, parsedBody, forwardRequest } = classified;
+    try {
+      switch (outcome.kind) {
+        case "reject":
+          reportError(/* @__PURE__ */ new Error(`Rejected inbound request (${outcome.cell}): ${outcome.message}`));
+          return rejectionResponse(outcome, echoableRequestId(body));
+        case "modern":
+          return await serveModern(outcome, request, authInfo);
+        case "legacy":
+          return await serveLegacyRoute(outcome, forwardRequest, authInfo, parsedBody);
+      }
+    } catch (error2) {
+      reportError(toError(error2));
+      return internalServerErrorResponse(echoableRequestId(body));
+    }
+  }
+  const fetchFace = async (request, requestOptions) => {
+    if (closed) throw new Error("This MCP handler has been closed");
+    try {
+      return await handle(request, requestOptions);
+    } catch (error2) {
+      reportError(toError(error2));
+      return internalServerErrorResponse(echoableRequestId(requestOptions?.parsedBody));
+    }
+  };
+  return {
+    fetch: fetchFace,
+    notify,
+    bus,
+    close: async () => {
+      closed = true;
+      listenRouter.closeAll();
+      const closing = [...inflight].map((server) => server.close().catch(() => {
+      }));
+      inflight.clear();
+      await Promise.all(closing);
+    }
+  };
+}
+
+// src/mcp/server.ts
+import path7 from "node:path";
+
 // node_modules/@modelcontextprotocol/server/dist/stdio.mjs
 var StdioServerTransport = class {
   _readBuffer;
@@ -22601,13 +24487,15 @@ var StdioServerTransport = class {
 };
 
 // src/mcp/server.ts
-var rootSchema = object({ project_root: string2().min(1).describe("Absolute path inside the target Git repository") });
+var rootSchema = object({
+  project_root: string2().min(1).refine(path7.isAbsolute, "project_root must be an absolute path").describe("Absolute path inside the target Git repository on the MCP server")
+});
 var phaseDefinition = object({
   id: string2().regex(/^[a-z0-9][a-z0-9-]{1,63}$/),
   title: string2().min(1),
   goal: string2().min(1),
   dependencies: array(string2()),
-  allowedScope: array(string2()).describe("Minimatch globs for files this phase may change"),
+  allowedScope: array(string2()).min(1).describe("Minimatch globs for files this phase may change"),
   acceptanceCommands: array(string2().min(1)).min(1),
   maxAttempts: number2().int().min(1).max(10).default(3)
 });
@@ -22619,10 +24507,21 @@ var contractSchema = object({
   invariants: array(string2()),
   doneWhen: array(string2()).min(1)
 });
-function createServer() {
-  const server = new McpServer({ name: "keep-coding", version: "0.1.0" });
+function createServer(options = {}) {
+  const server = new McpServer(
+    { name: "keep-coding", version: "0.1.0" },
+    {
+      instructions: [
+        "Use one evidence-gated workflow: initialize_project, save_plan, start_phase, implement, checkpoint_phase, then complete_project.",
+        "In a remote ChatGPT app, inspect only through list_files, read_file, search_code, and get_diff.",
+        "Apply edits only with apply_patch after start_phase; patches are rejected outside the active phase allowedScope.",
+        "Never claim completion while a phase is unfinished, FAILED, or BLOCKED."
+      ].join(" ")
+    }
+  );
   register2(
     server,
+    options,
     "initialize_project",
     "Initialize durable project memory and index the repository before planning.",
     rootSchema.extend({ prompt: string2().min(1) }),
@@ -22630,13 +24529,20 @@ function createServer() {
   );
   register2(
     server,
+    options,
     "save_plan",
     "Save the measurable project contract and dependency-aware phase plan.",
     rootSchema.extend({ contract: contractSchema, phases: array(phaseDefinition).min(1) }),
-    async (service, input) => service.savePlan(input.contract, input.phases)
+    async (service, input) => {
+      for (const phase of input.phases) {
+        for (const command2 of phase.acceptanceCommands) options.validateAcceptanceCommand?.(command2);
+      }
+      return service.savePlan(input.contract, input.phases);
+    }
   );
   register2(
     server,
+    options,
     "get_context",
     "Get the compact current contract, active phase, decisions, failures and relevant code graph.",
     rootSchema.extend({ max_chars: number2().int().min(1e3).max(3e4).optional() }),
@@ -22644,6 +24550,7 @@ function createServer() {
   );
   register2(
     server,
+    options,
     "start_phase",
     "Start exactly one ready phase after its dependencies are verified.",
     rootSchema.extend({ phase_id: string2().min(1) }),
@@ -22651,6 +24558,31 @@ function createServer() {
   );
   register2(
     server,
+    options,
+    "list_files",
+    "List repository files available to this server without returning file contents.",
+    rootSchema.extend({ max_files: number2().int().min(1).max(2e3).default(500) }),
+    async (service, input) => service.workspace.listFiles(input.max_files)
+  );
+  register2(server, options, "read_file", "Read a bounded line range from one text file inside the repository.", rootSchema.extend({
+    file_path: string2().min(1),
+    start_line: number2().int().min(1).default(1),
+    end_line: number2().int().min(1).max(5e3).default(400)
+  }), async (service, input) => service.workspace.readTextFile(input.file_path, input.start_line, input.end_line));
+  register2(server, options, "search_code", "Search text across bounded repository files and return matching lines.", rootSchema.extend({
+    query: string2().min(2).max(500),
+    max_results: number2().int().min(1).max(500).default(100)
+  }), async (service, input) => service.workspace.searchCode(input.query, input.max_results));
+  register2(server, options, "get_diff", "Return the current bounded Git diff and changed-file list.", rootSchema.extend({
+    max_chars: number2().int().min(1e3).max(1e5).default(3e4)
+  }), async (service, input) => service.workspace.diff(input.max_chars));
+  register2(server, options, "apply_patch", "Apply one unified Git patch only within an IN_PROGRESS phase and its declared allowedScope.", rootSchema.extend({
+    phase_id: string2().min(1),
+    patch: string2().min(1).max(262144)
+  }), async (service, input) => service.workspace.applyPatch(input.phase_id, input.patch));
+  register2(
+    server,
+    options,
     "record_decision",
     "Persist an architectural or product decision for future phases.",
     rootSchema.extend({ phase_id: string2().nullable().default(null), title: string2().min(1), rationale: string2().min(1), alternatives: array(string2()).default([]) }),
@@ -22658,6 +24590,7 @@ function createServer() {
   );
   register2(
     server,
+    options,
     "record_failure",
     "Record and deduplicate a failed approach so later attempts do not repeat it.",
     rootSchema.extend({ phase_id: string2().min(1), summary: string2().min(1), fingerprint: string2().optional() }),
@@ -22665,13 +24598,20 @@ function createServer() {
   );
   register2(
     server,
+    options,
     "checkpoint_phase",
     "Run scope and acceptance gates, persist evidence, and unlock dependent phases only on success.",
     rootSchema.extend({ phase_id: string2().min(1), summary: string2().min(1) }),
-    async (service, input) => service.checkpoint(input.phase_id, input.summary)
+    async (service, input) => {
+      const phase = service.store.getPhase(input.phase_id);
+      if (!phase) throw new Error(`unknown phase: ${input.phase_id}`);
+      for (const command2 of phase.acceptanceCommands) options.validateAcceptanceCommand?.(command2);
+      return service.checkpoint(input.phase_id, input.summary);
+    }
   );
   register2(
     server,
+    options,
     "get_status",
     "Return the full durable project snapshot.",
     rootSchema,
@@ -22679,6 +24619,7 @@ function createServer() {
   );
   register2(
     server,
+    options,
     "complete_project",
     "Mark the project complete only after every phase has a passing checkpoint.",
     rootSchema,
@@ -22690,17 +24631,25 @@ async function runMcpServer() {
   const server = createServer();
   await server.connect(new StdioServerTransport());
 }
-function register2(server, name, description, inputSchema, operation) {
+function register2(server, options, name, description, inputSchema, operation) {
+  const readOnlyTools = ["get_context", "list_files", "read_file", "search_code", "get_diff", "get_status"];
+  const idempotentTools = ["initialize_project", ...readOnlyTools];
   const config2 = {
     description,
     inputSchema,
-    annotations: { readOnlyHint: ["get_context", "get_status"].includes(name), destructiveHint: false, idempotentHint: ["initialize_project", "get_context", "get_status"].includes(name) }
+    annotations: {
+      readOnlyHint: readOnlyTools.includes(name),
+      destructiveHint: name === "apply_patch",
+      idempotentHint: idempotentTools.includes(name)
+    }
   };
   const handler = async (rawInput) => {
     let service = null;
     try {
-      const input = inputSchema.parse(rawInput);
-      service = await KeepCodingService.open(String(input.project_root));
+      const parsed = inputSchema.parse(rawInput);
+      const projectRoot = options.resolveProjectRoot === void 0 ? String(parsed.project_root) : await options.resolveProjectRoot(String(parsed.project_root));
+      const input = { ...parsed, project_root: projectRoot };
+      service = await KeepCodingService.open(projectRoot);
       const result = await operation(service, input);
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     } catch (error2) {
@@ -22712,11 +24661,305 @@ function register2(server, name, description, inputSchema, operation) {
   server.registerTool(name, config2, handler);
 }
 
+// src/mcp/root-policy.ts
+import { realpath as realpath2 } from "node:fs/promises";
+import path8 from "node:path";
+function parseAllowedRoots(value) {
+  if (value === void 0) return [];
+  return value.split(path8.delimiter).map((entry) => entry.trim()).filter(Boolean);
+}
+async function createAllowedRootResolver(allowedRoots) {
+  if (allowedRoots.length === 0) {
+    throw new Error("KEEP_CODING_ALLOWED_ROOTS must contain at least one existing directory");
+  }
+  const canonicalRoots = await Promise.all(allowedRoots.map(async (root) => {
+    if (!path8.isAbsolute(root)) throw new Error(`Allowed root must be absolute: ${root}`);
+    return realpath2(root);
+  }));
+  return async (projectRoot) => {
+    if (!path8.isAbsolute(projectRoot)) throw new Error("project_root must be an absolute path");
+    const canonicalProjectRoot = await realpath2(projectRoot);
+    if (!canonicalRoots.some((root) => containsPath(root, canonicalProjectRoot))) {
+      throw new Error(`project_root is outside KEEP_CODING_ALLOWED_ROOTS: ${projectRoot}`);
+    }
+    return canonicalProjectRoot;
+  };
+}
+function containsPath(root, candidate) {
+  const normalizedRoot = comparisonKey(root);
+  const normalizedCandidate = comparisonKey(candidate);
+  return normalizedCandidate === normalizedRoot || normalizedCandidate.startsWith(`${normalizedRoot}${path8.sep}`);
+}
+function comparisonKey(value) {
+  const normalized = path8.normalize(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+// src/mcp/http.ts
+var DEFAULT_HOST = "127.0.0.1";
+var DEFAULT_PORT = 8787;
+var DEFAULT_ENDPOINT = "/mcp";
+var DEFAULT_MAX_BODY_BYTES = 1048576;
+function loadHttpMcpConfig(env = process.env) {
+  const host = env.KEEP_CODING_HTTP_HOST?.trim() || DEFAULT_HOST;
+  const port = parsePort(env.KEEP_CODING_HTTP_PORT ?? env.PORT);
+  const endpointPath = normalizeEndpoint(env.KEEP_CODING_HTTP_PATH);
+  const allowedRoots = parseAllowedRoots(env.KEEP_CODING_ALLOWED_ROOTS);
+  if (allowedRoots.length === 0) {
+    throw new Error("KEEP_CODING_ALLOWED_ROOTS is required for mcp-http");
+  }
+  const configuredHosts = splitCommaSeparated(env.KEEP_CODING_ALLOWED_HOSTS);
+  const allowedHosts = configuredHosts.length > 0 ? configuredHosts : defaultAllowedHosts(host);
+  const allowedCommands = parseAllowedCommands(env.KEEP_CODING_ALLOWED_COMMANDS_JSON);
+  if (allowedCommands.length === 0) {
+    throw new Error("KEEP_CODING_ALLOWED_COMMANDS_JSON must contain at least one exact acceptance command");
+  }
+  const bearerToken = env.KEEP_CODING_BEARER_TOKEN?.trim() || void 0;
+  if (!isLoopbackHost(host) && bearerToken === void 0) {
+    throw new Error("KEEP_CODING_BEARER_TOKEN is required when mcp-http binds to a non-loopback host");
+  }
+  return {
+    host,
+    port,
+    endpointPath,
+    allowedRoots,
+    allowedHosts,
+    allowedCommands,
+    ...bearerToken !== void 0 && { bearerToken },
+    maxBodyBytes: parsePositiveInteger(env.KEEP_CODING_MAX_BODY_BYTES, DEFAULT_MAX_BODY_BYTES, "KEEP_CODING_MAX_BODY_BYTES")
+  };
+}
+async function createHttpMcpServer(config2) {
+  const resolveProjectRoot = await createAllowedRootResolver(config2.allowedRoots);
+  const allowedHosts = new Set(config2.allowedHosts.map(normalizeHost).filter(Boolean));
+  if (allowedHosts.size === 0) throw new Error("At least one allowed HTTP Host is required");
+  const allowedCommands = new Set(config2.allowedCommands);
+  const validateAcceptanceCommand = (command2) => {
+    if (!allowedCommands.has(command2)) {
+      throw new Error(`acceptance command is not operator-approved: ${command2}`);
+    }
+  };
+  const handler = createMcpHandler(
+    () => createServer({ resolveProjectRoot, validateAcceptanceCommand }),
+    { onerror: (error2) => process.stderr.write(`[keep-coding:mcp-http] ${error2.message}
+`) }
+  );
+  const server = createNodeServer((request, response) => {
+    void (async () => {
+      try {
+        if (!isAllowedHost(request, allowedHosts)) {
+          sendJson(response, 421, { error: "Misdirected request" });
+          return;
+        }
+        const pathname = new URL(request.url ?? "/", "http://localhost").pathname;
+        if (pathname === "/healthz" && request.method === "GET") {
+          sendJson(response, 200, { status: "ok", service: "keep-coding" });
+          return;
+        }
+        if (pathname !== config2.endpointPath) {
+          sendJson(response, 404, { error: "Not found" });
+          return;
+        }
+        if (!isAuthorized(request, config2.bearerToken)) {
+          response.setHeader("WWW-Authenticate", "Bearer");
+          sendJson(response, 401, { error: "Unauthorized" });
+          return;
+        }
+        const body = await readBody(request, config2.maxBodyBytes);
+        const webRequest = toWebRequest(request, body);
+        const webResponse = await handler.fetch(webRequest);
+        await writeWebResponse(response, webResponse);
+      } catch (error2) {
+        if (error2 instanceof PayloadTooLargeError) {
+          sendJson(response, 413, { error: error2.message });
+          return;
+        }
+        process.stderr.write(`[keep-coding:mcp-http] ${error2 instanceof Error ? error2.stack ?? error2.message : String(error2)}
+`);
+        sendJson(response, 500, { error: "Internal server error" });
+      }
+    })();
+  });
+  return {
+    server,
+    close: async () => {
+      await closeNodeServer(server);
+      await handler.close();
+    }
+  };
+}
+async function runHttpMcpServer(env = process.env) {
+  const config2 = loadHttpMcpConfig(env);
+  const runtime = await createHttpMcpServer(config2);
+  await new Promise((resolve, reject) => {
+    runtime.server.once("error", reject);
+    runtime.server.listen(config2.port, config2.host, () => {
+      runtime.server.off("error", reject);
+      resolve();
+    });
+  });
+  process.stderr.write(`Keep Coding MCP HTTP listening on http://${config2.host}:${config2.port}${config2.endpointPath}
+`);
+  let closing = false;
+  const shutdown = () => {
+    if (closing) return;
+    closing = true;
+    void runtime.close().catch((error2) => {
+      process.stderr.write(`${error2 instanceof Error ? error2.stack ?? error2.message : String(error2)}
+`);
+      process.exitCode = 1;
+    });
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
+function toWebRequest(request, body) {
+  const method = (request.method ?? "GET").toUpperCase();
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(request.headers)) {
+    if (value === void 0) continue;
+    if (Array.isArray(value)) value.forEach((item) => headers.append(name, item));
+    else headers.set(name, value);
+  }
+  return new Request(new URL(request.url ?? "/", "http://localhost"), {
+    method,
+    headers,
+    ...body !== void 0 && method !== "GET" && method !== "HEAD" && { body }
+  });
+}
+async function writeWebResponse(response, webResponse) {
+  const headers = {};
+  webResponse.headers.forEach((value, name) => {
+    headers[name] = value;
+  });
+  response.writeHead(webResponse.status, headers);
+  if (webResponse.body === null) {
+    response.end();
+    return;
+  }
+  const reader = webResponse.body.getReader();
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (!isStreamReadResult(result)) throw new Error("MCP response stream returned an invalid chunk");
+      if (result.done) break;
+      if (!response.write(result.value)) await waitForDrain(response);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  response.end();
+}
+async function readBody(request, maxBytes) {
+  const declaredLength = Number(request.headers["content-length"] ?? 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxBytes) throw new PayloadTooLargeError(maxBytes);
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    bytes += buffer.byteLength;
+    if (bytes > maxBytes) throw new PayloadTooLargeError(maxBytes);
+    chunks.push(buffer);
+  }
+  return chunks.length === 0 ? void 0 : Buffer.concat(chunks).toString("utf8");
+}
+function isAuthorized(request, bearerToken) {
+  if (bearerToken === void 0) return true;
+  const provided = request.headers.authorization ?? "";
+  const expected = `Bearer ${bearerToken}`;
+  const providedBuffer = Buffer.from(provided);
+  const expectedBuffer = Buffer.from(expected);
+  return providedBuffer.length === expectedBuffer.length && timingSafeEqual(providedBuffer, expectedBuffer);
+}
+function isAllowedHost(request, allowedHosts) {
+  const header2 = request.headers.host;
+  return typeof header2 === "string" && allowedHosts.has(normalizeHost(header2));
+}
+function normalizeHost(value) {
+  const trimmed = value.trim().toLowerCase();
+  if (trimmed.startsWith("[")) {
+    const close = trimmed.indexOf("]");
+    return close >= 0 ? trimmed.slice(1, close) : trimmed;
+  }
+  const colon = trimmed.lastIndexOf(":");
+  return colon > -1 && trimmed.indexOf(":") === colon ? trimmed.slice(0, colon) : trimmed;
+}
+function defaultAllowedHosts(bindHost) {
+  if (bindHost === "0.0.0.0" || bindHost === "::") {
+    throw new Error("KEEP_CODING_ALLOWED_HOSTS is required for wildcard HTTP bindings");
+  }
+  return Array.from(/* @__PURE__ */ new Set([bindHost, "localhost", "127.0.0.1", "::1"]));
+}
+function isLoopbackHost(host) {
+  const normalized = normalizeHost(host);
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+function normalizeEndpoint(value) {
+  const endpoint = value?.trim() || DEFAULT_ENDPOINT;
+  if (!endpoint.startsWith("/") || endpoint.includes("?") || endpoint.includes("#")) {
+    throw new Error("KEEP_CODING_HTTP_PATH must be an absolute URL path");
+  }
+  return path9.posix.normalize(endpoint);
+}
+function parsePort(value) {
+  return parsePositiveInteger(value, DEFAULT_PORT, "KEEP_CODING_HTTP_PORT", 65535);
+}
+function parsePositiveInteger(value, fallback, name, max = Number.MAX_SAFE_INTEGER) {
+  if (value === void 0 || value.trim() === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > max) throw new Error(`${name} must be an integer between 1 and ${max}`);
+  return parsed;
+}
+function parseAllowedCommands(value) {
+  if (value === void 0 || value.trim() === "") return [];
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("KEEP_CODING_ALLOWED_COMMANDS_JSON must be a JSON array of exact command strings");
+  }
+  if (!isTrimmedStringArray(parsed)) {
+    throw new Error("KEEP_CODING_ALLOWED_COMMANDS_JSON must be a JSON array of non-empty, trimmed command strings");
+  }
+  return [...new Set(parsed)];
+}
+function isTrimmedStringArray(value) {
+  return Array.isArray(value) && value.every((entry) => typeof entry === "string" && entry.trim() !== "" && entry === entry.trim());
+}
+function isStreamReadResult(value) {
+  if (typeof value !== "object" || value === null || !("done" in value) || typeof value.done !== "boolean") return false;
+  return value.done || "value" in value && value.value instanceof Uint8Array;
+}
+function splitCommaSeparated(value) {
+  return value?.split(",").map((entry) => entry.trim()).filter(Boolean) ?? [];
+}
+function sendJson(response, status, body) {
+  if (response.headersSent) {
+    response.end();
+    return;
+  }
+  const payload = JSON.stringify(body);
+  response.writeHead(status, { "content-type": "application/json; charset=utf-8", "content-length": String(Buffer.byteLength(payload)) });
+  response.end(payload);
+}
+function waitForDrain(response) {
+  return new Promise((resolve) => response.once("drain", resolve));
+}
+function closeNodeServer(server) {
+  if (!server.listening) return Promise.resolve();
+  return new Promise((resolve, reject) => server.close((error2) => error2 === void 0 ? resolve() : reject(error2)));
+}
+var PayloadTooLargeError = class extends Error {
+  constructor(maxBytes) {
+    super(`Request body exceeds ${maxBytes} bytes`);
+  }
+};
+
 // src/eval/runner.ts
 import { execFile as execFile2 } from "node:child_process";
 import { createHash as createHash4 } from "node:crypto";
-import { mkdir, readFile as readFile3, rm, writeFile } from "node:fs/promises";
-import path6 from "node:path";
+import { mkdir, readFile as readFile4, rm, writeFile } from "node:fs/promises";
+import path10 from "node:path";
 import { promisify as promisify3 } from "node:util";
 
 // src/eval/statistics.ts
@@ -22767,17 +25010,17 @@ function combination(n, k) {
 // src/eval/runner.ts
 var execFileAsync2 = promisify3(execFile2);
 async function runEvaluation(configPath) {
-  const absoluteConfig = path6.resolve(configPath);
-  const base = path6.dirname(absoluteConfig);
-  const config2 = JSON.parse(await readFile3(absoluteConfig, "utf8"));
+  const absoluteConfig = path10.resolve(configPath);
+  const base = path10.dirname(absoluteConfig);
+  const config2 = JSON.parse(await readFile4(absoluteConfig, "utf8"));
   validateConfig(config2);
-  const repository = path6.resolve(base, config2.repository);
-  const prompt = await readFile3(path6.resolve(base, config2.promptFile), "utf8");
-  const outputDirectory = path6.resolve(base, config2.outputDirectory);
+  const repository = path10.resolve(base, config2.repository);
+  const prompt = await readFile4(path10.resolve(base, config2.promptFile), "utf8");
+  const outputDirectory = path10.resolve(base, config2.outputDirectory);
   const { stdout: startingShaOutput } = await execFileAsync2("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" });
   const startingSha = startingShaOutput.trim();
   const promptHash = createHash4("sha256").update(prompt).digest("hex");
-  const workspace = path6.join(outputDirectory, "worktrees");
+  const workspace = path10.join(outputDirectory, "worktrees");
   await rm(outputDirectory, { recursive: true, force: true });
   await mkdir(workspace, { recursive: true });
   const results = [];
@@ -22785,7 +25028,7 @@ async function runEvaluation(configPath) {
     for (let pair = 1; pair <= config2.runs; pair += 1) {
       const arms = pair % 2 === 1 ? ["baseline", "keep-coding"] : ["keep-coding", "baseline"];
       for (const arm of arms) {
-        const target = path6.join(workspace, `${pair}-${arm}`);
+        const target = path10.join(workspace, `${pair}-${arm}`);
         await execFileAsync2("git", ["worktree", "add", "--detach", target, "HEAD"], { cwd: repository });
         const started = performance.now();
         const command2 = (arm === "baseline" ? config2.baseline : config2.keepCoding).command;
@@ -22818,11 +25061,11 @@ async function runEvaluation(configPath) {
   }));
   const statistics = summarizeOutcomes(pairs);
   await mkdir(outputDirectory, { recursive: true });
-  await writeFile(path6.join(outputDirectory, "raw.jsonl"), `${results.map((item) => JSON.stringify(item)).join("\n")}
+  await writeFile(path10.join(outputDirectory, "raw.jsonl"), `${results.map((item) => JSON.stringify(item)).join("\n")}
 `);
-  await writeFile(path6.join(outputDirectory, "summary.json"), `${JSON.stringify({ metadata: { startingSha, promptHash, generatedAt: (/* @__PURE__ */ new Date()).toISOString() }, statistics }, null, 2)}
+  await writeFile(path10.join(outputDirectory, "summary.json"), `${JSON.stringify({ metadata: { startingSha, promptHash, generatedAt: (/* @__PURE__ */ new Date()).toISOString() }, statistics }, null, 2)}
 `);
-  await writeFile(path6.join(outputDirectory, "summary.md"), markdownSummary(statistics));
+  await writeFile(path10.join(outputDirectory, "summary.md"), markdownSummary(statistics));
   return { statistics, outputDirectory };
 }
 function validateConfig(config2) {
@@ -22834,8 +25077,8 @@ async function run(command2, cwd, input, timeout) {
   const [executable, ...args] = command2;
   if (!executable) throw new Error("empty command");
   return new Promise((resolve) => {
-    const child = import("node:child_process").then(({ spawn }) => {
-      const process4 = spawn(executable, args, { cwd, env: processEnv(), stdio: ["pipe", "pipe", "pipe"], timeout });
+    const child = import("node:child_process").then(({ spawn: spawn2 }) => {
+      const process4 = spawn2(executable, args, { cwd, env: processEnv(), stdio: ["pipe", "pipe", "pipe"], timeout });
       let output = "";
       process4.stdout.on("data", (chunk) => {
         output += String(chunk);
@@ -22885,6 +25128,9 @@ try {
     case "mcp":
       await runMcpServer();
       break;
+    case "mcp-http":
+      await runHttpMcpServer();
+      break;
     case "hook": {
       const input = JSON.parse(await readStdin() || "{}");
       process.stdout.write(`${JSON.stringify(await handleHook(argument ?? "", input))}
@@ -22911,7 +25157,7 @@ try {
       process.stdout.write("0.1.0\n");
       break;
     default:
-      process.stdout.write("Keep Coding v0.1.0\nUsage: keep-coding <mcp|hook|init|status|context|index|eval|version> [path]\n");
+      process.stdout.write("Keep Coding v0.1.0\nUsage: keep-coding <mcp|mcp-http|hook|init|status|context|index|eval|version> [path]\n");
   }
 } catch (error2) {
   process.stderr.write(`${error2 instanceof Error ? error2.stack ?? error2.message : String(error2)}

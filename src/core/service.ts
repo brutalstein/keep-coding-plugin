@@ -4,14 +4,20 @@ import { compileContext } from "./context.js";
 import { GitRepository } from "./git.js";
 import { indexRepository } from "./indexer.js";
 import { PhaseVerifier } from "./verifier.js";
+import { WorkspaceTools } from "./workspace.js";
 
 export class KeepCodingService {
   static async open(projectRoot: string): Promise<KeepCodingService> {
     const git = await GitRepository.open(projectRoot);
-    return new KeepCodingService(git, new ProjectStore(git.root));
+    const store = new ProjectStore(git.root);
+    return new KeepCodingService(git, store, new WorkspaceTools(git, store));
   }
 
-  private constructor(readonly git: GitRepository, readonly store: ProjectStore) {}
+  private constructor(
+    readonly git: GitRepository,
+    readonly store: ProjectStore,
+    readonly workspace: WorkspaceTools
+  ) {}
 
   close(): void {
     this.store.close();
