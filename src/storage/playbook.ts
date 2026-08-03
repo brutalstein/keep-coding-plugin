@@ -98,15 +98,18 @@ export class PlaybookStore {
     const failureRows = this.db.prepare("SELECT * FROM failure_patterns ORDER BY count DESC, updated_at DESC LIMIT ?").all(limit) as Row[];
     const failureSuggestions = failureRows
       .filter((row) => terms.some((term) => String(row.summary).toLowerCase().includes(term)))
-      .map((row) => ({
-        id: String(row.fingerprint),
-        title: "Avoid repeated failure",
-        goal: `${String(row.summary)}${row.resolution ? ` Resolution: ${String(row.resolution)}` : ""}`,
-        allowedScope: [],
-        acceptanceCommands: [],
-        score: 0.5,
-        source: "failure-pattern" as const
-      }));
+      .map((row) => {
+        const resolution = typeof row.resolution === "string" ? row.resolution : null;
+        return {
+          id: String(row.fingerprint),
+          title: "Avoid repeated failure",
+          goal: `${String(row.summary)}${resolution ? ` Resolution: ${resolution}` : ""}`,
+          allowedScope: [],
+          acceptanceCommands: [],
+          score: 0.5,
+          source: "failure-pattern" as const
+        };
+      });
     return [...phaseSuggestions, ...failureSuggestions].sort((left, right) => right.score - left.score).slice(0, limit);
   }
 }
