@@ -1,33 +1,28 @@
 import type { ProjectSnapshot } from "../domain/model.js";
-import type { ProjectStore } from "../storage/store.js";
+import type { PlatformStore } from "../storage/platform-store.js";
 
 const DEFAULT_MAX_CHARS = 12_000;
 
-export function compileContext(store: ProjectStore, maxChars = DEFAULT_MAX_CHARS): string {
+export function compileContext(store: PlatformStore, maxChars = DEFAULT_MAX_CHARS): string {
   const snapshot = store.snapshot();
   const active = snapshot.project.currentPhaseId
     ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) ?? null
     : null;
   const terms = tokenize([active?.title, active?.goal, ...(active?.allowedScope ?? [])].filter(Boolean).join(" "));
   const related = store.searchGraph(terms, 35);
-  const sections = [
-    header(snapshot),
-    contractSection(snapshot),
-    phaseSection(snapshot),
-    decisionSection(snapshot),
-    failureSection(snapshot),
-    checkpointSection(snapshot),
+  return fitSections([
+    header(snapshot), contractSection(snapshot), phaseSection(snapshot), approvalSection(snapshot), budgetSection(snapshot),
+    decisionSection(snapshot), failureSection(snapshot), checkpointSection(snapshot),
     related.length > 0
-      ? `## Relevant repository graph\n${related.map((node) => `- ${node.type}: ${node.path ?? node.label}${node.symbol ? `#${node.symbol}` : ""}`).join("\n")}`
+      ? `## Relevant semantic graph\n${related.map((node) => `- ${node.type}: ${node.path ?? node.label}${node.symbol ? `#${node.symbol}` : ""}`).join("\n")}`
       : ""
-  ].filter(Boolean);
-  return fitSections(sections, maxChars);
+  ].filter(Boolean), maxChars);
 }
 
 function header(snapshot: ProjectSnapshot): string {
   return [
     "# KEEP CODING ACTIVE",
-    "Use the Keep Coding MCP workflow. Do not declare completion without a passing checkpoint.",
+    "Use the evidence-gated workflow. Never claim completion without passing deterministic evidence.",
     `Project root: ${snapshot.project.root}`,
     `Project status: ${snapshot.project.status}`,
     `Plan version: ${snapshot.project.planVersion}`
@@ -36,10 +31,9 @@ function header(snapshot: ProjectSnapshot): string {
 
 function contractSection(snapshot: ProjectSnapshot): string {
   const contract = snapshot.project.contract;
-  if (!contract) return "## Required next action\nInspect the repository, then call `save_plan` with a measurable contract and dependency-aware phases.";
+  if (!contract) return "## Required next action\nInspect the repository, then call `save_plan`.";
   return [
-    "## Project contract",
-    `Goal: ${contract.goal}`,
+    "## Project contract", `Goal: ${contract.goal}`,
     `Deliverables:\n${bullets(contract.deliverables)}`,
     `Constraints:\n${bullets(contract.constraints)}`,
     `Invariants:\n${bullets(contract.invariants)}`,
@@ -53,14 +47,23 @@ function phaseSection(snapshot: ProjectSnapshot): string {
     : null;
   if (!active) return `## Phase status\n${snapshot.phases.map((phase) => `- ${phase.id}: ${phase.status}`).join("\n") || "Plan not saved."}`;
   return [
-    "## Active phase",
-    `${active.id} — ${active.title} [${active.status}]`,
-    `Goal: ${active.goal}`,
+    "## Active phase", `${active.id} — ${active.title} [${active.status}]`, `Goal: ${active.goal}`,
     `Allowed scope:\n${bullets(active.allowedScope)}`,
     `Acceptance commands:\n${bullets(active.acceptanceCommands)}`,
     `Attempts: ${active.attempts}/${active.maxAttempts}`,
-    "Complete this phase, call `checkpoint_phase`, repair failures, then continue to the next ready phase."
-  ].join("\n");
+    active.reverifyReason ? `Reverification reason: ${active.reverifyReason}` : "",
+    "Implement, checkpoint, repair failures, and continue without weakening gates."
+  ].filter(Boolean).join("\n");
+}
+
+function approvalSection(snapshot: ProjectSnapshot): string {
+  const pending = (snapshot.approvals ?? []).filter((item) => item.status === "pending");
+  return pending.length === 0 ? "" : `## Pending human approvals\n${pending.map((item) => `- ${item.id} [${item.phaseId}]: ${item.prompt}`).join("\n")}`;
+}
+
+function budgetSection(snapshot: ProjectSnapshot): string {
+  const entries = Object.entries(snapshot.budgetUsage ?? {});
+  return entries.length === 0 ? "" : `## Budget usage\n${entries.map(([scope, usage]) => `- ${scope}: ${usage.tokens} tokens, $${usage.costUsd.toFixed(4)}, ${usage.wallClockMs} ms`).join("\n")}`;
 }
 
 function decisionSection(snapshot: ProjectSnapshot): string {
@@ -94,7 +97,4 @@ function tokenize(value: string): string[] {
   const stop = new Set(["the", "and", "for", "with", "from", "this", "that", "bir", "ve", "ile", "için", "bu"]);
   return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop.has(term)).slice(0, 12);
 }
-
-function bullets(values: string[]): string {
-  return values.length === 0 ? "- None" : values.map((value) => `- ${value}`).join("\n");
-}
+function bullets(values: string[]): string { return values.length === 0 ? "- None" : values.map((value) => `- ${value}`).join("\n"); }
