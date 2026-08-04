@@ -29,16 +29,18 @@ describe("context compiler", () => {
     try {
       const full = compileContextEnvelope(store);
       const unchanged = compileContextEnvelope(store, { sinceSequence: full.sequence });
-      expect(unchanged).toMatchObject({ unchanged: true, sequence: full.sequence, changedSections: [], estimatedTokens: 0 });
+      expect(unchanged).toEqual({ unchanged: true, sequence: full.sequence });
       expect("context" in unchanged).toBe(false);
-      expect(JSON.stringify(unchanged).length).toBeLessThan((full.context ?? "").length / 3);
+      expect(JSON.stringify(unchanged).length).toBeLessThan((full.unchanged ? "" : full.context).length / 3);
 
       store.recordDecision({ phaseId: "server", title: "Use SQLite", rationale: "Preserve durable state", alternatives: ["Memory only"] });
       const delta = compileContextEnvelope(store, { sinceSequence: full.sequence });
+      expect(delta.unchanged).toBe(false);
+      if (delta.unchanged) throw new Error("expected changed context");
       expect(delta.changedSections).toEqual(["decisions"]);
       expect(delta.unchangedSections).toContain("contract");
       expect(delta.context).toContain("Use SQLite");
-      expect((delta.context ?? "").length).toBeLessThan((full.context ?? "").length);
+      expect(delta.context.length).toBeLessThan((full.unchanged ? "" : full.context).length);
     } finally { store.close(); }
   });
 
