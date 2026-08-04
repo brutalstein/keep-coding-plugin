@@ -32,12 +32,12 @@ jobs:
       - run: npm run build
       - name: Commit lockfile and bundle
         run: |
-          if git diff --quiet -- package-lock.json plugins/keep-coding/dist/keep-coding.mjs plugins/keep-coding/dist/keep-coding.mjs.map; then
+          if git diff --quiet -- package-lock.json plugins/keep-coding/dist/keep-coding.mjs; then
             echo "Generated files are current."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add package-lock.json plugins/keep-coding/dist/keep-coding.mjs plugins/keep-coding/dist/keep-coding.mjs.map
+          git add package-lock.json plugins/keep-coding/dist/keep-coding.mjs
           git commit -m "Synchronize 0.2.1 generated files"
           git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
