@@ -36,6 +36,8 @@ npm run check
 
 `npm run check`; lint, strict TypeScript, source coverage, production build, derlenmiş artifact smoke testleri, context payload benchmark'ı, doküman/sürüm kontrolü ve plugin doğrulamasını çalıştırır. Bu nedenle kaynak testleri yeşilken bozuk bir `dist/keep-coding.mjs` paketlenemez.
 
+Doğrulanmış source suite: 51 test, 16 dosya. Build sonrası artifact suite üç compiled-binary senaryo ekler; context benchmark'ı ayrı çalışır.
+
 ## Temel kural
 
 Bir faz; dosya kapsamı, secret taraması, bütçe, seçilmiş testler, acceptance komutları ve yapılandırılmış critic kapıları geçmeden `COMPLETED` olmaz. Token verimliliği yalnızca tekrarlı payload'ı azaltır; doğrulama rigor'unu azaltmaz. Proje tamamlanırken yapılandırılmış full test suite tekrar çalışır. Plan değişiklikleri yalnızca `amend_plan` ile yapılır ve event geçmişine yazılır.
