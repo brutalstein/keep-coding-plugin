@@ -7,6 +7,12 @@ on:
     paths:
       - .github/workflows/materialize-v040.yml
       - .publish/v040-overlay-06.b64
+  pull_request:
+    branches:
+      - main
+    types:
+      - reopened
+      - synchronize
 
 permissions:
   contents: write
@@ -17,6 +23,7 @@ concurrency:
 
 jobs:
   materialize:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
