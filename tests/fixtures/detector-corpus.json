@@ -1,0 +1,58 @@
+[
+  {
+    "activate": true,
+    "prompt": "Build a production-ready complete project with architecture, integration tests, CI, deployment, documentation and dependency-aware phases."
+  },
+  {
+    "activate": true,
+    "prompt": "Uçtan uca üretime hazır bir uygulama geliştir; mimari, entegrasyon, testler, dokümantasyon, dağıtım ve faz planı dahil olsun."
+  },
+  {
+    "activate": true,
+    "prompt": "Rewrite authentication end-to-end with a migration, tests, deployment plan and explicit phases."
+  },
+  {
+    "activate": true,
+    "prompt": "Refactor the platform architecture and implement CI, integration tests, production deployment and parallel phases."
+  },
+  {
+    "activate": true,
+    "prompt": "Tüm projeyi modüler hale getir, mimariyi yenile, testleri ve CI entegrasyonunu kur, dağıtımı dokümante et ve işi fazlara böl."
+  },
+  {
+    "activate": true,
+    "prompt": "Create the complete service:\n- architecture\n- migration\n- tests\n- CI\n- deployment\n- documentation\n- phases"
+  },
+  {
+    "activate": false,
+    "prompt": "Rename this variable."
+  },
+  {
+    "activate": false,
+    "prompt": "Explain what software architecture means."
+  },
+  {
+    "activate": false,
+    "prompt": "Write a short poem about debugging."
+  },
+  {
+    "activate": false,
+    "prompt": "Summarize this test output in two sentences."
+  },
+  {
+    "activate": false,
+    "prompt": "What is deployment?"
+  },
+  {
+    "activate": false,
+    "prompt": "Create a button label."
+  },
+  {
+    "activate": false,
+    "prompt": "I have been thinking about my weekend for a while and want to talk through several unrelated ideas about books, food, music and how the weather made the day feel. This is intentionally conversational and fairly long, but it does not ask for implementation work or a software project."
+  },
+  {
+    "activate": false,
+    "prompt": "Bu uzun bir sohbet mesajı; kitaplardan, müzikten, günlük hayattan ve hafta sonundan söz ediyor ama herhangi bir yazılım geliştirme, mimari kurma, test yazma ya da proje teslim etme isteği içermiyor."
+  }
+]
