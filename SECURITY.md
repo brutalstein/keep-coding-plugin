@@ -8,6 +8,18 @@ Acceptance commands execute in the target repository and are not sandboxed. In l
 
 The evaluator executes commands from its JSON configuration and creates/removes Git worktrees under its output directory. Treat evaluation configurations as executable code.
 
+## Acceptance evidence quality
+
+The agent authors the plan and therefore selects its own deterministic acceptance commands. This is an unavoidable trust dependency: a command may be syntactically valid and still provide weak evidence for the claimed deliverable.
+
+Keep Coding raises the bar in three ways:
+
+- exact no-op commands remain blocked;
+- `save_plan` and `amend_plan` return non-blocking warnings when a code phase lacks a recognizable test, lint, type-check, build, or syntax-validation category, or when unrelated phases reuse identical commands;
+- phases may explicitly declare `verificationKind: "non-code"`; otherwise weak deterministic evidence also produces a recommendation to enable a blocking independent critic.
+
+These heuristics do not prove that a command is sufficient, cannot understand every custom build tool, and do not remove the trust dependency on agent-authored plans. High-assurance projects should use operator-owned command allowlists, measurable phase-specific commands, full-suite completion gates, and `critic.blocking = true` when deterministic evidence is incomplete.
+
 ## HTTP deployment
 
 - The listener binds to `127.0.0.1` by default.
@@ -21,9 +33,9 @@ Write actions remain vulnerable to malicious repository content and prompt injec
 
 ## Data
 
-Project prompts, decisions, failures, file paths, content hashes, and command output are stored in `.keep-coding/state.db` inside each target repository. Source contents are read for indexing and remote workspace operations but are not stored wholesale in the ledger.
+Project prompts, decisions, normalized failure records, file paths, content hashes, compact command evidence, token telemetry, and approvals are stored in `.keep-coding/state.db` inside each target repository. Source contents are read for indexing and remote workspace operations but are not stored wholesale in the ledger. The optional cross-project playbook stores compact structured patterns in `~/.keep-coding/playbook.db` only when explicitly enabled.
 
-Keep Coding itself makes no outbound network requests. A tunnel, reverse proxy, or ChatGPT connection introduces its own network and data-processing boundary.
+Keep Coding itself makes no outbound network requests. A tunnel, reverse proxy, critic command, or ChatGPT connection introduces its own network and data-processing boundary.
 
 ## Reporting
 
