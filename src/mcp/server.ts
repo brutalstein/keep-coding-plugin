@@ -23,6 +23,7 @@ const phaseDefinition = z.object({
   allowedScope: z.array(z.string()).min(1),
   acceptanceCommands: z.array(z.string().min(1)).min(1),
   maxAttempts: z.number().int().min(1).max(10).default(3),
+  verificationKind: z.enum(["code", "non-code"]).optional(),
   budget: budgetSchema.optional(),
   criticBlocking: z.boolean().optional(),
   requiresApproval: z.boolean().optional(),
@@ -50,20 +51,21 @@ export interface CreateServerOptions {
 
 export function createServer(options: CreateServerOptions = {}): McpServer {
   const server = new McpServer(
-    { name: "keep-coding", version: "0.2.0" },
+    { name: "keep-coding", version: "0.2.1" },
     {
       instructions: [
         "Use one evidence-gated workflow; amend plans only through amend_plan.",
         "Deterministic commands, secret scanning, budget checks, impact-aware reverification, and pending approvals are authoritative.",
+        "Prefer delta get_context, get_file_digest, and Tier-1 expand_graph over redundant broad reads.",
         "Remote edits remain bounded by the active phase allowedScope."
       ].join(" ")
     }
   );
   register(server, options, "initialize_project", "Initialize durable memory and index the repository.", rootSchema.extend({ prompt: z.string().min(1) }),
     (service, input) => service.initialize(input.prompt));
-  register(server, options, "save_plan", "Save the initial measurable contract and acyclic phase DAG.", rootSchema.extend({ contract: contractSchema, phases: z.array(phaseDefinition).min(1) }),
+  register(server, options, "save_plan", "Save the initial measurable contract and acyclic phase DAG; returns command-quality warnings.", rootSchema.extend({ contract: contractSchema, phases: z.array(phaseDefinition).min(1) }),
     async (service, input) => { validateCommands(options, input.phases); return service.savePlan(input.contract, input.phases); });
-  register(server, options, "amend_plan", "Version an auditable plan amendment without destroying completed evidence.", rootSchema.extend({
+  register(server, options, "amend_plan", "Version an auditable plan amendment without destroying completed evidence; returns command-quality warnings.", rootSchema.extend({
     reason: z.string().min(10), add_phases: z.array(phaseDefinition), supersede_phase_ids: z.array(z.string()), contract_patch: contractSchema.partial().optional()
   }), async (service, input) => {
     validateCommands(options, input.add_phases);
@@ -74,10 +76,24 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
       ...(input.contract_patch ? { contractPatch: input.contract_patch } : {})
     });
   });
-  register(server, options, "get_context", "Get compact durable context and snapshot.", rootSchema.extend({ max_chars: z.number().int().min(1_000).max(30_000).optional() }),
-    async (service, input) => ({ context: service.context(input.max_chars), snapshot: service.store.snapshot() }));
+  register(server, options, "get_context", "Get sequence-aware compact durable context; structured snapshot is opt-in.", rootSchema.extend({
+    max_chars: z.number().int().min(1_000).max(30_000).optional(),
+    since_sequence: z.number().int().nonnegative().optional(),
+    include_snapshot: z.boolean().default(false),
+    usage_tokens: z.number().int().nonnegative().optional()
+  }), async (service, input) => {
+    if (input.usage_tokens) service.recordHostTokenUsage(input.usage_tokens);
+    const envelope = service.contextEnvelope(input.since_sequence, input.max_chars);
+    return input.include_snapshot ? { ...envelope, snapshot: service.store.snapshot() } : envelope;
+  });
   register(server, options, "get_impact", "Compute explainable file or symbol blast radius and impacted tests.", rootSchema.extend({ target: z.string().min(1), max_depth: z.number().int().min(1).max(8).default(4) }),
     async (service, input) => service.impact(input.target, input.max_depth));
+  register(server, options, "expand_graph", "Expand exact Tier-1 graph detail only when dependency detail is needed.", rootSchema.extend({
+    terms: z.array(z.string().min(1)).default([]), node_ids: z.array(z.string().min(1)).default([]), limit: z.number().int().min(1).max(200).default(50)
+  }).refine((input) => input.terms.length > 0 || input.node_ids.length > 0, "terms or node_ids is required"),
+  async (service, input) => service.expandGraph(input.terms, input.node_ids, input.limit));
+  register(server, options, "get_file_digest", "Return indexed symbols, imports, hash, lines, and last modifying phase without reading the file.", rootSchema.extend({ file_path: z.string().min(1) }),
+    async (service, input) => service.fileDigest(input.file_path));
   register(server, options, "start_phase", "Start one dependency-ready phase.", rootSchema.extend({ phase_id: z.string().min(1) }),
     (service, input) => service.startPhase(input.phase_id));
   register(server, options, "prepare_parallel_phases", "Create isolated Git worktrees for independent parallel-safe READY phases.", rootSchema.extend({ phase_ids: z.array(z.string()).optional() }),
@@ -88,19 +104,21 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
     async (service, input) => service.store.requestApproval(input.phase_id, input.prompt));
   register(server, options, "resolve_approval", "Resolve a pending human approval.", rootSchema.extend({ approval_id: z.string().min(1), approved: z.boolean(), note: z.string().default("") }),
     async (service, input) => service.store.resolveApproval(input.approval_id, input.approved, input.note));
-  register(server, options, "record_budget_usage", "Record token, cost, and wall-clock usage for enforceable budgets.", rootSchema.extend({
+  register(server, options, "record_budget_usage", "Record token, estimated-token, cost, and wall-clock usage for enforceable budgets.", rootSchema.extend({
     scope: z.enum(["project", "phase"]), scope_id: z.string().min(1), tokens: z.number().int().nonnegative().optional(),
-    cost_usd: z.number().nonnegative().optional(), wall_clock_ms: z.number().int().nonnegative().optional()
+    estimated_tokens: z.number().int().nonnegative().optional(), cost_usd: z.number().nonnegative().optional(),
+    wall_clock_ms: z.number().int().nonnegative().optional()
   }), async (service, input) => service.store.recordBudgetUsage(input.scope, input.scope_id, {
     ...(input.tokens !== undefined ? { tokens: input.tokens } : {}),
+    ...(input.estimated_tokens !== undefined ? { estimatedTokens: input.estimated_tokens } : {}),
     ...(input.cost_usd !== undefined ? { costUsd: input.cost_usd } : {}),
     ...(input.wall_clock_ms !== undefined ? { wallClockMs: input.wall_clock_ms } : {})
   }));
   register(server, options, "restore_phase_baseline", "Restore only files changed since a phase baseline.", rootSchema.extend({ phase_id: z.string().min(1) }),
     (service, input) => service.restorePhaseBaseline(input.phase_id));
-  register(server, options, "suggest_phases", "Consult the opt-in cross-project playbook.", rootSchema.extend({ query: z.string().min(1) }),
+  register(server, options, "suggest_phases", "Consult the opt-in compressed cross-project playbook.", rootSchema.extend({ query: z.string().min(1) }),
     async (service, input) => service.suggestPhases(input.query));
-  register(server, options, "remember_phase_template", "Persist a successful phase into the opt-in playbook.", rootSchema.extend({ phase_id: z.string().min(1) }),
+  register(server, options, "remember_phase_template", "Persist a successful phase as a compact deduplicated playbook pattern.", rootSchema.extend({ phase_id: z.string().min(1) }),
     async (service, input) => service.rememberPhaseTemplate(input.phase_id));
   register(server, options, "list_files", "List bounded repository paths.", rootSchema.extend({ max_files: z.number().int().min(1).max(2_000).default(500) }),
     (service, input) => service.workspace.listFiles(input.max_files));
@@ -115,7 +133,7 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
   register(server, options, "record_decision", "Persist architectural rationale.", rootSchema.extend({
     phase_id: z.string().nullable().default(null), title: z.string().min(1), rationale: z.string().min(1), alternatives: z.array(z.string()).default([])
   }), async (service, input) => service.store.recordDecision({ phaseId: input.phase_id, title: input.title, rationale: input.rationale, alternatives: input.alternatives }));
-  register(server, options, "record_failure", "Deduplicate a failed approach and compound opt-in playbook memory.", rootSchema.extend({ phase_id: z.string().min(1), summary: z.string().min(1), fingerprint: z.string().optional() }),
+  register(server, options, "record_failure", "Deduplicate a normalized failed approach and compound opt-in playbook memory.", rootSchema.extend({ phase_id: z.string().min(1), summary: z.string().min(1), fingerprint: z.string().optional() }),
     async (service, input) => service.recordFailure(input.phase_id, input.summary, input.fingerprint));
   register(server, options, "checkpoint_phase", "Run scope, secret, budget, selective-test, command, and critic gates.", rootSchema.extend({ phase_id: z.string().min(1), summary: z.string().min(1) }),
     async (service, input) => {
@@ -140,7 +158,7 @@ function validateCommands(options: CreateServerOptions, phases: Array<{ acceptan
   for (const phase of phases) for (const command of phase.acceptanceCommands) options.validateAcceptanceCommand?.(command);
 }
 
-function register<Schema extends z.ZodObject<z.ZodRawShape>>(
+function register<Schema extends z.ZodType>(
   server: McpServer,
   options: CreateServerOptions,
   name: string,
@@ -148,7 +166,7 @@ function register<Schema extends z.ZodObject<z.ZodRawShape>>(
   inputSchema: Schema,
   operation: (service: KeepCodingService, input: z.output<Schema>) => Promise<unknown>
 ): void {
-  const readOnlyTools = ["get_context", "get_impact", "suggest_phases", "list_files", "read_file", "search_code", "get_diff", "get_status"];
+  const readOnlyTools = ["get_context", "get_impact", "expand_graph", "get_file_digest", "suggest_phases", "list_files", "read_file", "search_code", "get_diff", "get_status"];
   const config = {
     description,
     inputSchema,
@@ -161,7 +179,7 @@ function register<Schema extends z.ZodObject<z.ZodRawShape>>(
   const handler = async (rawInput: unknown) => {
     let service: KeepCodingService | null = null;
     try {
-      const parsed = inputSchema.parse(rawInput);
+      const parsed = inputSchema.parse(rawInput) as z.output<Schema> & { project_root: string };
       const projectRoot = options.resolveProjectRoot
         ? await options.resolveProjectRoot(String(parsed.project_root))
         : String(parsed.project_root);

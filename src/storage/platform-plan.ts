@@ -46,8 +46,8 @@ export function amendPlan(host: PlanHost, amendment: PlanAmendment): void {
     INSERT INTO phases (id, ordinal, title, goal, status, dependencies_json, allowed_scope_json,
       acceptance_commands_json, max_attempts, attempts, started_at, completed_at, base_sha, head_sha,
       summary, revision, superseded_by, requires_approval, approval_prompt, approved_at, budget_json,
-      critic_blocking, parallel_safe, reverify_reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, NULL, ?, ?, ?, NULL)
+      critic_blocking, parallel_safe, reverify_reason, verification_kind)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, NULL, ?, ?, ?, NULL, ?)
   `);
   amendment.addPhases.forEach((phase, index) => {
     const ready = phase.dependencies.every((dependency) => dependencySatisfied(host.db, dependency));
@@ -55,7 +55,8 @@ export function amendPlan(host: PlanHost, amendment: PlanAmendment): void {
       phase.id, startOrdinal + index, phase.title, phase.goal, ready ? "READY" : "PENDING",
       JSON.stringify(phase.dependencies), JSON.stringify(phase.allowedScope), JSON.stringify(phase.acceptanceCommands),
       phase.maxAttempts, version, phase.requiresApproval ? 1 : 0, phase.approvalPrompt ?? null,
-      JSON.stringify(phase.budget ?? {}), phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0
+      JSON.stringify(phase.budget ?? {}), phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0,
+      phase.verificationKind ?? "code"
     );
     host.graphNode({ id: `phase:${phase.id}`, type: "phase", label: phase.title, path: null, symbol: null, contentHash: null, metadata: { revision: version, goal: phase.goal } });
     for (const dependency of phase.dependencies) host.graphEdge({ sourceId: `phase:${phase.id}`, targetId: `phase:${dependency}`, type: "depends_on", metadata: { version } });
@@ -80,8 +81,11 @@ export function listPlanRevisions(db: DatabaseSync): PlanRevisionRecord[] {
 }
 
 export function writePhaseOptions(db: DatabaseSync, phase: PhaseDefinition, revision: number): void {
-  db.prepare("UPDATE phases SET revision = ?, requires_approval = ?, approval_prompt = ?, budget_json = ?, critic_blocking = ?, parallel_safe = ? WHERE id = ?")
-    .run(revision, phase.requiresApproval ? 1 : 0, phase.approvalPrompt ?? null, JSON.stringify(phase.budget ?? {}), phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0, phase.id);
+  db.prepare("UPDATE phases SET revision = ?, requires_approval = ?, approval_prompt = ?, budget_json = ?, critic_blocking = ?, parallel_safe = ?, verification_kind = ? WHERE id = ?")
+    .run(
+      revision, phase.requiresApproval ? 1 : 0, phase.approvalPrompt ?? null, JSON.stringify(phase.budget ?? {}),
+      phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0, phase.verificationKind ?? "code", phase.id
+    );
 }
 
 function redirectDependencies(db: DatabaseSync, superseded: string[], replacement: string): void {

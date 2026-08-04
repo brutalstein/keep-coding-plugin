@@ -65,8 +65,9 @@ describe("project state machine", () => {
     const store = subject();
     const project = store.initialize("Build everything");
     store.savePlan(contract, [phases[0]!]);
-    store.recordBudgetUsage("project", project.id, { tokens: 101 });
+    store.recordBudgetUsage("project", project.id, { tokens: 101, estimatedTokens: 20 });
     expect(store.budgetEvidence("foundation").passed).toBe(false);
+    expect(store.listBudgetUsage()[`project:${project.id}`]?.estimatedTokens).toBe(20);
     store.startPhase("foundation", "abc");
     store.markVerifying("foundation");
     store.finishVerification("foundation", "done", evidence());
@@ -89,5 +90,18 @@ describe("project state machine", () => {
     store.finishVerification("foundation", "failed", evidence(false));
     expect(store.getProject()?.status).toBe("BLOCKED_BUDGET");
     store.close();
+  });
+
+  it("clusters equivalent failures despite timestamps paths and line numbers", () => {
+    const store = subject();
+    try {
+      store.initialize("Build");
+      store.savePlan(contract, [phases[0]!]);
+      const first = store.recordFailure("foundation", "2026-08-04T10:00:00Z Error in /tmp/repo/src/a.ts:12: migration failed with code 500");
+      const second = store.recordFailure("foundation", "2026-08-04T10:03:15Z Error in /home/agent/work/src/a.ts:99: migration failed with code 404");
+      expect(second.id).toBe(first.id);
+      expect(second.count).toBe(2);
+      expect(store.listFailures()).toHaveLength(1);
+    } finally { store.close(); }
   });
 });

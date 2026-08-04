@@ -20,8 +20,8 @@ describe("next generation platform", () => {
     expect(detectLargeProject("small", { force: true }).manualOverride).toBe(true);
   });
 
-  it("builds AST symbols, imports and calls", () => {
-    const parsed = parseSemanticFile("import { b } from './b.js'; export function a(){ return b(); }", ".ts");
+  it("builds AST symbols, imports and calls lazily", async () => {
+    const parsed = await parseSemanticFile("import { b } from './b.js'; export function a(){ return b(); }", ".ts");
     expect(parsed.symbols.some((item) => item.name === "a")).toBe(true);
     expect(parsed.imports).toContain("./b.js");
     expect(parsed.references.some((item) => item.target === "b" && item.kind === "calls")).toBe(true);
@@ -45,7 +45,7 @@ describe("next generation platform", () => {
     expect((await new PollingCliAdapter().translate({ name: "poll", cwd: "/r" }, null)).continue).toBe(true);
   });
 
-  it("stores opt-in playbook templates outside a project", () => {
+  it("stores opt-in playbook patterns outside a project", () => {
     const root = mkdtempSync(path.join(tmpdir(), "playbook-"));
     const database = path.join(root, "playbook.db");
     const playbook = new PlaybookStore(database);

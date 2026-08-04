@@ -1,7 +1,8 @@
+import { createHash } from "node:crypto";
 import type {
-  ApprovalRecord, BudgetEvidence, BudgetLimits, BudgetUsage, GraphEdge, GraphNode, ImpactNode,
-  PhaseDefinition, PhaseRecord, PlanAmendment, PlanRevisionRecord, ProjectContract, ProjectRecord,
-  ProjectSnapshot, VerificationEvidence, WorktreeRecord
+  ApprovalRecord, BudgetEvidence, BudgetLimits, BudgetUsage, CommandFailureRecord, EventRecord, FailureRecord,
+  FileDigest, GraphEdge, GraphNode, ImpactNode, PhaseDefinition, PhaseRecord, PlanAmendment, PlanRevisionRecord,
+  ProjectContract, ProjectRecord, ProjectSnapshot, VerificationEvidence, WorktreeRecord
 } from "../domain/model.js";
 import { ProjectStore } from "./store.js";
 import { PlatformDb, type DbRow, json, nullable, now, text } from "./platform-db.js";
@@ -78,16 +79,76 @@ export class PlatformStore extends ProjectStore {
     return required(this.getProject(), "project completion failed");
   }
 
+  override recordFailure(phaseId: string, summary: string, fingerprint?: string): FailureRecord {
+    return super.recordFailure(phaseId, summary, fingerprint?.trim() || failureSignature(summary));
+  }
+
   requestApproval(phaseId: string, prompt: string): ApprovalRecord { return requestApproval(this.runtimeHost(), phaseId, prompt); }
   resolveApproval(id: string, approved: boolean, note: string): ApprovalRecord { return resolveApproval(this.runtimeHost(), id, approved, note); }
   listApprovals(): ApprovalRecord[] { return listApprovals(this.platform.db); }
   listPlanRevisions(): PlanRevisionRecord[] { return listPlanRevisions(this.platform.db); }
-  recordBudgetUsage(scope: "project" | "phase", scopeId: string, delta: Partial<Omit<BudgetUsage, "updatedAt">>): BudgetUsage { return recordBudgetUsage(this.platform.db, scope, scopeId, delta); }
+  recordBudgetUsage(scope: "project" | "phase", scopeId: string, delta: Partial<Omit<BudgetUsage, "updatedAt">>, eventType = "budget_usage_recorded"): BudgetUsage {
+    const usage = recordBudgetUsage(this.platform.db, scope, scopeId, delta);
+    this.appendEvent(eventType, scope === "phase" ? scopeId : null, { scope, scopeId, delta });
+    return usage;
+  }
   budgetEvidence(phaseId: string): BudgetEvidence { return budgetEvidence(this.runtimeHost(), phaseId); }
   listBudgetUsage(): Record<string, BudgetUsage> { return listBudgetUsage(this.platform.db); }
   setWorktree(record: WorktreeRecord): void { setWorktree(this.platform.db, record); }
   getWorktree(id: string): WorktreeRecord | null { return getWorktree(this.platform.db, id); }
   listWorktrees(): WorktreeRecord[] { return listWorktrees(this.platform.db); }
+
+  eventsSince(sequence: number): EventRecord[] {
+    return (this.platform.db.prepare("SELECT * FROM events WHERE sequence > ? ORDER BY sequence").all(sequence) as DbRow[]).map((row) => ({
+      sequence: Number(row.sequence), timestamp: text(row.timestamp), type: text(row.type),
+      phaseId: nullable(row.phase_id), payload: json<Record<string, unknown>>(row.payload_json)
+    }));
+  }
+
+  getLastDeliveredSequence(cursor: string): number {
+    const row = this.platform.db.prepare("SELECT value FROM metadata WHERE key = ?").get(`context_cursor:${cursor}`) as DbRow | undefined;
+    return row ? Number(row.value) : 0;
+  }
+  setLastDeliveredSequence(cursor: string, sequence: number): void {
+    this.platform.db.prepare(`INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
+      .run(`context_cursor:${cursor}`, String(sequence));
+  }
+
+  fileDigest(filePath: string): FileDigest | null {
+    const normalized = filePath.replaceAll("\\", "/").replace(/^\.\//, "");
+    const file = this.platform.db.prepare("SELECT * FROM graph_nodes WHERE id = ? AND active = 1").get(`file:${normalized}`) as DbRow | undefined;
+    if (!file) return null;
+    const metadata = json<Record<string, unknown>>(file.metadata_json);
+    const symbols = (this.platform.db.prepare("SELECT * FROM graph_nodes WHERE path = ? AND type = 'symbol' AND active = 1 ORDER BY CAST(json_extract(metadata_json,'$.line') AS INTEGER), label").all(normalized) as DbRow[])
+      .map((row) => {
+        const item = json<Record<string, unknown>>(row.metadata_json);
+        return {
+          name: text(row.label),
+          kind: typeof item.kind === "string" ? item.kind : "symbol",
+          line: typeof item.line === "number" ? item.line : 0
+        };
+      });
+    const imports = (this.platform.db.prepare("SELECT target_id FROM graph_edges WHERE source_id = ? AND type = 'imports' ORDER BY target_id").all(`file:${normalized}`) as DbRow[])
+      .map((row) => text(row.target_id).replace(/^file:/, ""));
+    const modifier = this.platform.db.prepare("SELECT source_id FROM graph_edges WHERE target_id = ? AND type = 'modifies' ORDER BY updated_at DESC LIMIT 1").get(`file:${normalized}`) as DbRow | undefined;
+    return {
+      path: normalized,
+      contentHash: nullable(file.content_hash),
+      lineCount: Number(metadata.lineCount ?? 0),
+      symbols,
+      imports,
+      lastModifiedByPhase: modifier ? text(modifier.source_id).replace(/^phase:/, "") : null
+    };
+  }
+
+  latestCommandFailure(phaseId: string, command: string): CommandFailureRecord | null {
+    const row = this.platform.db.prepare("SELECT * FROM command_failures WHERE phase_id=? AND command=? ORDER BY attempt DESC LIMIT 1").get(phaseId, command) as DbRow | undefined;
+    return row ? commandFailureFromRow(row) : null;
+  }
+  recordCommandFailure(record: CommandFailureRecord): void {
+    this.platform.db.prepare(`INSERT OR REPLACE INTO command_failures(phase_id,command,attempt,stdout,stderr,fingerprint,created_at) VALUES(?,?,?,?,?,?,?)`)
+      .run(record.phaseId, record.command, record.attempt, record.stdout, record.stderr, record.fingerprint, record.createdAt);
+  }
 
   markReverification(ids: string[], reason: string, sourcePhaseId: string): string[] {
     const marked: string[] = [];
@@ -133,13 +194,14 @@ export class PlatformStore extends ProjectStore {
   }
 
   private augment(phase: PhaseRecord): PhaseRecord {
-    const row = this.platform.db.prepare(`SELECT revision,superseded_by,requires_approval,approval_prompt,approved_at,budget_json,critic_blocking,parallel_safe,reverify_reason FROM phases WHERE id=?`).get(phase.id) as DbRow | undefined;
+    const row = this.platform.db.prepare(`SELECT revision,superseded_by,requires_approval,approval_prompt,approved_at,budget_json,critic_blocking,parallel_safe,reverify_reason,verification_kind FROM phases WHERE id=?`).get(phase.id) as DbRow | undefined;
     if (!row) return phase;
     const budget = row.budget_json ? json<BudgetLimits>(row.budget_json) : {};
     return {
       ...phase, revision: Number(row.revision ?? 1), supersededBy: nullable(row.superseded_by), approvedAt: nullable(row.approved_at),
       reverifyReason: nullable(row.reverify_reason), requiresApproval: Boolean(row.requires_approval), criticBlocking: Boolean(row.critic_blocking),
-      parallelSafe: Boolean(row.parallel_safe), ...(row.approval_prompt ? { approvalPrompt: text(row.approval_prompt) } : {}),
+      parallelSafe: Boolean(row.parallel_safe), verificationKind: text(row.verification_kind) as "code" | "non-code",
+      ...(row.approval_prompt ? { approvalPrompt: text(row.approval_prompt) } : {}),
       ...(Object.keys(budget).length > 0 ? { budget } : {})
     };
   }
@@ -168,4 +230,20 @@ export class PlatformStore extends ProjectStore {
   }
 }
 
+function commandFailureFromRow(row: DbRow): CommandFailureRecord {
+  return {
+    phaseId: text(row.phase_id), command: text(row.command), attempt: Number(row.attempt),
+    stdout: text(row.stdout), stderr: text(row.stderr), fingerprint: text(row.fingerprint), createdAt: text(row.created_at)
+  };
+}
+function failureSignature(value: string): string {
+  const normalized = value.toLowerCase()
+    .replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/giu, "<timestamp>")
+    .replace(/(?:[a-z]:\\|\/)(?:[^\s:]+[\\/])+[^\s:]+/giu, "<path>")
+    .replace(/:\d+(?::\d+)?\b/gu, ":<line>")
+    .replace(/0x[0-9a-f]+/giu, "<hex>")
+    .replace(/\b\d+\b/gu, "<n>")
+    .replace(/\s+/gu, " ").trim();
+  return createHash("sha256").update(normalized).digest("hex").slice(0, 24);
+}
 function required<T>(value: T | null | undefined, message: string): T { if (value === null || value === undefined) throw new Error(message); return value; }

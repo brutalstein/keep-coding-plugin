@@ -37,14 +37,22 @@ export function listApprovals(db: DatabaseSync): ApprovalRecord[] {
 
 export function recordBudgetUsage(db: DatabaseSync, scope: "project" | "phase", scopeId: string, delta: Partial<Omit<BudgetUsage, "updatedAt">>): BudgetUsage {
   for (const value of Object.values(delta)) if (value !== undefined && (!Number.isFinite(value) || value < 0)) throw new Error("budget deltas must be non-negative");
-  db.prepare(`INSERT INTO budget_usage VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(scope, scope_id) DO UPDATE SET tokens = tokens + excluded.tokens, cost_usd = cost_usd + excluded.cost_usd, wall_clock_ms = wall_clock_ms + excluded.wall_clock_ms, updated_at = excluded.updated_at`)
-    .run(scope, scopeId, delta.tokens ?? 0, delta.costUsd ?? 0, delta.wallClockMs ?? 0, now());
+  db.prepare(`
+    INSERT INTO budget_usage (scope, scope_id, tokens, estimated_tokens, cost_usd, wall_clock_ms, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(scope, scope_id) DO UPDATE SET
+      tokens = tokens + excluded.tokens,
+      estimated_tokens = estimated_tokens + excluded.estimated_tokens,
+      cost_usd = cost_usd + excluded.cost_usd,
+      wall_clock_ms = wall_clock_ms + excluded.wall_clock_ms,
+      updated_at = excluded.updated_at
+  `).run(scope, scopeId, delta.tokens ?? 0, delta.estimatedTokens ?? 0, delta.costUsd ?? 0, delta.wallClockMs ?? 0, now());
   return getBudgetUsage(db, scope, scopeId);
 }
 
 export function getBudgetUsage(db: DatabaseSync, scope: "project" | "phase", scopeId: string): BudgetUsage {
   const row = db.prepare("SELECT * FROM budget_usage WHERE scope = ? AND scope_id = ?").get(scope, scopeId) as DbRow | undefined;
-  return row ? usageFromRow(row) : { tokens: 0, costUsd: 0, wallClockMs: 0, updatedAt: "" };
+  return row ? usageFromRow(row) : { tokens: 0, estimatedTokens: 0, costUsd: 0, wallClockMs: 0, updatedAt: "" };
 }
 
 export function budgetEvidence(host: RuntimeHost, phaseId: string): BudgetEvidence {
@@ -54,8 +62,11 @@ export function budgetEvidence(host: RuntimeHost, phaseId: string): BudgetEviden
   const projectUsage = getBudgetUsage(host.db, "project", project.id);
   const phaseUsage = getBudgetUsage(host.db, "phase", phaseId);
   const usage: BudgetUsage = {
-    tokens: Math.max(projectUsage.tokens, phaseUsage.tokens), costUsd: Math.max(projectUsage.costUsd, phaseUsage.costUsd),
-    wallClockMs: Math.max(projectUsage.wallClockMs, phaseUsage.wallClockMs), updatedAt: now()
+    tokens: Math.max(projectUsage.tokens, phaseUsage.tokens),
+    estimatedTokens: Math.max(projectUsage.estimatedTokens ?? 0, phaseUsage.estimatedTokens ?? 0),
+    costUsd: Math.max(projectUsage.costUsd, phaseUsage.costUsd),
+    wallClockMs: Math.max(projectUsage.wallClockMs, phaseUsage.wallClockMs),
+    updatedAt: now()
   };
   const violations: string[] = [];
   if (limits.maxTokens !== undefined && usage.tokens > limits.maxTokens) violations.push(`token budget exceeded: ${usage.tokens}/${limits.maxTokens}`);

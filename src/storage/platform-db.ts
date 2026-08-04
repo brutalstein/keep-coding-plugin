@@ -38,8 +38,8 @@ export class PlatformDb {
       );
       CREATE TABLE IF NOT EXISTS budget_usage (
         scope TEXT NOT NULL, scope_id TEXT NOT NULL, tokens INTEGER NOT NULL DEFAULT 0,
-        cost_usd REAL NOT NULL DEFAULT 0, wall_clock_ms INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id)
+        estimated_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
+        wall_clock_ms INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id)
       );
       CREATE TABLE IF NOT EXISTS critic_reviews (
         id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -48,7 +48,14 @@ export class PlatformDb {
         phase_id TEXT PRIMARY KEY, path TEXT NOT NULL, branch TEXT NOT NULL, status TEXT NOT NULL,
         base_sha TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS command_failures (
+        phase_id TEXT NOT NULL, command TEXT NOT NULL, attempt INTEGER NOT NULL,
+        stdout TEXT NOT NULL, stderr TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY (phase_id, command, attempt)
+      );
+      CREATE INDEX IF NOT EXISTS idx_command_failures_latest ON command_failures(phase_id, command, attempt DESC);
     `);
+    addColumn(this.db, "budget_usage", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
     const additions: Record<string, string> = {
       revision: "INTEGER NOT NULL DEFAULT 1",
       superseded_by: "TEXT",
@@ -58,13 +65,16 @@ export class PlatformDb {
       budget_json: "TEXT NOT NULL DEFAULT '{}'",
       critic_blocking: "INTEGER NOT NULL DEFAULT 0",
       parallel_safe: "INTEGER NOT NULL DEFAULT 0",
-      reverify_reason: "TEXT"
+      reverify_reason: "TEXT",
+      verification_kind: "TEXT NOT NULL DEFAULT 'code'"
     };
-    for (const [name, definition] of Object.entries(additions)) {
-      const columns = this.db.prepare("PRAGMA table_info(phases)").all() as DbRow[];
-      if (!columns.some((row) => text(row.name) === name)) this.db.exec(`ALTER TABLE phases ADD COLUMN ${name} ${definition}`);
-    }
+    for (const [name, definition] of Object.entries(additions)) addColumn(this.db, "phases", name, definition);
   }
+}
+
+function addColumn(db: DatabaseSync, table: string, name: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as DbRow[];
+  if (!columns.some((row) => text(row.name) === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 }
 
 export function approvalFromRow(row: DbRow): ApprovalRecord {
@@ -76,7 +86,13 @@ export function approvalFromRow(row: DbRow): ApprovalRecord {
 }
 
 export function usageFromRow(row: DbRow): BudgetUsage {
-  return { tokens: Number(row.tokens), costUsd: Number(row.cost_usd), wallClockMs: Number(row.wall_clock_ms), updatedAt: text(row.updated_at) };
+  return {
+    tokens: Number(row.tokens),
+    estimatedTokens: Number(row.estimated_tokens ?? 0),
+    costUsd: Number(row.cost_usd),
+    wallClockMs: Number(row.wall_clock_ms),
+    updatedAt: text(row.updated_at)
+  };
 }
 
 export function worktreeFromRow(row: DbRow): WorktreeRecord {

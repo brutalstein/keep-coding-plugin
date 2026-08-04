@@ -1,4 +1,4 @@
-import { chmod, mkdir } from "node:fs/promises";
+import { chmod, mkdir, stat } from "node:fs/promises";
 import { build } from "esbuild";
 
 const outfile = "plugins/keep-coding/dist/keep-coding.mjs";
@@ -12,6 +12,8 @@ await build({
   target: "node22",
   sourcemap: true,
   banner: { js: "#!/usr/bin/env node" },
-  external: ["node:sqlite"]
+  external: ["node:sqlite", "typescript"]
 });
 await chmod(outfile, 0o755);
+const output = await stat(outfile);
+console.log(`Built ${outfile} (${output.size} bytes; TypeScript compiler external).`);
