@@ -25,7 +25,13 @@ export interface BudgetLimits {
   maxCostUsd?: number | undefined;
   maxWallClockMs?: number | undefined;
 }
-export interface BudgetUsage { tokens: number; costUsd: number; wallClockMs: number; updatedAt: string }
+export interface BudgetUsage {
+  tokens: number;
+  estimatedTokens?: number | undefined;
+  costUsd: number;
+  wallClockMs: number;
+  updatedAt: string;
+}
 export interface BudgetEvidence { passed: boolean; limits: BudgetLimits; usage: BudgetUsage; violations: string[] }
 export interface CriticPolicy { enabled: boolean; blocking: boolean }
 export interface SelectiveTestPolicy { commandTemplate: string; fullSuiteCommands: string[] }
@@ -55,6 +61,7 @@ export interface PhaseDefinition {
   allowedScope: string[];
   acceptanceCommands: string[];
   maxAttempts: number;
+  verificationKind?: "code" | "non-code" | undefined;
   budget?: BudgetLimits | undefined;
   criticBlocking?: boolean | undefined;
   requiresApproval?: boolean | undefined;
@@ -101,7 +108,31 @@ export interface DecisionRecord { id: string; phaseId: string | null; title: str
 export interface FailureRecord { id: string; phaseId: string; fingerprint: string; summary: string; count: number; lastSeenAt: string; resolution: string | null }
 export interface ApprovalRecord { id: string; phaseId: string; prompt: string; status: "pending" | "approved" | "rejected"; requestedAt: string; resolvedAt: string | null; resolutionNote: string | null }
 
-export interface CommandEvidence { command: string; exitCode: number | null; passed: boolean; durationMs: number; stdout: string; stderr: string; timedOut: boolean }
+export interface CommandOutputCompression {
+  originalChars: number;
+  emittedChars: number;
+  unchangedLines: number;
+  previousAttempt: number | null;
+}
+export interface CommandEvidence {
+  command: string;
+  exitCode: number | null;
+  passed: boolean;
+  durationMs: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  compression?: CommandOutputCompression | undefined;
+}
+export interface CommandFailureRecord {
+  phaseId: string;
+  command: string;
+  attempt: number;
+  stdout: string;
+  stderr: string;
+  fingerprint: string;
+  createdAt: string;
+}
 export interface SecretFinding { ruleId: string; file: string; line: number; fingerprint: string; preview: string }
 export interface SecretScanEvidence { passed: boolean; scannedFiles: string[]; findings: SecretFinding[] }
 export interface CriticFinding { severity: "info" | "warning" | "error"; rule: string; message: string; file?: string | undefined }
@@ -144,6 +175,43 @@ export interface GraphEdge {
 
 export interface ImpactNode { node: GraphNode; distance: number; via: GraphEdge["type"] | null }
 export interface EventRecord { sequence: number; timestamp: string; type: string; phaseId: string | null; payload: Record<string, unknown> }
+
+export type ContextSection = "header" | "contract" | "active_phase" | "approvals" | "budget" | "decisions" | "failures" | "checkpoints" | "graph" | "playbook";
+export interface ContextEnvelope {
+  unchanged: boolean;
+  sequence: number;
+  context?: string | undefined;
+  changedSections: ContextSection[];
+  unchangedSections: ContextSection[];
+  estimatedTokens: number;
+}
+
+export interface CommandQualityWarning {
+  phaseId: string;
+  code: "weak-verification-category" | "duplicate-verification-command" | "critic-recommended";
+  message: string;
+  commands: string[];
+}
+
+export interface FileDigest {
+  path: string;
+  contentHash: string | null;
+  lineCount: number;
+  symbols: Array<{ name: string; kind: string; line: number }>;
+  imports: string[];
+  lastModifiedByPhase: string | null;
+}
+
+export interface PlaybookPattern {
+  id: string;
+  pattern: string;
+  triggerConditions: string[];
+  resolution: string[];
+  applicabilityScope: string[];
+  score: number;
+  successCount: number;
+  sourceProjects: string[];
+}
 
 export interface ProjectSnapshot {
   project: ProjectRecord;
