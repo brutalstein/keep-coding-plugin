@@ -1,6 +1,6 @@
 {
   "name": "keep-coding",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Evidence-gated durable memory for long-running coding agents.",
   "type": "module",
   "private": true,
@@ -12,16 +12,19 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "npm run lint && npm run typecheck && npm run test:coverage && npm run build && npm run validate:plugin",
+    "check": "npm run lint && npm run typecheck && npm run test:coverage && npm run build && npm run test:dist-smoke && npm run benchmark:context && npm run validate:plugin",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
+    "test:dist-smoke": "vitest run --config vitest.dist.config.ts",
+    "benchmark:context": "vitest run --config vitest.benchmark.config.ts",
     "validate:plugin": "node scripts/validate-plugin.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
     "minimatch": "10.2.6",
+    "typescript": "6.0.3",
     "zod": "4.4.3"
   },
   "devDependencies": {
@@ -31,7 +34,6 @@
     "@vitest/coverage-v8": "4.1.10",
     "esbuild": "0.28.1",
     "eslint": "10.8.0",
-    "typescript": "6.0.3",
     "typescript-eslint": "8.65.0",
     "vitest": "4.1.10"
   }
