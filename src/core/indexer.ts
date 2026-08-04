@@ -39,10 +39,18 @@ export async function indexRepository(store: ProjectStore, git: GitRepository): 
     if (content === null || content.includes("\0")) { result.skipped += 1; continue; }
     const isTest = isTestPath(relativePath);
     const fileId = `file:${relativePath}`;
-    store.upsertGraphNode({ id: fileId, type: isTest ? "test" : "file", label: path.basename(relativePath), path: relativePath, symbol: null, contentHash: sha256(content), metadata: { bytes: info.size, extension, parser: parserName(extension) } });
+    store.upsertGraphNode({
+      id: fileId,
+      type: isTest ? "test" : "file",
+      label: path.basename(relativePath),
+      path: relativePath,
+      symbol: null,
+      contentHash: sha256(content),
+      metadata: { bytes: info.size, lineCount: content.split("\n").length, extension, parser: parserName(extension) }
+    });
     result.filesIndexed += 1;
     if (isTest) result.testsIndexed += 1;
-    const parsed = parseSemanticFile(content, extension);
+    const parsed = await parseSemanticFile(content, extension);
     entries.push({ relativePath, extension, parsed });
     for (const symbol of parsed.symbols) {
       const symbolId = `symbol:${relativePath}:${symbol.kind}:${symbol.name}`;
