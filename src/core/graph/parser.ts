@@ -29,10 +29,9 @@ export async function parseSemanticFile(content: string, extension: string): Pro
 }
 
 async function loadTypeScript(): Promise<typeof TypeScript> {
-  typescriptPromise ??= import("typescript").then((loaded) => {
-    const compatible = loaded as typeof loaded & { default?: typeof TypeScript };
-    return compatible.default ?? compatible;
-  });
+  if (typescriptPromise === null) {
+    typescriptPromise = import("typescript").then((loaded) => loaded.default);
+  }
   return typescriptPromise;
 }
 
