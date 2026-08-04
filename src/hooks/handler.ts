@@ -36,7 +36,8 @@ export async function handleHook(event: string, input: HookInput): Promise<HookO
       service.recordHostTokenUsage(extractUsageTokens(input));
       const envelope = service.contextEnvelope();
       service.store.setLastDeliveredSequence(cursorKey(runtime, session, event), envelope.sequence);
-      return contextOutput(event, `${envelope.context ?? ""}\n\nActivation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.reasons.join("; ")}.`);
+      const activationContext = envelope.unchanged ? "" : envelope.context;
+      return contextOutput(event, `${activationContext}\n\nActivation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.reasons.join("; ")}.`);
     });
   }
 
