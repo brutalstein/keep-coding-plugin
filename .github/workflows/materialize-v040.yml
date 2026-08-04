@@ -41,7 +41,8 @@ jobs:
           25f80b9fb15516fdef691ca4cb032f1918d84f238592c505e116f5722029f041  .publish/v040-overlay-02.b64
           459bd03d3243e7d53437b5022d9f3e9d93484151f9a4a7303de1459d35615c50  .publish/v040-overlay-03.b64
           d336dd85ab3a2350a55745b0e7bde5c640ff786537ea6278029bcd3b223f5891  .publish/v040-overlay-04a.b64
-          554283e6e7433ef2800ad008f229eaa05f77330a3d1e638071cebf7660afd151  .publish/v040-overlay-04b.b64
+          7b908c909b35e889589f450a76ea9a3043a95037018109da13424287ca23ca26  .publish/v040-overlay-04b-00.b64
+          ee38ed7daa3eadde7239bf9828e8131312b7b2301c49b3f1ed23696158e99d54  .publish/v040-overlay-04b-01.b64
           8cd3ed99e928224611e8abefded834bd8b33caa532e473ae6877fd7bbbc1577f  .publish/v040-tail-00.b64
           902844b65e22b76429d31db426929141ca4aa15a668198457bfb6d34c827d5cb  .publish/v040-tail-01.b64
           6c6f596f3dd6d118cc70ece475bdbff0efce765033e3f0dff9eefa04835ac438  .publish/v040-tail-rest-00.b64
@@ -56,7 +57,8 @@ jobs:
             .publish/v040-overlay-02.b64 \
             .publish/v040-overlay-03.b64 \
             .publish/v040-overlay-04a.b64 \
-            .publish/v040-overlay-04b.b64 \
+            .publish/v040-overlay-04b-00.b64 \
+            .publish/v040-overlay-04b-01.b64 \
             .publish/v040-tail-00.b64 \
             .publish/v040-tail-01.b64 \
             .publish/v040-tail-rest-00.b64 \
