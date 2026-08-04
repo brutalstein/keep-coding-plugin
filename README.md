@@ -1,41 +1,39 @@
 # Keep Coding
 
-Keep Coding is a runtime-agnostic durable-memory and verification layer for long-running coding agents. It keeps one default workflow: contract → dependency-aware phases → implementation → evidence-backed checkpoint → completion. Existing v0.1/v0.2 state databases continue through additive SQLite migrations.
+Keep Coding is a local-first control plane for long-running coding agents. It turns one project request into a durable contract, dependency-aware phase DAG, scoped implementation, evidence-backed checkpoints, and a full-suite completion gate. Existing v0.1-v0.3 SQLite state is upgraded additively.
 
 ## Status
 
-**Current release: v0.3.0.** This release adds an assumption ledger and bounded blast-radius correction protocol on top of the v0.2.1 evidence and token-efficiency platform. Wrong interpretations are now durable graph entities: the agent records them before implementation, links the artifacts that depend on them, invalidates them into a computed correction radius, and cannot silently edit outside that radius.
+**Current release: v0.4.0.** This release brings Python and C/C++ graph extraction to real syntax-tree fidelity, raises branch coverage to an enforced 75% floor, adds a reproducible paired-evaluation corpus, publishes host-agnostic MCP/Agent Skills packaging, and decomposes storage infrastructure without changing the durable data model.
 
 ## Core guarantees
 
-- A phase reaches `COMPLETED` only after scope, secret, budget, selective-test, acceptance-command, and configured critic gates finish.
-- `complete_project` requires every active phase—including impact-triggered reverification—to be complete and runs configured full-suite commands.
+- A phase reaches `COMPLETED` only after scope, secret, budget, selective-test, acceptance-command, approval, correction-radius, and configured critic gates pass.
+- `complete_project` requires every active phase and impact-triggered reverification to pass, then runs the configured full suite.
 - Plan amendments are versioned; completed evidence is never silently overwritten.
-- Remote workspace access remains root-confined and patch writes remain phase-scoped.
-- `npm run check` executes the built production artifact; source-only green tests cannot mask a broken distributable.
-- Low-confidence open assumptions and high-ambiguity phases cannot pass a checkpoint without explicit resolution.
-- Correction edits are restricted to the intersection of the phase scope and the computed/justifiably expanded blast radius.
+- Remote workspace access is canonical-root confined and patch writes remain phase-scoped.
+- The production CLI and its parser sidecars are executed in CI; source-only success cannot mask a broken distribution.
+- Low-confidence assumptions and high-ambiguity phases cannot silently pass checkpoints.
+- Correction edits are restricted to the intersection of phase scope and the computed or explicitly justified blast radius.
+- Native parser failure degrades to an explicit, telemetered legacy fallback instead of aborting indexing or returning a silent empty graph.
 
 ## Platform capabilities
 
 - Adaptive plan insertion and supersession after work starts
 - Atomic Git commit per passing phase, scoped baseline restore, and isolated parallel worktrees
-- Parser-backed TypeScript/JavaScript graph plus bounded language adapters, impact analysis, selective tests, and reverification
+- TypeScript compiler AST plus WASM tree-sitter parsers for Python, C, and C++
+- Decorator, nested-scope, namespace, template, local/system include, and lexical call extraction
+- Header/source symbol unification through explainable `same_symbol` graph edges
+- Impact analysis, impacted-test selection, and completed-phase reverification
 - Deterministic verification plus optional independent critic review
-- Human approval and enforceable token, cost, and wall-clock budgets
-- Always-on secret scanning and non-blocking acceptance-command quality warnings
-- Sequence-aware delta context and per-session unchanged-hook suppression
-- Tier-0 semantic summaries with explicit Tier-1 `expand_graph`
-- Indexed `get_file_digest` for low-token orientation before full file reads
-- Failure-output diffing, marker-aware truncation, normalized failure clustering, and token telemetry
-- Compact opt-in cross-project playbook patterns
-- Durable assumptions linked to exact files, symbols, and decisions
-- Cycle-safe, hop-limited correction blast radii with contained/expanded outcome tracking
-- Bilingual ambiguity pre-flight, blocking low-confidence critic escalation, and non-blocking apology-language correction nudges
-- Cross-project correction anti-patterns with measured hit rate and deduplication
-- Loopback-only read-only dashboard
-- Codex, Claude-style hook, and generic polling continuity adapters
-- GitHub CI and decision-sourced PR-description generation
+- Human approvals and enforceable token, cost, and wall-clock budgets
+- Always-on secret scanning and command-quality warnings
+- Sequence-aware delta context, unchanged-hook suppression, Tier-0 summaries, Tier-1 `expand_graph`, and `get_file_digest`
+- Command-output compression, repeated-failure diffing, normalized failure clustering, and token telemetry
+- Durable assumptions, bounded corrections, bilingual ambiguity detection, and opt-in correction anti-pattern memory
+- Loopback dashboard, stdio/HTTP MCP, Codex hooks, Claude hooks, and hookless polling
+- Canonical Agent Skills package shared byte-for-byte across host manifests
+- Frozen 24-task paired evaluation corpus with detached worktrees, external verifier contracts, Wilson intervals, and exact McNemar analysis
 
 ## Requirements and development
 
@@ -46,9 +44,11 @@ npm ci
 npm run check
 ```
 
-`npm run check` runs lint, strict TypeScript, source coverage, production build, compiled-artifact smoke tests, the context payload benchmark, documentation/version checks, and plugin validation. The committed distributable is `plugins/keep-coding/dist/keep-coding.mjs`.
+`npm run check` runs lint, strict TypeScript, source coverage, coverage-delta reporting, production build, byte-identical distribution checks, compiled-artifact scenarios, context and graph benchmarks, parser-asset integrity checks, corpus validation, cross-agent distribution validation, documentation drift checks, and executable plugin validation.
 
-Verified source suite: 107 tests across 26 files. The post-build artifact suite adds four compiled-binary scenarios, and the context benchmark runs separately.
+The committed distribution is the entire `plugins/keep-coding/dist/` directory: the executable `keep-coding.mjs` plus hash-manifested WASM grammars and tree-sitter queries.
+
+Verified source suite: 128 tests across 31 files. The post-build artifact suite adds five compiled-distribution scenarios; context and graph benchmarks run separately.
 
 ## CLI
 
@@ -56,27 +56,37 @@ Verified source suite: 107 tests across 26 files. The post-build artifact suite 
 keep-coding init /path/to/repo < project-prompt.md
 keep-coding status /path/to/repo
 keep-coding context /path/to/repo
+keep-coding poll /path/to/repo <last-sequence>
 keep-coding impact /path/to/repo src/core/service.ts
 keep-coding dashboard /path/to/repo
 keep-coding pr-description /path/to/repo
+keep-coding eval-corpus ./keep-coding.corpus.eval.json
 ```
 
-The dashboard binds to `127.0.0.1` by default. The optional independent critic is configured with `KEEP_CODING_CRITIC_COMMAND`; it receives JSON on stdin and returns `{ "passed": boolean, "summary": string, "findings": [] }`.
+The dashboard binds to `127.0.0.1`. The optional independent critic is configured with `KEEP_CODING_CRITIC_COMMAND` and receives structured JSON over stdin.
 
-## MCP workflow and token-efficient usage
+## Cross-agent installation
 
-Initialize and save a plan, start ready phases, apply scoped edits, checkpoint, resolve any approval, budget, or reverification state, then call `complete_project`. `amend_plan` is the only supported way to change an active plan.
+Use the generic MCP instructions in [docs/INSTALL_MCP.md](docs/INSTALL_MCP.md). The same canonical backend is exposed through:
 
-Use `get_context` without `include_snapshot` for normal reasoning. Pass the last `sequence` as `since_sequence`; an unchanged project returns a near-zero `{ "unchanged": true, "sequence": ... }` response. Request `include_snapshot: true` only for structured tooling or debugging. Prefer `get_file_digest` before a full file read, and call `expand_graph` only when exact dependency nodes are needed.
+- Codex plugin metadata and lifecycle hooks;
+- Claude plugin metadata, MCP declaration, and lifecycle hooks;
+- the open Agent Skills `SKILL.md` package;
+- generic stdio or Streamable HTTP MCP for Cursor, Windsurf, VS Code, Gemini CLI, OpenCode, and other MCP hosts;
+- `poll` as the sequence-aware fallback for hosts without lifecycle hooks.
 
-Normal ChatGPT can use the bounded `mcp-http` surface described in [docs/CHATGPT_APP.md](docs/CHATGPT_APP.md). Codex uses plugin hooks. Other runtimes can use the adapter layer or poll the CLI.
+Host integrations never fork the durable-memory or verification implementation.
 
-## Assumption and correction protocol
+## Semantic graph fidelity
 
-When an interpretation is uncertain, call `record_assumption` before editing, then `link_assumption` to the exact graph nodes that were built because of it. Resolve it with `confirm_assumption`, or call `invalidate_assumption` to compute a bounded correction radius. A correction checkpoint may touch only files inside both the original phase scope and that radius. `expand_correction_scope` requires a non-empty justification and records the expansion for review.
+TypeScript and JavaScript use the TypeScript compiler AST. Python, C, and C++ use `web-tree-sitter` with pinned grammar versions and SHA-256-verified sidecar assets. Golden adversarial fixtures cover decorated and nested Python definitions, multiline constructs, strings/comments containing fake code, C/C++ templates, namespaces, operators, declarations, definitions, and include classification.
 
-The default confidence threshold is `0.6` and can be changed with `contract.assumptionConfidenceThreshold`. Matching contained corrections can be promoted into the opt-in playbook as anti-patterns and surfaced before the same mistake is repeated. Evaluation reports include containment rate, Wilson 95% confidence interval, project-scoped tokens per correction, anti-pattern hit rate, and an optional enabled-vs-disabled paired comparison.
+Tree-sitter provides correct local syntax and lexical scope, not full compiler semantics. Cross-module Python type resolution, C/C++ macro expansion, conditional preprocessing, template instantiation, and overload resolution remain explicit Tier-2 work. Pyright or clangd enrichment will only be added after real corpus evidence justifies the additional subprocess and configuration boundary.
 
-## Architecture and evaluation
+## Evaluation boundary
+
+The repository includes a frozen 24-task corpus and a reproducible paired runner, but it does not publish fabricated efficacy percentages. [docs/EVALUATION_RESULTS.md](docs/EVALUATION_RESULTS.md) records the current evidence state and the exact command required to run authenticated treatment/baseline experiments. Provider credentials and agent executables are intentionally external to the repository.
+
+## Architecture and safety
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/EVALUATION.md](docs/EVALUATION.md), [SECURITY.md](SECURITY.md), and [docs/README.tr.md](docs/README.tr.md).

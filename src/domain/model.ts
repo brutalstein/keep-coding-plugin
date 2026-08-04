@@ -200,7 +200,7 @@ export interface GraphNode {
 export interface GraphEdge {
   sourceId: string;
   targetId: string;
-  type: "imports" | "contains" | "calls" | "references" | "tested_by" | "implements" | "modifies" | "verified_by" | "depends_on" | "depends_on_assumption" | "supersedes";
+  type: "imports" | "contains" | "calls" | "references" | "tested_by" | "implements" | "modifies" | "verified_by" | "depends_on" | "depends_on_assumption" | "supersedes" | "same_symbol";
   metadata: Record<string, unknown>;
 }
 

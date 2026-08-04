@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "keep_coding": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/keep-coding.mjs", "mcp"]
+    }
+  }
+}

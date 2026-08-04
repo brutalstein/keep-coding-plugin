@@ -1,0 +1,23 @@
+{
+  "name": "keep-coding",
+  "displayName": "Keep Coding",
+  "version": "0.4.0",
+  "description": "Evidence-gated durable project memory, semantic impact analysis, and bounded correction for long-running coding agents.",
+  "author": {
+    "name": "Keep Coding contributors"
+  },
+  "homepage": "https://github.com/brutalstein/keep-coding-plugin",
+  "repository": "https://github.com/brutalstein/keep-coding-plugin",
+  "license": "MIT",
+  "keywords": [
+    "coding-agent",
+    "mcp",
+    "durable-memory",
+    "verification",
+    "semantic-graph",
+    "assumption-ledger"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/claude-hooks.json",
+  "mcpServers": "./.mcp.claude.json"
+}

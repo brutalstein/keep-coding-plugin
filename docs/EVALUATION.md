@@ -48,3 +48,10 @@ The subsystem metrics are:
 - **Enabled-vs-disabled outcome:** an optional paired success comparison summarized by the same exact McNemar function used by the main A/B report.
 
 Self-reported confidence is not treated as calibrated probability. Evaluate confidence calibration indirectly through containment, repeated correction frequency, and the relationship between confidence bands and later invalidations.
+
+
+## Frozen corpus runner
+
+`eval-corpus` consumes the repository's versioned 24-task manifest. Each task supplies a seed fixture, prompt, category, independent structured assertions, and optional verifier argv. The runner creates a fresh seed commit and paired detached worktrees for every repetition, alternates arm order, and stores prompt hashes and starting SHAs. Agent and verifier commands are arrays rather than shell strings. Verifier definitions are not copied into the mutable task worktree.
+
+The repository intentionally separates **evaluation infrastructure** from **efficacy evidence**. A valid public efficacy report requires an externally available authenticated agent executable and completed paired runs. When that dependency is absent, [EVALUATION_RESULTS.md](EVALUATION_RESULTS.md) reports the corpus and methodology but no invented rate, confidence interval, or p-value.

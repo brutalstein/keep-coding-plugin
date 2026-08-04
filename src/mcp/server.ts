@@ -53,7 +53,7 @@ export interface CreateServerOptions {
 
 export function createServer(options: CreateServerOptions = {}): McpServer {
   const server = new McpServer(
-    { name: "keep-coding", version: "0.3.0" },
+    { name: "keep-coding", version: "0.4.0" },
     {
       instructions: [
         "Use one evidence-gated workflow; amend plans only through amend_plan.",

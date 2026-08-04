@@ -48,3 +48,14 @@ Assumption confidence is agent-authored metadata, not a probability guarantee. V
 `invalidate_assumption` computes only from explicit graph links and bounded dependency edges. Empty seeds return an empty radius. The verifier intersects that radius with the existing phase scope, so an assumption cannot grant broader write authority. `expand_correction_scope` requires a stored non-empty justification and any unexplained excess file remains a normal scope violation. The apology-language hook is advisory only and never grants or removes write authority.
 
 Project databases now also store assumption statements, rejected alternatives, confidence, graph dependencies, root causes, correction scopes, justifications, outcomes, and token counters. Opt-in cross-project playbook memory may store compact correction anti-patterns. These records can expose product requirements or design intent even though source file contents are not stored wholesale; protect `.keep-coding/state.db` and `~/.keep-coding/playbook.db` accordingly.
+
+
+## Native parser sidecars
+
+Python, C, and C++ parsing loads pinned WASM artifacts from the installed distribution. Before first use, Keep Coding verifies every grammar, query, and the tree-sitter runtime against the committed SHA-256 and byte-count manifest. Missing or modified assets cannot be treated as trusted syntax trees; indexing records an explicit degraded fallback. The parsers have bounded query match counts, parse/query deadlines, and output caps.
+
+Tree-sitter provides syntax, not compiler authority. No source-controlled grammar, query, or repository file can enable a new subprocess. Optional Pyright/clangd enrichment is not enabled in v0.4.0; any future implementation must use argv execution without shell interpolation, bounded timeouts, explicit binary discovery, content-hash caches, and failure-open-to-tree-sitter behavior.
+
+## Cross-agent packaging
+
+Codex, Claude, Agent Skills, and generic MCP packages point to one executable. Distribution validation prevents host-specific skill forks and checks that hook manifests declare their runtime identity. Streamable HTTP remains the only network-facing mode and retains its existing root, host, bearer-token, request-size, and exact-command boundaries.

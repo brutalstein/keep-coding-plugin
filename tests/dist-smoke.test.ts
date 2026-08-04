@@ -43,7 +43,7 @@ function textResult(result: Awaited<ReturnType<Client["callTool"]>>): Record<str
 
 describe("compiled Keep Coding artifact", () => {
   it("runs version and detection without evaluating the graph parser", () => {
-    expect(run(["version"]).stdout.trim()).toBe("0.3.0");
+    expect(run(["version"]).stdout.trim()).toBe("0.4.0");
     const detection = JSON.parse(run(["detect"], "Build a production-ready complete project with architecture, tests, CI, deployment and phases.").stdout) as { activate: boolean };
     expect(detection.activate).toBe(true);
     expect(statSync(DIST).size).toBeLessThan(3_000_000);
@@ -148,6 +148,26 @@ describe("compiled Keep Coding artifact", () => {
     } finally {
       await client.close().catch(() => undefined);
     }
+  });
+
+
+  it("indexes Python and C++ through verified compiled sidecar grammars", async () => {
+    const root = repository("keep-coding-dist-native-graph-");
+    writeFileSync(path.join(root, "src", "worker.py"), "def outer():\n    def inner():\n        return helper()\n    return inner()\n");
+    writeFileSync(path.join(root, "src", "worker.cpp"), "namespace demo { int helper(); int run() { return helper(); } }\n");
+    execFileSync("git", ["add", "."], { cwd: root });
+    execFileSync("git", ["commit", "-qm", "add native sources"], { cwd: root });
+    const transport = new StdioClientTransport({ command: process.execPath, args: [DIST, "mcp"], cwd: process.cwd(), stderr: "pipe" });
+    const client = new Client({ name: "keep-coding-dist-native", version: "1.0.0" });
+    try {
+      await client.connect(transport);
+      await client.callTool({ name: "initialize_project", arguments: { project_root: root, prompt: "Index Python and C++ sources with verified syntax-tree grammars." } });
+      const python = textResult(await client.callTool({ name: "expand_graph", arguments: { project_root: root, terms: ["outer", "inner"], limit: 50 } }));
+      const cpp = textResult(await client.callTool({ name: "expand_graph", arguments: { project_root: root, terms: ["demo", "run"], limit: 50 } }));
+      expect(JSON.stringify(python.nodes)).toContain("outer.inner");
+      expect(JSON.stringify(cpp.nodes)).toContain("demo::run");
+      expect(existsSync(path.resolve("plugins/keep-coding/dist/grammars/manifest.json"))).toBe(true);
+    } finally { await client.close().catch(() => undefined); }
   });
 
 });

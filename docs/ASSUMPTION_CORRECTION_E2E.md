@@ -1,7 +1,7 @@
 # Assumption ledger manual E2E evidence
 
 Run date: 2026-08-04  
-Artifact: built `plugins/keep-coding/dist/keep-coding.mjs` v0.3.0  
+Artifact: built `plugins/keep-coding/dist/keep-coding.mjs` v0.4.0  
 Result: **8/8 PASS**
 
 This walkthrough used fresh scratch Git repositories and the compiled stdio MCP/CLI, not source imports.
