@@ -61,7 +61,7 @@ var PROJECT_SIGNALS = [
 ];
 function detectLargeProject(prompt, options = {}) {
   const normalized = prompt.replace(/\s+/g, " ").trim();
-  const threshold = options.threshold ?? 5;
+  const threshold = options.threshold ?? 4;
   const signals = [];
   if (normalized.length >= 700) signals.push({ reason: "long specification", weight: 3 });
   else if (normalized.length >= 300) signals.push({ reason: "substantial specification", weight: 2 });
@@ -1268,7 +1268,11 @@ var PlatformStore = class extends ProjectStore {
     const metadata = json(file.metadata_json);
     const symbols = this.platform.db.prepare("SELECT * FROM graph_nodes WHERE path = ? AND type = 'symbol' AND active = 1 ORDER BY CAST(json_extract(metadata_json,'$.line') AS INTEGER), label").all(normalized).map((row) => {
       const item = json(row.metadata_json);
-      return { name: text(row.label), kind: String(item.kind ?? "symbol"), line: Number(item.line ?? 0) };
+      return {
+        name: text(row.label),
+        kind: typeof item.kind === "string" ? item.kind : "symbol",
+        line: typeof item.line === "number" ? item.line : 0
+      };
     });
     const imports = this.platform.db.prepare("SELECT target_id FROM graph_edges WHERE source_id = ? AND type = 'imports' ORDER BY target_id").all(`file:${normalized}`).map((row) => text(row.target_id).replace(/^file:/, ""));
     const modifier = this.platform.db.prepare("SELECT source_id FROM graph_edges WHERE target_id = ? AND type = 'modifies' ORDER BY updated_at DESC LIMIT 1").get(`file:${normalized}`);
@@ -1628,9 +1632,7 @@ var ALL_SECTIONS = [
 function compileContextEnvelope(store, options = {}) {
   const sequence = store.latestEventSequence();
   const since = options.sinceSequence;
-  if (since !== void 0 && since >= sequence) {
-    return { unchanged: true, sequence, changedSections: [], unchangedSections: ALL_SECTIONS, estimatedTokens: 0 };
-  }
+  if (since !== void 0 && since >= sequence) return { unchanged: true, sequence };
   const snapshot = store.snapshot();
   const active = snapshot.project.currentPhaseId ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) ?? null : null;
   const terms = tokenize([active?.title, active?.goal, ...active?.allowedScope ?? []].filter(Boolean).join(" "));
@@ -1823,10 +1825,9 @@ async function parseSemanticFile(content, extension) {
   return parseCStyle(content);
 }
 async function loadTypeScript() {
-  typescriptPromise ??= import("typescript").then((loaded) => {
-    const compatible = loaded;
-    return compatible.default ?? compatible;
-  });
+  if (typescriptPromise === null) {
+    typescriptPromise = import("typescript").then((loaded) => loaded.default);
+  }
   return typescriptPromise;
 }
 async function parseTypeScript(content, extension) {
@@ -4122,6 +4123,7 @@ function appendBounded(current, chunk) {
 var execAsync = promisify2(exec);
 var MAX_OUTPUT2 = 8e3;
 var ERROR_MARKER = /\b(?:error|fail(?:ed|ure)?|exception|fatal|panic|assertion)\b/iu;
+var ANSI_ESCAPE_PATTERN = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "gu");
 var PhaseVerifier = class {
   constructor(commandTimeoutMs = 12e4) {
     this.commandTimeoutMs = commandTimeoutMs;
@@ -4220,7 +4222,7 @@ function compressCommandOutput(value, previous, maxChars = MAX_OUTPUT2) {
   };
 }
 function stripCommandNoise(value) {
-  const lines = value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").replaceAll("\r\n", "\n").split("\n");
+  const lines = value.replace(ANSI_ESCAPE_PATTERN, "").replaceAll("\r\n", "\n").split("\n");
   const filtered = [];
   for (const line of lines) {
     if (/^\s*at\s+(?:node:internal|internal\/)/u.test(line)) continue;
@@ -4594,7 +4596,7 @@ var KeepCodingService = class _KeepCodingService {
     const playbook = this.relevantPlaybook();
     const context = compileContextEnvelope(this.store, { ...maxChars !== void 0 ? { maxChars } : {}, playbook });
     this.recordPluginContextUsage(context);
-    return context.context ?? "";
+    return context.unchanged ? "" : context.context;
   }
   contextEnvelope(sinceSequence, maxChars) {
     const envelope = compileContextEnvelope(this.store, {
@@ -4756,7 +4758,8 @@ var KeepCodingService = class _KeepCodingService {
     }
   }
   recordPluginContextUsage(envelope) {
-    if (envelope.unchanged || !envelope.context || envelope.estimatedTokens <= 0) return;
+    if (envelope.unchanged) return;
+    if (envelope.estimatedTokens <= 0) return;
     const project = this.store.getProject();
     if (!project) return;
     const delta = { tokens: envelope.estimatedTokens, estimatedTokens: envelope.estimatedTokens };
@@ -4814,7 +4817,8 @@ async function handleHook(event, input) {
       service.recordHostTokenUsage(extractUsageTokens(input));
       const envelope = service.contextEnvelope();
       service.store.setLastDeliveredSequence(cursorKey(runtime, session, event), envelope.sequence);
-      return contextOutput(event, `${envelope.context ?? ""}
+      const activationContext = envelope.unchanged ? "" : envelope.context;
+      return contextOutput(event, `${activationContext}
 
 Activation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.reasons.join("; ")}.`);
     });
@@ -4843,7 +4847,7 @@ Activation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.r
       ...lastDelivered !== void 0 ? { sinceSequence: lastDelivered } : {}
     }, service);
     if (event === "Stop" && !directive.continue) {
-      service.store.setLastStopProgressSequence(progressSequence);
+      service.store.setLastStopProgressSequence(service.store.latestEventSequence());
       return {
         decision: "block",
         reason: `Keep Coding project is ${project.status}. Resume from durable state:
