@@ -6,7 +6,7 @@ import type {
 import { PlatformStore } from "../storage/platform-store.js";
 import { PlaybookStore } from "../storage/playbook.js";
 import { lintAcceptanceCommands } from "./command-quality.js";
-import { compileContext, compileContextEnvelope, estimateTokens, tokenize } from "./context.js";
+import { compileContextEnvelope, tokenize } from "./context.js";
 import { GitRepository } from "./git.js";
 import { indexRepository } from "./indexer.js";
 import { ParallelOrchestrator } from "./orchestrator.js";
@@ -229,7 +229,7 @@ export class KeepCodingService {
 
   private recordCommandOutputUsage(phaseId: string | null, commands: Array<{ stdout: string; stderr: string }>): void {
     const chars = commands.reduce((sum, command) => sum + command.stdout.length + command.stderr.length, 0);
-    const tokens = estimateTokens(" ".repeat(chars));
+    const tokens = Math.ceil(chars / 4);
     if (tokens <= 0) return;
     const project = this.store.getProject();
     if (!project) return;
