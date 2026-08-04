@@ -1,4 +1,4 @@
-import type * as TypeScript from "typescript";
+import type TypeScript from "typescript";
 
 export interface ParsedSymbol {
   name: string;
