@@ -177,14 +177,16 @@ export interface ImpactNode { node: GraphNode; distance: number; via: GraphEdge[
 export interface EventRecord { sequence: number; timestamp: string; type: string; phaseId: string | null; payload: Record<string, unknown> }
 
 export type ContextSection = "header" | "contract" | "active_phase" | "approvals" | "budget" | "decisions" | "failures" | "checkpoints" | "graph" | "playbook";
-export interface ContextEnvelope {
-  unchanged: boolean;
-  sequence: number;
-  context?: string | undefined;
-  changedSections: ContextSection[];
-  unchangedSections: ContextSection[];
-  estimatedTokens: number;
-}
+export type ContextEnvelope =
+  | { unchanged: true; sequence: number }
+  | {
+      unchanged: false;
+      sequence: number;
+      context: string;
+      changedSections: ContextSection[];
+      unchangedSections: ContextSection[];
+      estimatedTokens: number;
+    };
 
 export interface CommandQualityWarning {
   phaseId: string;
