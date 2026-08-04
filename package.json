@@ -1,6 +1,6 @@
 {
   "name": "keep-coding",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Evidence-gated durable memory for long-running coding agents.",
   "type": "module",
   "private": true,
@@ -12,22 +12,28 @@
   },
   "scripts": {
     "build": "node scripts/build.mjs",
-    "check": "npm run lint && npm run typecheck && npm run test:coverage && npm run build && npm run check:bundle && npm run test:dist-smoke && npm run benchmark:context && npm run check:docs && npm run validate:plugin",
+    "check": "npm run lint && npm run typecheck && npm run test:coverage && npm run coverage:report && npm run build && npm run check:bundle && npm run test:dist-smoke && npm run benchmark:context && npm run benchmark:graph && npm run check:assets && npm run check:corpus && npm run check:distribution && npm run check:docs && npm run validate:plugin",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:dist-smoke": "vitest run --config vitest.dist.config.ts",
     "benchmark:context": "vitest run --config vitest.benchmark.config.ts",
-    "check:bundle": "git diff --exit-code -- plugins/keep-coding/dist/keep-coding.mjs",
+    "check:bundle": "git diff --exit-code -- plugins/keep-coding/dist",
     "check:docs": "node scripts/check-doc-versions.mjs",
-    "validate:plugin": "node scripts/validate-plugin.mjs"
+    "validate:plugin": "node scripts/validate-plugin.mjs",
+    "benchmark:graph": "vitest run --config vitest.graph-benchmark.config.ts",
+    "check:assets": "node scripts/check-tree-sitter-assets.mjs",
+    "coverage:report": "node scripts/report-coverage.mjs",
+    "check:corpus": "node scripts/validate-evaluation-corpus.mjs",
+    "check:distribution": "node scripts/validate-distribution.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
     "minimatch": "10.2.6",
     "typescript": "6.0.3",
-    "zod": "4.4.3"
+    "zod": "4.4.3",
+    "web-tree-sitter": "0.26.11"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

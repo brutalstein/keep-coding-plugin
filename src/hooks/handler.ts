@@ -27,7 +27,7 @@ export async function handleHook(event: string, input: HookInput): Promise<HookO
   const git = await GitRepository.open(candidate).catch(() => null);
   if (!git) return { continue: true };
   const stateExists = existsSync(path.join(git.root, ".keep-coding", "state.db"));
-  const runtime = typeof input.runtime === "string" ? input.runtime : "codex";
+  const runtime = typeof input.runtime === "string" ? input.runtime : process.env.KEEP_CODING_RUNTIME ?? "codex";
   const session = typeof input.session_id === "string" && input.session_id.trim() ? input.session_id.trim() : "default";
 
   if (event === "UserPromptSubmit" && !stateExists) {

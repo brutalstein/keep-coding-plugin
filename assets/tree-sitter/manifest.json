@@ -1,0 +1,39 @@
+{
+  "schemaVersion": 1,
+  "packages": {
+    "web-tree-sitter": "0.26.11",
+    "tree-sitter-python": "0.25.0",
+    "tree-sitter-c": "0.24.1",
+    "tree-sitter-cpp": "0.23.4"
+  },
+  "files": {
+    "queries/c.scm": {
+      "sha256": "2c2589d38776daf12754fbd277856d50f282383ade468aaf1995c2236b61d07c",
+      "bytes": 625
+    },
+    "queries/cpp.scm": {
+      "sha256": "7f5e380c9a9a29ec60e3ef64282e96d5ec751bb7b3fe584750101b77066e8f27",
+      "bytes": 713
+    },
+    "queries/python.scm": {
+      "sha256": "6aac697441c9c9df7c6045068ebf7895d755bcd98d1353485050f6d5ef168deb",
+      "bytes": 321
+    },
+    "tree-sitter-c.wasm": {
+      "sha256": "c852c2a85ebf2beb636aa3b0ef7f7e70458684d74f6741b20dcb296885bed9f9",
+      "bytes": 625918
+    },
+    "tree-sitter-cpp.wasm": {
+      "sha256": "174eb0deb75b2ec7881bcacda9f995648d8e683956e5c2267e69ab6dc503fcbf",
+      "bytes": 3434931
+    },
+    "tree-sitter-python.wasm": {
+      "sha256": "16108b50df4ee9a30168794252ab55e7c93bfc5765d7fa0aa3e335752c515f47",
+      "bytes": 457883
+    },
+    "web-tree-sitter.wasm": {
+      "sha256": "715cae35f31b7b03a13592bc5ac9039d5c6d2c2bda9f9e0c2b8abab77b3f64cc",
+      "bytes": 201037
+    }
+  }
+}

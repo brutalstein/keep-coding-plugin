@@ -1,6 +1,6 @@
 {
   "name": "keep-coding",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Evidence-gated durable memory with assumption tracking and bounded correction for long-running coding agents.",
   "author": {
     "name": "Keep Coding contributors"

@@ -120,4 +120,75 @@ describe("MCP protocol", () => {
       expect(digest.symbols).toEqual(expect.arrayContaining([expect.objectContaining({ name: "feature", kind: "function" })]));
     } finally { await connection.close(); }
   });
+
+  it("exercises resolver failures, annotations, workspace reads, budgets, approvals, and status branches", async () => {
+    const root = repository();
+    const connection = await linked({
+      resolveProjectRoot: async (candidate) => {
+        if (candidate.endsWith("blocked")) throw new Error("root blocked");
+        return candidate;
+      }
+    });
+    try {
+      const tools = await connection.client.listTools();
+      const byName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+      expect(byName.get("get_status")?.annotations).toMatchObject({ readOnlyHint: true, idempotentHint: true, destructiveHint: false });
+      expect(byName.get("apply_patch")?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false });
+
+      const blocked = await connection.client.callTool({ name: "get_status", arguments: { project_root: path.join(root, "blocked") } });
+      expect(blocked.isError).toBe(true);
+      expect(JSON.stringify(blocked.content)).toContain("root blocked");
+
+      await connection.client.callTool({ name: "initialize_project", arguments: { project_root: root, prompt: "Create a verified plan and exercise MCP boundaries." } });
+      await connection.client.callTool({
+        name: "save_plan",
+        arguments: {
+          project_root: root,
+          contract: { ...contract, budget: { maxTokens: 1000, maxCostUsd: 10, maxWallClockMs: 10000 }, playbookOptIn: false },
+          phases: [{
+            id: "feature", title: "Feature", goal: "Implement feature", dependencies: [], allowedScope: ["src/**"],
+            acceptanceCommands: ["node --check src/feature.ts"], maxAttempts: 2, requiresApproval: true, approvalPrompt: "Proceed?"
+          }]
+        }
+      });
+
+      const files = resultJson(await connection.client.callTool({ name: "list_files", arguments: { project_root: root, max_files: 10 } }));
+      expect(files.files).toEqual(expect.arrayContaining(["README.md", "src/feature.ts"]));
+      const read = resultJson(await connection.client.callTool({ name: "read_file", arguments: { project_root: root, file_path: "src/feature.ts", start_line: 1, end_line: 2 } }));
+      expect(read.content).toContain("feature");
+      const search = resultJson(await connection.client.callTool({ name: "search_code", arguments: { project_root: root, query: "feature", max_results: 10 } }));
+      expect((search.matches as unknown[]).length).toBeGreaterThan(0);
+      const diff = resultJson(await connection.client.callTool({ name: "get_diff", arguments: { project_root: root, max_chars: 2000 } }));
+      expect(diff.diff).toBe("");
+
+      await connection.client.callTool({
+        name: "record_budget_usage", arguments: {
+          project_root: root, scope: "project", scope_id: "project", tokens: 10, estimated_tokens: 3, cost_usd: 0.25, wall_clock_ms: 50
+        }
+      });
+      await connection.client.callTool({
+        name: "record_budget_usage", arguments: { project_root: root, scope: "phase", scope_id: "feature" }
+      });
+      const approval = resultJson(await connection.client.callTool({
+        name: "request_approval", arguments: { project_root: root, phase_id: "feature", prompt: "Proceed with feature?" }
+      }));
+      expect(approval.status).toBe("pending");
+      const resolved = resultJson(await connection.client.callTool({
+        name: "resolve_approval", arguments: { project_root: root, approval_id: approval.id, approved: true }
+      }));
+      expect(resolved.status).toBe("approved");
+
+      const suggested = resultJson(await connection.client.callTool({ name: "suggest_phases", arguments: { project_root: root, query: "feature" } }));
+      expect(suggested.enabled).toBe(false);
+      const status = resultJson(await connection.client.callTool({ name: "get_status", arguments: { project_root: root } }));
+      expect(status.project).toBeDefined();
+
+      const invalidExpand = await connection.client.callTool({ name: "expand_graph", arguments: { project_root: root, terms: [], node_ids: [] } });
+      expect(invalidExpand.isError).toBe(true);
+      const unknownCheckpoint = await connection.client.callTool({ name: "checkpoint_phase", arguments: { project_root: root, phase_id: "missing", summary: "none" } });
+      expect(unknownCheckpoint.isError).toBe(true);
+      expect(JSON.stringify(unknownCheckpoint.content)).toContain("unknown phase");
+    } finally { await connection.close(); }
+  });
+
 });

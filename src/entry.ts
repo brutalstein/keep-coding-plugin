@@ -5,10 +5,11 @@ import { KeepCodingService } from "./core/service.js";
 import { indexRepository } from "./core/indexer.js";
 import { detectLargeProject } from "./core/detector.js";
 import { runEvaluation } from "./eval/runner.js";
+import { runEvaluationCorpus } from "./eval/corpus.js";
 import { startDashboard } from "./dashboard/server.js";
 import { generatePullRequestDescription } from "./integrations/github.js";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const [command = "help", argument] = process.argv.slice(2);
 
 try {
@@ -23,16 +24,18 @@ try {
     case "init": await withService(argument ?? process.cwd(), async (service) => service.initialize(await readStdin())); break;
     case "status": await withService(argument ?? process.cwd(), async (service) => service.store.snapshot()); break;
     case "context": await withService(argument ?? process.cwd(), async (service) => service.contextEnvelope()); break;
+    case "poll": await withService(argument ?? process.cwd(), async (service) => service.contextEnvelope(parseSequence(process.argv[4]))); break;
     case "index": await withService(argument ?? process.cwd(), async (service) => indexRepository(service.store, service.git)); break;
     case "impact": await withService(argument ?? process.cwd(), async (service) => service.impact(process.argv[4] ?? "")); break;
     case "detect": print(detectLargeProject(await readStdin(), { force: argument === "--force" })); break;
     case "pr-description": await withService(argument ?? process.cwd(), async (service) => ({ markdown: generatePullRequestDescription(service.store.snapshot()) })); break;
     case "dashboard": await dashboard(argument ?? process.cwd()); break;
     case "eval": print(await runEvaluation(argument ?? "keep-coding.eval.json")); break;
+    case "eval-corpus": print(await runEvaluationCorpus(argument ?? "keep-coding.corpus.eval.json")); break;
     case "--version":
     case "version": process.stdout.write(`${VERSION}\n`); break;
     default:
-      process.stdout.write(`Keep Coding v${VERSION}\nUsage: keep-coding <mcp|mcp-http|hook|init|status|context|index|impact|detect|dashboard|pr-description|eval|version> [path]\n`);
+      process.stdout.write(`Keep Coding v${VERSION}\nUsage: keep-coding <mcp|mcp-http|hook|init|status|context|poll|index|impact|detect|dashboard|pr-description|eval|eval-corpus|version> [path]\n`);
   }
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
@@ -66,3 +69,9 @@ async function readStdin(): Promise<string> {
   return value;
 }
 function print(value: unknown): void { process.stdout.write(`${JSON.stringify(value, null, 2)}\n`); }
+function parseSequence(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error("sequence must be a non-negative safe integer");
+  return parsed;
+}

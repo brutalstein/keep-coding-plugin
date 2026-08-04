@@ -10,7 +10,7 @@ Keep Coding is a single-workflow, local-first continuity platform with an option
 | MCP/CLI | Validate explicit project roots and expose lifecycle, delta context, digest, graph, and workspace operations. |
 | Service | Coordinate state, Git, graph indexing, verification, telemetry, playbook, and orchestration. |
 | Store | Migration-safe SQLite source of truth for plan versions, phases, evidence, approvals, budgets, graph, worktrees, command failures, cursors, and events. |
-| Semantic graph | Lazy TypeScript compiler AST plus bounded language adapters for symbols, imports, calls, references, tests, and blast radius. |
+| Semantic graph | TypeScript compiler AST plus hash-verified WASM tree-sitter adapters for Python, C, and C++; emits symbols, imports, calls, references, tests, symbol equivalence, and blast radius. |
 | Verifier | Scope → secret scan → budget → selective tests → acceptance commands → optional critic, with compressed command evidence. |
 | Orchestrator | Isolated worktrees and merge-after-evidence for independent parallel-safe phases. |
 | Dashboard | Loopback-only read-only HTML and JSON projection of durable state. |
@@ -40,7 +40,7 @@ A passing checkpoint stages only the phase change set and creates a phase-scoped
 
 ## Semantic impact and lazy expansion
 
-TypeScript/JavaScript files use the TypeScript compiler AST, loaded lazily only when those files are indexed. Python and C-style languages use bounded structural adapters. The graph emits file, test, and symbol nodes plus `contains`, `imports`, `calls`, `references`, and `tested_by` edges.
+TypeScript/JavaScript files use the TypeScript compiler AST, loaded lazily only when those files are indexed. Python, C, and C++ use pinned `web-tree-sitter` WASM grammars and language-specific query assets. Every sidecar is verified against a SHA-256/byte-count manifest before the first parse in an asset directory. Parsing and query execution are time-bounded and capped; failure is explicit and degrades to the retained legacy structural parser. The graph emits file, test, and symbol nodes plus `contains`, `imports`, `calls`, `references`, `tested_by`, and header/source `same_symbol` edges.
 
 Default context contains only a fixed-size Tier-0 graph summary. `expand_graph` returns Tier-1 node detail on explicit demand. `get_file_digest` projects an indexed file's content hash, line count, symbols, imports, and last modifying phase without sending the complete source file. `get_impact` returns distance and edge provenance. Changed files determine impacted tests, and completed phases move to `REVERIFY_REQUIRED` when later work touches their verified ownership.
 
@@ -72,7 +72,7 @@ The Streamable HTTP adapter retains canonical allowed-root checks, Host and requ
 
 ## Packaging
 
-`scripts/build.mjs` creates one ESM executable while marking `typescript` external. The parser module has no top-level runtime dependency on the compiler; it performs a cached dynamic import only for TypeScript/JavaScript indexing. The production pipeline builds first, then executes the compiled artifact through version, hook, and full stdio MCP smoke tests. Plugin validation also runs the built CLI, so a module-evaluation crash cannot pass `npm run check`.
+`scripts/build.mjs` creates one ESM executable while marking `typescript` external, then copies the tree-sitter runtime, grammars, queries, and integrity manifest into `dist/grammars`. The parser performs cached lazy initialization. The production pipeline verifies the complete distribution directory, executes version/hook/MCP/assumption/native-parser scenarios, and refuses stale generated files. The executable remains under the 3 MB guard; parser sidecars have a separate 8 MB budget.
 
 ## Assumption ledger and bounded correction
 
@@ -87,3 +87,20 @@ Contained corrections may be promoted, only with playbook opt-in, into structure
 ## Assumption evaluation boundary
 
 The evaluation configuration accepts `assumptionLedger.enabled`. When enabled, reports may include correction outcomes and token counters, anti-pattern warning/matching counts, and paired enabled/disabled outcomes. The resulting section reports containment rate with an existing Wilson 95% interval, project-scoped tokens per completed correction, anti-pattern hit rate, and an exact McNemar comparison. When disabled, the runner does not emit a subsystem section or create project ledger persistence.
+
+
+## Storage decomposition
+
+`ProjectStore` remains the compatibility facade used by the service and `PlatformStore`, but infrastructure concerns no longer live in one file. `migrations.ts` owns additive schema creation, `validation.ts` owns contract/phase/budget invariants, and `row-mappers.ts` owns scalar coercion and durable-record mapping. Existing project databases and public store methods are unchanged. This split keeps migration review, validation review, and persistence-shape review independent without introducing an abstraction layer over SQLite transactions.
+
+## Cross-agent distribution
+
+The canonical implementation is the same `dist/keep-coding.mjs` MCP backend for every host. A single Agent Skills source is byte-compared with the Codex and Claude package copies. Codex and Claude add only host-specific manifests and lifecycle hook commands. Hosts with MCP but no lifecycle hooks call the sequence-aware `poll` command. Distribution validation checks version parity, manifest shape, MCP arguments, hook runtime identity, and canonical skill hashes.
+
+## Evaluation corpus
+
+The corpus runner accepts exactly 20-30 frozen tasks, materializes each seed as a fresh Git repository, creates detached paired worktrees, counterbalances treatment order, and invokes agent/verifier commands as argv arrays without shell interpolation. Verifier contracts remain outside the mutable worktree. Every record includes the starting SHA and prompt hash. Reports use Wilson 95% intervals and the existing exact McNemar implementation. Missing provider executables or credentials are treated as an absent experiment, never as synthetic success data.
+
+## Tier-2 semantic enrichment boundary
+
+Pyright and clangd remain deferred. Tree-sitter establishes correct local syntax and lexical scope without requiring a project build configuration. Cross-module type binding, macro expansion, conditional preprocessing, template instantiation, and overload resolution require compiler/LSP processes. Those subprocesses will only be introduced as explicit opt-ins after the frozen corpus produces real Python/C++ evidence and after their timeout, binary-discovery, cache, and security boundaries are specified.

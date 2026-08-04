@@ -34,6 +34,7 @@ export function amendPlan(host: PlanHost, amendment: PlanAmendment): void {
   const version = project.planVersion + 1;
   const replacement = amendment.addPhases[0]?.id ?? null;
   const nextContract = mergeContract(contract, amendment.contractPatch ?? {});
+  validateBudgetLimits(nextContract.budget, "contract budget");
   const startOrdinal = host.phases().reduce((maximum, phase) => Math.max(maximum, phase.ordinal + 1), 0);
 
   for (const id of amendment.supersedePhaseIds) {
@@ -108,6 +109,7 @@ function validateDefinitions(phases: PhaseDefinition[], existing: Map<string, Ph
   for (const phase of phases) {
     if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(phase.id)) throw new Error(`invalid phase id: ${phase.id}`);
     if (ids.has(phase.id) || existing.has(phase.id)) throw new Error(`duplicate phase id: ${phase.id}`);
+    validateBudgetLimits(phase.budget, `phase ${phase.id} budget`);
     if (!phase.allowedScope.length || !phase.acceptanceCommands.length) throw new Error(`phase ${phase.id} requires scope and commands`);
     if (phase.acceptanceCommands.some((command) => /^(true|echo\b|exit\s+0)$/i.test(command.trim()))) throw new Error(`phase ${phase.id} contains a no-op command`);
     ids.add(phase.id);
@@ -127,6 +129,13 @@ function validateDefinitions(phases: PhaseDefinition[], existing: Map<string, Ph
     visited.add(id);
   };
   for (const phase of phases) visit(phase.id);
+}
+
+function validateBudgetLimits(budget: PhaseDefinition["budget"] | undefined, label: string): void {
+  if (!budget) return;
+  for (const [name, value] of Object.entries(budget)) {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) throw new Error(`${label} ${name} must be positive`);
+  }
 }
 
 function mergeContract(contract: ProjectContract, patch: ProjectContractPatch): ProjectContract {

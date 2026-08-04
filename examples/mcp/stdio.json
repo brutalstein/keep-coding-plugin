@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "keep_coding": {
+      "command": "node",
+      "args": ["/absolute/path/to/keep-coding-plugin/plugins/keep-coding/dist/keep-coding.mjs", "mcp"]
+    }
+  }
+}
