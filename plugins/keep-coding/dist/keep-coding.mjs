@@ -14,7 +14,7 @@ var CodexContinuityAdapter = class {
   id = "codex";
   async translate(event, service) {
     if (!service) return { continue: true };
-    if (["SessionStart", "PostCompact", "UserPromptSubmit"].includes(event.name)) return { continue: true, context: service.context() };
+    if (["SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact"].includes(event.name)) return contextDirective(service, event.sinceSequence);
     if (event.name === "Stop") {
       const project = service.store.getProject();
       if (!project || ["COMPLETED", "BLOCKED", "BLOCKED_BUDGET"].includes(project.status)) return { continue: true };
@@ -27,7 +27,7 @@ var ClaudeHooksAdapter = class {
   id = "claude-hooks";
   async translate(event, service) {
     if (!service) return { continue: true };
-    if (["SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact"].includes(event.name)) return { continue: true, context: service.context() };
+    if (["SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact"].includes(event.name)) return contextDirective(service, event.sinceSequence);
     if (event.name === "Stop") {
       const project = service.store.getProject();
       return project && !["COMPLETED", "BLOCKED", "BLOCKED_BUDGET"].includes(project.status) ? { continue: false, blockReason: service.context(7e3) } : { continue: true };
@@ -37,8 +37,8 @@ var ClaudeHooksAdapter = class {
 };
 var PollingCliAdapter = class {
   id = "polling-cli";
-  async translate(_event, service) {
-    return service ? { continue: true, context: service.context() } : { continue: true };
+  async translate(event, service) {
+    return service ? contextDirective(service, event.sinceSequence) : { continue: true };
   }
 };
 function adapterById(id) {
@@ -46,14 +46,18 @@ function adapterById(id) {
   if (id === "poll" || id === "polling-cli") return new PollingCliAdapter();
   return new CodexContinuityAdapter();
 }
+function contextDirective(service, sinceSequence) {
+  const envelope = service.contextEnvelope(sinceSequence);
+  return envelope.unchanged || !envelope.context ? { continue: true, sequence: envelope.sequence } : { continue: true, context: envelope.context, sequence: envelope.sequence };
+}
 
 // src/core/detector.ts
 var PROJECT_SIGNALS = [
   { pattern: /\b(end[- ]to[- ]end|uçtan uca|full|complete|entire|whole|tüm|bütün)\b/iu, weight: 2, reason: "end-to-end scope" },
   { pattern: /\b(architecture|mimari|migration|refactor|production[- ]ready|github[- ]ready)\b/iu, weight: 2, reason: "architecture or production scope" },
-  { pattern: /\b(test|tests|testler|ci|deploy|integration|entegrasyon|documentation|dokümantasyon)\b/iu, weight: 1, reason: "delivery disciplines" },
+  { pattern: /\b(test|tests|testler|ci|deploy|deployment|integration|entegrasyon|documentation|dokümantasyon)\b/iu, weight: 1, reason: "delivery disciplines" },
   { pattern: /\b(phase|phases|faz|fazlar|multi[- ]agent|parallel|paralel)\b/iu, weight: 2, reason: "multi-phase execution" },
-  { pattern: /\b(build|create|implement|develop|kur|oluştur|geliştir|yap|ekle|tasarla)\b/iu, weight: 1, reason: "implementation action" }
+  { pattern: /\b(build|create|implement|develop|rewrite|kur|oluştur|geliştir|yap|ekle|tasarla)\b/iu, weight: 1, reason: "implementation action" }
 ];
 function detectLargeProject(prompt, options = {}) {
   const normalized = prompt.replace(/\s+/g, " ").trim();
@@ -74,12 +78,16 @@ function detectLargeProject(prompt, options = {}) {
   return {
     activate: manualOverride || score >= threshold,
     score,
-    confidence: manualOverride ? 1 : Math.min(0.99, score / (threshold + 3)),
+    confidence: manualOverride ? 1 : heuristicStrength(score, threshold),
     threshold,
     signals,
     reasons: signals.map((signal) => `${signal.reason} (+${signal.weight})`),
     manualOverride
   };
+}
+function heuristicStrength(score, threshold) {
+  if (score >= threshold) return Math.min(0.99, 0.55 + (score - threshold) * 0.07);
+  return Math.max(0, Math.min(0.49, score / Math.max(1, threshold) * 0.49));
 }
 
 // src/core/git.ts
@@ -204,6 +212,12 @@ var GitRepository = class _GitRepository {
 function splitNull(value) {
   return Buffer.isBuffer(value) ? value.toString("utf8").split("\0").filter(Boolean) : value.split("\0").filter(Boolean);
 }
+
+// src/core/service.ts
+import { createHash as createHash7 } from "node:crypto";
+
+// src/storage/platform-store.ts
+import { createHash as createHash3 } from "node:crypto";
 
 // src/storage/store.ts
 import { randomUUID, createHash as createHash2 } from "node:crypto";
@@ -749,8 +763,8 @@ var PlatformDb = class {
       );
       CREATE TABLE IF NOT EXISTS budget_usage (
         scope TEXT NOT NULL, scope_id TEXT NOT NULL, tokens INTEGER NOT NULL DEFAULT 0,
-        cost_usd REAL NOT NULL DEFAULT 0, wall_clock_ms INTEGER NOT NULL DEFAULT 0,
-        updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id)
+        estimated_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
+        wall_clock_ms INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id)
       );
       CREATE TABLE IF NOT EXISTS critic_reviews (
         id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -759,7 +773,14 @@ var PlatformDb = class {
         phase_id TEXT PRIMARY KEY, path TEXT NOT NULL, branch TEXT NOT NULL, status TEXT NOT NULL,
         base_sha TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS command_failures (
+        phase_id TEXT NOT NULL, command TEXT NOT NULL, attempt INTEGER NOT NULL,
+        stdout TEXT NOT NULL, stderr TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY (phase_id, command, attempt)
+      );
+      CREATE INDEX IF NOT EXISTS idx_command_failures_latest ON command_failures(phase_id, command, attempt DESC);
     `);
+    addColumn(this.db, "budget_usage", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
     const additions = {
       revision: "INTEGER NOT NULL DEFAULT 1",
       superseded_by: "TEXT",
@@ -769,14 +790,16 @@ var PlatformDb = class {
       budget_json: "TEXT NOT NULL DEFAULT '{}'",
       critic_blocking: "INTEGER NOT NULL DEFAULT 0",
       parallel_safe: "INTEGER NOT NULL DEFAULT 0",
-      reverify_reason: "TEXT"
+      reverify_reason: "TEXT",
+      verification_kind: "TEXT NOT NULL DEFAULT 'code'"
     };
-    for (const [name, definition] of Object.entries(additions)) {
-      const columns = this.db.prepare("PRAGMA table_info(phases)").all();
-      if (!columns.some((row) => text(row.name) === name)) this.db.exec(`ALTER TABLE phases ADD COLUMN ${name} ${definition}`);
-    }
+    for (const [name, definition] of Object.entries(additions)) addColumn(this.db, "phases", name, definition);
   }
 };
+function addColumn(db, table, name, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((row) => text(row.name) === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+}
 function approvalFromRow(row) {
   return {
     id: text(row.id),
@@ -789,7 +812,13 @@ function approvalFromRow(row) {
   };
 }
 function usageFromRow(row) {
-  return { tokens: Number(row.tokens), costUsd: Number(row.cost_usd), wallClockMs: Number(row.wall_clock_ms), updatedAt: text(row.updated_at) };
+  return {
+    tokens: Number(row.tokens),
+    estimatedTokens: Number(row.estimated_tokens ?? 0),
+    costUsd: Number(row.cost_usd),
+    wallClockMs: Number(row.wall_clock_ms),
+    updatedAt: text(row.updated_at)
+  };
 }
 function worktreeFromRow(row) {
   return {
@@ -915,8 +944,8 @@ function amendPlan(host, amendment) {
     INSERT INTO phases (id, ordinal, title, goal, status, dependencies_json, allowed_scope_json,
       acceptance_commands_json, max_attempts, attempts, started_at, completed_at, base_sha, head_sha,
       summary, revision, superseded_by, requires_approval, approval_prompt, approved_at, budget_json,
-      critic_blocking, parallel_safe, reverify_reason)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, NULL, ?, ?, ?, NULL)
+      critic_blocking, parallel_safe, reverify_reason, verification_kind)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL, NULL, NULL, ?, NULL, ?, ?, NULL, ?, ?, ?, NULL, ?)
   `);
   amendment.addPhases.forEach((phase, index) => {
     const ready = phase.dependencies.every((dependency) => dependencySatisfied(host.db, dependency));
@@ -935,7 +964,8 @@ function amendPlan(host, amendment) {
       phase.approvalPrompt ?? null,
       JSON.stringify(phase.budget ?? {}),
       phase.criticBlocking ? 1 : 0,
-      phase.parallelSafe ? 1 : 0
+      phase.parallelSafe ? 1 : 0,
+      phase.verificationKind ?? "code"
     );
     host.graphNode({ id: `phase:${phase.id}`, type: "phase", label: phase.title, path: null, symbol: null, contentHash: null, metadata: { revision: version2, goal: phase.goal } });
     for (const dependency of phase.dependencies) host.graphEdge({ sourceId: `phase:${phase.id}`, targetId: `phase:${dependency}`, type: "depends_on", metadata: { version: version2 } });
@@ -960,7 +990,16 @@ function listPlanRevisions(db) {
   }));
 }
 function writePhaseOptions(db, phase, revision) {
-  db.prepare("UPDATE phases SET revision = ?, requires_approval = ?, approval_prompt = ?, budget_json = ?, critic_blocking = ?, parallel_safe = ? WHERE id = ?").run(revision, phase.requiresApproval ? 1 : 0, phase.approvalPrompt ?? null, JSON.stringify(phase.budget ?? {}), phase.criticBlocking ? 1 : 0, phase.parallelSafe ? 1 : 0, phase.id);
+  db.prepare("UPDATE phases SET revision = ?, requires_approval = ?, approval_prompt = ?, budget_json = ?, critic_blocking = ?, parallel_safe = ?, verification_kind = ? WHERE id = ?").run(
+    revision,
+    phase.requiresApproval ? 1 : 0,
+    phase.approvalPrompt ?? null,
+    JSON.stringify(phase.budget ?? {}),
+    phase.criticBlocking ? 1 : 0,
+    phase.parallelSafe ? 1 : 0,
+    phase.verificationKind ?? "code",
+    phase.id
+  );
 }
 function redirectDependencies(db, superseded, replacement) {
   const rows = db.prepare("SELECT id, dependencies_json FROM phases WHERE status != 'SUPERSEDED'").all();
@@ -1036,12 +1075,21 @@ function listApprovals(db) {
 }
 function recordBudgetUsage(db, scope, scopeId, delta) {
   for (const value of Object.values(delta)) if (value !== void 0 && (!Number.isFinite(value) || value < 0)) throw new Error("budget deltas must be non-negative");
-  db.prepare(`INSERT INTO budget_usage VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(scope, scope_id) DO UPDATE SET tokens = tokens + excluded.tokens, cost_usd = cost_usd + excluded.cost_usd, wall_clock_ms = wall_clock_ms + excluded.wall_clock_ms, updated_at = excluded.updated_at`).run(scope, scopeId, delta.tokens ?? 0, delta.costUsd ?? 0, delta.wallClockMs ?? 0, now());
+  db.prepare(`
+    INSERT INTO budget_usage (scope, scope_id, tokens, estimated_tokens, cost_usd, wall_clock_ms, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(scope, scope_id) DO UPDATE SET
+      tokens = tokens + excluded.tokens,
+      estimated_tokens = estimated_tokens + excluded.estimated_tokens,
+      cost_usd = cost_usd + excluded.cost_usd,
+      wall_clock_ms = wall_clock_ms + excluded.wall_clock_ms,
+      updated_at = excluded.updated_at
+  `).run(scope, scopeId, delta.tokens ?? 0, delta.estimatedTokens ?? 0, delta.costUsd ?? 0, delta.wallClockMs ?? 0, now());
   return getBudgetUsage(db, scope, scopeId);
 }
 function getBudgetUsage(db, scope, scopeId) {
   const row = db.prepare("SELECT * FROM budget_usage WHERE scope = ? AND scope_id = ?").get(scope, scopeId);
-  return row ? usageFromRow(row) : { tokens: 0, costUsd: 0, wallClockMs: 0, updatedAt: "" };
+  return row ? usageFromRow(row) : { tokens: 0, estimatedTokens: 0, costUsd: 0, wallClockMs: 0, updatedAt: "" };
 }
 function budgetEvidence(host, phaseId) {
   const project = must2(host.project(), "project missing");
@@ -1051,6 +1099,7 @@ function budgetEvidence(host, phaseId) {
   const phaseUsage = getBudgetUsage(host.db, "phase", phaseId);
   const usage = {
     tokens: Math.max(projectUsage.tokens, phaseUsage.tokens),
+    estimatedTokens: Math.max(projectUsage.estimatedTokens ?? 0, phaseUsage.estimatedTokens ?? 0),
     costUsd: Math.max(projectUsage.costUsd, phaseUsage.costUsd),
     wallClockMs: Math.max(projectUsage.wallClockMs, phaseUsage.wallClockMs),
     updatedAt: now()
@@ -1161,6 +1210,9 @@ var PlatformStore = class extends ProjectStore {
     this.appendEvent("project_completed", null, { phaseCount: phases.filter((phase) => phase.status === "COMPLETED").length });
     return required(this.getProject(), "project completion failed");
   }
+  recordFailure(phaseId, summary, fingerprint) {
+    return super.recordFailure(phaseId, summary, fingerprint?.trim() || failureSignature(summary));
+  }
   requestApproval(phaseId, prompt) {
     return requestApproval(this.runtimeHost(), phaseId, prompt);
   }
@@ -1173,8 +1225,10 @@ var PlatformStore = class extends ProjectStore {
   listPlanRevisions() {
     return listPlanRevisions(this.platform.db);
   }
-  recordBudgetUsage(scope, scopeId, delta) {
-    return recordBudgetUsage(this.platform.db, scope, scopeId, delta);
+  recordBudgetUsage(scope, scopeId, delta, eventType = "budget_usage_recorded") {
+    const usage = recordBudgetUsage(this.platform.db, scope, scopeId, delta);
+    this.appendEvent(eventType, scope === "phase" ? scopeId : null, { scope, scopeId, delta });
+    return usage;
   }
   budgetEvidence(phaseId) {
     return budgetEvidence(this.runtimeHost(), phaseId);
@@ -1190,6 +1244,49 @@ var PlatformStore = class extends ProjectStore {
   }
   listWorktrees() {
     return listWorktrees(this.platform.db);
+  }
+  eventsSince(sequence) {
+    return this.platform.db.prepare("SELECT * FROM events WHERE sequence > ? ORDER BY sequence").all(sequence).map((row) => ({
+      sequence: Number(row.sequence),
+      timestamp: text(row.timestamp),
+      type: text(row.type),
+      phaseId: nullable2(row.phase_id),
+      payload: json(row.payload_json)
+    }));
+  }
+  getLastDeliveredSequence(cursor) {
+    const row = this.platform.db.prepare("SELECT value FROM metadata WHERE key = ?").get(`context_cursor:${cursor}`);
+    return row ? Number(row.value) : 0;
+  }
+  setLastDeliveredSequence(cursor, sequence) {
+    this.platform.db.prepare(`INSERT INTO metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(`context_cursor:${cursor}`, String(sequence));
+  }
+  fileDigest(filePath) {
+    const normalized = filePath.replaceAll("\\", "/").replace(/^\.\//, "");
+    const file = this.platform.db.prepare("SELECT * FROM graph_nodes WHERE id = ? AND active = 1").get(`file:${normalized}`);
+    if (!file) return null;
+    const metadata = json(file.metadata_json);
+    const symbols = this.platform.db.prepare("SELECT * FROM graph_nodes WHERE path = ? AND type = 'symbol' AND active = 1 ORDER BY CAST(json_extract(metadata_json,'$.line') AS INTEGER), label").all(normalized).map((row) => {
+      const item = json(row.metadata_json);
+      return { name: text(row.label), kind: String(item.kind ?? "symbol"), line: Number(item.line ?? 0) };
+    });
+    const imports = this.platform.db.prepare("SELECT target_id FROM graph_edges WHERE source_id = ? AND type = 'imports' ORDER BY target_id").all(`file:${normalized}`).map((row) => text(row.target_id).replace(/^file:/, ""));
+    const modifier = this.platform.db.prepare("SELECT source_id FROM graph_edges WHERE target_id = ? AND type = 'modifies' ORDER BY updated_at DESC LIMIT 1").get(`file:${normalized}`);
+    return {
+      path: normalized,
+      contentHash: nullable2(file.content_hash),
+      lineCount: Number(metadata.lineCount ?? 0),
+      symbols,
+      imports,
+      lastModifiedByPhase: modifier ? text(modifier.source_id).replace(/^phase:/, "") : null
+    };
+  }
+  latestCommandFailure(phaseId, command2) {
+    const row = this.platform.db.prepare("SELECT * FROM command_failures WHERE phase_id=? AND command=? ORDER BY attempt DESC LIMIT 1").get(phaseId, command2);
+    return row ? commandFailureFromRow(row) : null;
+  }
+  recordCommandFailure(record2) {
+    this.platform.db.prepare(`INSERT OR REPLACE INTO command_failures(phase_id,command,attempt,stdout,stderr,fingerprint,created_at) VALUES(?,?,?,?,?,?,?)`).run(record2.phaseId, record2.command, record2.attempt, record2.stdout, record2.stderr, record2.fingerprint, record2.createdAt);
   }
   markReverification(ids, reason, sourcePhaseId) {
     const marked = [];
@@ -1234,7 +1331,7 @@ var PlatformStore = class extends ProjectStore {
     this.platform.db.prepare("UPDATE project SET status=?,current_phase_id=?,updated_at=?").run(allDone ? "READY_TO_COMPLETE" : "ACTIVE", next?.id ?? null, now());
   }
   augment(phase) {
-    const row = this.platform.db.prepare(`SELECT revision,superseded_by,requires_approval,approval_prompt,approved_at,budget_json,critic_blocking,parallel_safe,reverify_reason FROM phases WHERE id=?`).get(phase.id);
+    const row = this.platform.db.prepare(`SELECT revision,superseded_by,requires_approval,approval_prompt,approved_at,budget_json,critic_blocking,parallel_safe,reverify_reason,verification_kind FROM phases WHERE id=?`).get(phase.id);
     if (!row) return phase;
     const budget = row.budget_json ? json(row.budget_json) : {};
     return {
@@ -1246,6 +1343,7 @@ var PlatformStore = class extends ProjectStore {
       requiresApproval: Boolean(row.requires_approval),
       criticBlocking: Boolean(row.critic_blocking),
       parallelSafe: Boolean(row.parallel_safe),
+      verificationKind: text(row.verification_kind),
       ...row.approval_prompt ? { approvalPrompt: text(row.approval_prompt) } : {},
       ...Object.keys(budget).length > 0 ? { budget } : {}
     };
@@ -1274,13 +1372,28 @@ var PlatformStore = class extends ProjectStore {
     this.platform.db.prepare(`INSERT INTO graph_edges(source_id,target_id,type,metadata_json,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(source_id,target_id,type) DO UPDATE SET metadata_json=excluded.metadata_json,updated_at=excluded.updated_at`).run(edge.sourceId, edge.targetId, edge.type, JSON.stringify(edge.metadata), now());
   }
 };
+function commandFailureFromRow(row) {
+  return {
+    phaseId: text(row.phase_id),
+    command: text(row.command),
+    attempt: Number(row.attempt),
+    stdout: text(row.stdout),
+    stderr: text(row.stderr),
+    fingerprint: text(row.fingerprint),
+    createdAt: text(row.created_at)
+  };
+}
+function failureSignature(value) {
+  const normalized = value.toLowerCase().replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/giu, "<timestamp>").replace(/(?:[a-z]:\\|\/)(?:[^\s:]+[\\/])+[^\s:]+/giu, "<path>").replace(/:\d+(?::\d+)?\b/gu, ":<line>").replace(/0x[0-9a-f]+/giu, "<hex>").replace(/\b\d+\b/gu, "<n>").replace(/\s+/gu, " ").trim();
+  return createHash3("sha256").update(normalized).digest("hex").slice(0, 24);
+}
 function required(value, message) {
   if (value === null || value === void 0) throw new Error(message);
   return value;
 }
 
 // src/storage/playbook.ts
-import { randomUUID as randomUUID3 } from "node:crypto";
+import { createHash as createHash4 } from "node:crypto";
 import { homedir } from "node:os";
 import { mkdirSync as mkdirSync2 } from "node:fs";
 import path3 from "node:path";
@@ -1296,27 +1409,54 @@ var PlaybookStore = class {
         id TEXT PRIMARY KEY, title TEXT NOT NULL, keywords_json TEXT NOT NULL, phase_json TEXT NOT NULL,
         source_project TEXT NOT NULL, success_count INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS playbook_patterns (
+        id TEXT PRIMARY KEY, signature TEXT NOT NULL UNIQUE, pattern TEXT NOT NULL,
+        trigger_conditions_json TEXT NOT NULL, resolution_json TEXT NOT NULL,
+        applicability_scope_json TEXT NOT NULL, source_projects_json TEXT NOT NULL,
+        success_count INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS failure_patterns (
         fingerprint TEXT PRIMARY KEY, summary TEXT NOT NULL, resolution TEXT, occurrences INTEGER NOT NULL,
         source_project TEXT NOT NULL, updated_at TEXT NOT NULL
       );
     `);
+    this.migrateLegacyTemplates();
   }
   close() {
     this.db.close();
   }
   rememberPhase(sourceProject, phase, keywords) {
-    const normalizedKeywords = normalizeKeywords([phase.title, phase.goal, ...keywords].join(" "));
-    const row = this.db.prepare("SELECT * FROM phase_templates WHERE source_project = ? AND title = ?").get(sourceProject, phase.title);
+    const tuple = compactPhase(phase, keywords);
+    const signature = patternSignature(tuple.pattern, tuple.triggerConditions, tuple.resolution, tuple.applicabilityScope);
+    const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature);
     const now2 = (/* @__PURE__ */ new Date()).toISOString();
-    const id = row ? String(row.id) : randomUUID3();
+    const id = existing ? String(existing.id) : signature;
+    const sources = existing ? [.../* @__PURE__ */ new Set([...jsonArray(existing.source_projects_json), sourceProject])] : [sourceProject];
     this.db.prepare(`
-      INSERT INTO phase_templates (id, title, keywords_json, phase_json, source_project, success_count, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET keywords_json = excluded.keywords_json, phase_json = excluded.phase_json,
-        success_count = phase_templates.success_count + 1, updated_at = excluded.updated_at
-    `).run(id, phase.title, JSON.stringify(normalizedKeywords), JSON.stringify(phase), sourceProject, now2, now2);
-    return mustSuggestion(this.db.prepare("SELECT * FROM phase_templates WHERE id = ?").get(id), 1);
+      INSERT INTO playbook_patterns (
+        id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
+        source_projects_json, success_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(signature) DO UPDATE SET
+        pattern = excluded.pattern,
+        trigger_conditions_json = excluded.trigger_conditions_json,
+        resolution_json = excluded.resolution_json,
+        applicability_scope_json = excluded.applicability_scope_json,
+        source_projects_json = excluded.source_projects_json,
+        success_count = playbook_patterns.success_count + 1,
+        updated_at = excluded.updated_at
+    `).run(
+      id,
+      signature,
+      tuple.pattern,
+      JSON.stringify(tuple.triggerConditions),
+      JSON.stringify(tuple.resolution),
+      JSON.stringify(tuple.applicabilityScope),
+      JSON.stringify(sources),
+      now2,
+      now2
+    );
+    return patternFromRow(required2(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature)), 1);
   }
   rememberFailure(sourceProject, failure) {
     this.db.prepare(`
@@ -1325,55 +1465,227 @@ var PlaybookStore = class {
       ON CONFLICT(fingerprint) DO UPDATE SET summary = excluded.summary,
         resolution = COALESCE(excluded.resolution, failure_patterns.resolution),
         occurrences = failure_patterns.occurrences + excluded.occurrences,
+        source_project = CASE
+          WHEN instr(failure_patterns.source_project, excluded.source_project) > 0 THEN failure_patterns.source_project
+          ELSE failure_patterns.source_project || ',' || excluded.source_project
+        END,
         updated_at = excluded.updated_at
     `).run(failure.fingerprint, failure.summary, failure.resolution, failure.count, sourceProject, (/* @__PURE__ */ new Date()).toISOString());
   }
   suggest(query, limit = 8) {
     const terms = normalizeKeywords(query);
-    const rows = this.db.prepare("SELECT * FROM phase_templates ORDER BY success_count DESC, updated_at DESC LIMIT 200").all();
+    const rows = this.db.prepare("SELECT * FROM playbook_patterns ORDER BY success_count DESC, updated_at DESC LIMIT 300").all();
     return rows.map((row) => {
-      const keywords = JSON.parse(String(row.keywords_json));
-      const overlap = terms.filter((term) => keywords.includes(term)).length;
+      const triggers = jsonArray(row.trigger_conditions_json);
+      const patternTerms = normalizeKeywords(String(row.pattern));
+      const searchable = /* @__PURE__ */ new Set([...triggers, ...patternTerms]);
+      const overlap = terms.filter((term) => searchable.has(term)).length;
       const score = terms.length === 0 ? 0 : overlap / terms.length + Math.min(0.25, Number(row.success_count) / 100);
-      return mustSuggestion(row, score);
-    }).filter((suggestion) => suggestion.score > 0).sort((left, right) => right.score - left.score).slice(0, limit);
+      return patternFromRow(row, score);
+    }).filter((suggestion) => suggestion.score > 0).sort((left, right) => right.score - left.score || right.successCount - left.successCount).slice(0, Math.max(1, Math.min(limit, 20)));
+  }
+  migrateLegacyTemplates() {
+    const legacy = this.db.prepare("SELECT * FROM phase_templates").all();
+    for (const row of legacy) {
+      const phase = JSON.parse(String(row.phase_json));
+      const tuple = compactPhase(phase, jsonArray(row.keywords_json));
+      const signature = patternSignature(tuple.pattern, tuple.triggerConditions, tuple.resolution, tuple.applicabilityScope);
+      const now2 = String(row.updated_at);
+      this.db.prepare(`
+        INSERT OR IGNORE INTO playbook_patterns (
+          id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
+          source_projects_json, success_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        signature,
+        signature,
+        tuple.pattern,
+        JSON.stringify(tuple.triggerConditions),
+        JSON.stringify(tuple.resolution),
+        JSON.stringify(tuple.applicabilityScope),
+        JSON.stringify([String(row.source_project)]),
+        Number(row.success_count),
+        String(row.created_at),
+        now2
+      );
+    }
   }
 };
-function mustSuggestion(row, score) {
-  if (!row) throw new Error("playbook write failed");
+function compactPhase(phase, keywords) {
+  return {
+    pattern: phase.title.trim(),
+    triggerConditions: normalizeKeywords([phase.title, phase.goal, ...keywords].join(" ")),
+    resolution: [phase.goal.trim(), ...phase.acceptanceCommands.map((command2) => command2.trim())].filter(Boolean).slice(0, 6),
+    applicabilityScope: [...new Set(phase.allowedScope.map((scope) => scope.trim()).filter(Boolean))].slice(0, 12)
+  };
+}
+function patternFromRow(row, score) {
   return {
     id: String(row.id),
-    title: String(row.title),
+    pattern: String(row.pattern),
     score,
-    phase: JSON.parse(String(row.phase_json)),
-    sourceProject: String(row.source_project),
+    triggerConditions: jsonArray(row.trigger_conditions_json),
+    resolution: jsonArray(row.resolution_json),
+    applicabilityScope: jsonArray(row.applicability_scope_json),
+    sourceProjects: jsonArray(row.source_projects_json),
     successCount: Number(row.success_count)
   };
 }
+function patternSignature(pattern, triggers, resolution, scope) {
+  const canonical = JSON.stringify({
+    pattern: pattern.toLowerCase().replace(/\s+/g, " ").trim(),
+    triggers: [...triggers].sort(),
+    resolution: resolution.map(normalizeText),
+    scope: [...scope].sort()
+  });
+  return createHash4("sha256").update(canonical).digest("hex").slice(0, 32);
+}
+function normalizeText(value) {
+  return value.toLowerCase().replace(/(?:[a-z]:\\|\/)(?:[^\s]+[\\/])+[^\s]+/giu, "<path>").replace(/\b\d+\b/gu, "<n>").replace(/\s+/gu, " ").trim();
+}
 function normalizeKeywords(value) {
+  const source = Array.isArray(value) ? value.join(" ") : value;
   const stop = /* @__PURE__ */ new Set(["the", "and", "for", "with", "from", "this", "that", "phase", "build", "create", "bir", "ve", "ile", "i\xE7in", "faz"]);
-  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop.has(term)).slice(0, 40);
+  return [...new Set(source.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop.has(term)).slice(0, 40);
+}
+function jsonArray(value) {
+  return JSON.parse(String(value));
+}
+function required2(value) {
+  if (value === null || value === void 0) throw new Error("playbook write failed");
+  return value;
+}
+
+// src/core/command-quality.ts
+var VERIFICATION_CATEGORIES = [
+  { name: "test", pattern: /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|vitest|jest|mocha|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b/iu },
+  { name: "lint", pattern: /\b(?:eslint|ruff|pylint|flake8|golangci-lint|clippy|shellcheck|stylelint|lint)\b/iu },
+  { name: "typecheck", pattern: /\b(?:tsc|mypy|pyright|typecheck|cargo\s+check|go\s+vet)\b/iu },
+  { name: "build", pattern: /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?build\b|\b(?:cargo\s+build|go\s+build|dotnet\s+build|mvn\s+package|gradle\s+build|cmake\s+--build|make)\b/iu },
+  { name: "syntax", pattern: /\b(?:node|python|ruby)\s+--?check\b|\bgit\s+diff\s+--check\b/iu }
+];
+function lintAcceptanceCommands(phases, contract) {
+  const warnings = [];
+  const owners = /* @__PURE__ */ new Map();
+  for (const phase of phases) {
+    const normalized = phase.acceptanceCommands.map(normalizeCommand);
+    for (const command2 of normalized) owners.set(command2, [...owners.get(command2) ?? [], phase.id]);
+    if (phase.verificationKind !== "non-code" && !phase.acceptanceCommands.some(recognizedVerification)) {
+      warnings.push({
+        phaseId: phase.id,
+        code: "weak-verification-category",
+        message: `Phase ${phase.id} has no recognizable test, lint, type-check, build, or syntax verification command.`,
+        commands: phase.acceptanceCommands
+      });
+      if (contract?.critic?.blocking !== true && phase.criticBlocking !== true) {
+        warnings.push({
+          phaseId: phase.id,
+          code: "critic-recommended",
+          message: `Enable a blocking independent critic for phase ${phase.id} while deterministic acceptance evidence remains weak.`,
+          commands: phase.acceptanceCommands
+        });
+      }
+    }
+  }
+  for (const [command2, phaseIds] of owners) {
+    const unique = [...new Set(phaseIds)];
+    if (unique.length < 2) continue;
+    for (const phaseId of unique) {
+      warnings.push({
+        phaseId,
+        code: "duplicate-verification-command",
+        message: `The same acceptance command is reused by unrelated phases: ${unique.join(", ")}. Confirm that it validates each phase's deliverable.`,
+        commands: [command2]
+      });
+    }
+  }
+  return dedupeWarnings(warnings);
+}
+function recognizedVerification(command2) {
+  return VERIFICATION_CATEGORIES.some((category) => category.pattern.test(command2));
+}
+function normalizeCommand(value) {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+function dedupeWarnings(values) {
+  return [...new Map(values.map((warning) => [`${warning.phaseId}:${warning.code}:${warning.commands.join("|")}`, warning])).values()];
 }
 
 // src/core/context.ts
 var DEFAULT_MAX_CHARS = 12e3;
-function compileContext(store, maxChars = DEFAULT_MAX_CHARS) {
+var ALL_SECTIONS = [
+  "header",
+  "contract",
+  "active_phase",
+  "approvals",
+  "budget",
+  "decisions",
+  "failures",
+  "checkpoints",
+  "graph",
+  "playbook"
+];
+function compileContextEnvelope(store, options = {}) {
+  const sequence = store.latestEventSequence();
+  const since = options.sinceSequence;
+  if (since !== void 0 && since >= sequence) {
+    return { unchanged: true, sequence, changedSections: [], unchangedSections: ALL_SECTIONS, estimatedTokens: 0 };
+  }
   const snapshot = store.snapshot();
   const active = snapshot.project.currentPhaseId ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) ?? null : null;
   const terms = tokenize([active?.title, active?.goal, ...active?.allowedScope ?? []].filter(Boolean).join(" "));
-  const related = store.searchGraph(terms, 35);
-  return fitSections([
-    header(snapshot),
-    contractSection(snapshot),
-    phaseSection(snapshot),
-    approvalSection(snapshot),
-    budgetSection(snapshot),
-    decisionSection(snapshot),
-    failureSection(snapshot),
-    checkpointSection(snapshot),
-    related.length > 0 ? `## Relevant semantic graph
-${related.map((node) => `- ${node.type}: ${node.path ?? node.label}${node.symbol ? `#${node.symbol}` : ""}`).join("\n")}` : ""
-  ].filter(Boolean), maxChars);
+  const related = store.searchGraph(terms, 200);
+  const changedSections = since === void 0 ? [...ALL_SECTIONS] : changedSectionsFromEvents(store.eventsSince(since));
+  const effectiveChanged = changedSections.length === 0 ? ["header"] : changedSections;
+  const sectionValues = /* @__PURE__ */ new Map([
+    ["header", header(snapshot)],
+    ["contract", contractSection(snapshot)],
+    ["active_phase", phaseSection(snapshot)],
+    ["approvals", approvalSection(snapshot)],
+    ["budget", budgetSection(snapshot)],
+    ["decisions", decisionSection(snapshot)],
+    ["failures", failureSection(snapshot)],
+    ["checkpoints", checkpointSection(snapshot)],
+    ["graph", graphSummarySection(related)],
+    ["playbook", playbookSection(options.playbook ?? [])]
+  ]);
+  const rendered = effectiveChanged.map((section) => sectionValues.get(section) ?? "").filter(Boolean);
+  const unchangedSections = ALL_SECTIONS.filter((section) => !effectiveChanged.includes(section));
+  if (since !== void 0 && unchangedSections.length > 0) {
+    rendered.push(`Unchanged since sequence ${since}: ${unchangedSections.join(", ")}.`);
+  }
+  const context = fitSections(rendered, options.maxChars ?? DEFAULT_MAX_CHARS);
+  return {
+    unchanged: false,
+    sequence,
+    context,
+    changedSections: effectiveChanged,
+    unchangedSections,
+    estimatedTokens: estimateTokens(context)
+  };
+}
+function changedSectionsFromEvents(events) {
+  const sections = /* @__PURE__ */ new Set();
+  for (const event of events) {
+    const type = event.type;
+    if (/^(project_initialized|plan_saved|plan_amended)$/u.test(type)) {
+      sections.add("header");
+      sections.add("contract");
+      sections.add("active_phase");
+    }
+    if (/^(phase_|project_completion|project_completed|approval_)/u.test(type)) {
+      sections.add("header");
+      sections.add("active_phase");
+    }
+    if (/^approval_/u.test(type)) sections.add("approvals");
+    if (/^(budget_|plugin_token_)/u.test(type)) sections.add("budget");
+    if (/^decision_/u.test(type)) sections.add("decisions");
+    if (/^failure_/u.test(type)) sections.add("failures");
+    if (/^(phase_completed|phase_verification|project_completion_gate)/u.test(type)) sections.add("checkpoints");
+    if (/^(repository_indexed|phase_completed|phase_reverification)/u.test(type)) sections.add("graph");
+    if (/^playbook_/u.test(type)) sections.add("playbook");
+  }
+  return ALL_SECTIONS.filter((section) => sections.has(section));
 }
 function header(snapshot) {
   return [
@@ -1424,8 +1736,19 @@ ${pending.map((item) => `- ${item.id} [${item.phaseId}]: ${item.prompt}`).join("
 }
 function budgetSection(snapshot) {
   const entries = Object.entries(snapshot.budgetUsage ?? {});
-  return entries.length === 0 ? "" : `## Budget usage
-${entries.map(([scope, usage]) => `- ${scope}: ${usage.tokens} tokens, $${usage.costUsd.toFixed(4)}, ${usage.wallClockMs} ms`).join("\n")}`;
+  const lines = entries.map(([scope, usage]) => {
+    const estimated = usage.estimatedTokens ? ` (${usage.estimatedTokens} estimated plugin tokens)` : "";
+    return `- ${scope}: ${usage.tokens} tokens${estimated}, $${usage.costUsd.toFixed(4)}, ${usage.wallClockMs} ms`;
+  });
+  const maximum = snapshot.project.contract?.budget?.maxTokens;
+  const projectUsage = snapshot.budgetUsage?.[`project:${snapshot.project.id}`];
+  if (maximum && projectUsage) {
+    const percentage = Math.floor(projectUsage.tokens / maximum * 100);
+    if (percentage >= 90) lines.unshift(`Budget ${percentage}% used \u2014 use delta context, minimal diffs, file digests, and avoid rereading unchanged files.`);
+    else if (percentage >= 70) lines.unshift(`Budget ${percentage}% used \u2014 prefer get_file_digest and expand_graph over broad file or graph reads.`);
+  }
+  return lines.length === 0 ? "" : `## Budget usage
+${lines.join("\n")}`;
 }
 function decisionSection(snapshot) {
   const decisions = snapshot.decisions.filter((decision) => decision.status === "active").slice(-12);
@@ -1433,14 +1756,35 @@ function decisionSection(snapshot) {
 ${decisions.map((decision) => `- ${decision.title}: ${decision.rationale}`).join("\n")}`;
 }
 function failureSection(snapshot) {
-  const failures = snapshot.failures.filter((failure) => failure.resolution === null).slice(-10);
-  return failures.length === 0 ? "" : `## Unresolved failure memory
-${failures.map((failure) => `- [${failure.phaseId}] x${failure.count} ${failure.summary}`).join("\n")}`;
+  const unresolved = snapshot.failures.filter((failure) => failure.resolution === null);
+  const failures = [...unresolved].sort((left, right) => right.count - left.count || right.lastSeenAt.localeCompare(left.lastSeenAt)).slice(0, 5);
+  if (failures.length === 0) return "";
+  const suppressed = unresolved.length - failures.length;
+  return `## Unresolved failure memory
+${failures.map((failure) => `- [${failure.phaseId}] x${failure.count} ${failure.summary}`).join("\n")}${suppressed > 0 ? `
++${suppressed} similar failures suppressed (see get_status for the complete list).` : ""}`;
 }
 function checkpointSection(snapshot) {
   const checkpoints = snapshot.checkpoints.slice(-5);
   return checkpoints.length === 0 ? "" : `## Recent verified checkpoints
 ${checkpoints.map((checkpoint) => `- ${checkpoint.phaseId} @ ${checkpoint.gitSha.slice(0, 12)}: ${checkpoint.summary}`).join("\n")}`;
+}
+function graphSummarySection(nodes) {
+  if (nodes.length === 0) return "";
+  const files = new Set(nodes.map((node) => node.path).filter((value) => Boolean(value)));
+  const counts = /* @__PURE__ */ new Map();
+  for (const node of nodes) counts.set(node.type, (counts.get(node.type) ?? 0) + 1);
+  const groups = [...counts.entries()].sort((left, right) => right[1] - left[1]).slice(0, 5).map(([type, count]) => `${count} ${type}`).join(", ");
+  return [
+    "## Semantic graph \u2014 Tier 0",
+    `${nodes.length} relevant nodes across ${files.size} files: ${groups}.`,
+    "Use `expand_graph` only when exact node, import, call, or reference detail is needed."
+  ].join("\n");
+}
+function playbookSection(patterns) {
+  if (patterns.length === 0) return "";
+  return `## Relevant playbook patterns
+${patterns.slice(0, 3).map((entry) => `- ${entry.pattern}: ${entry.resolution.join("; ")} [scope: ${entry.applicabilityScope.join(", ")}]`).join("\n")}`;
 }
 function fitSections(sections, maxChars) {
   const selected = [];
@@ -1456,26 +1800,37 @@ function fitSections(sections, maxChars) {
 }
 function tokenize(value) {
   const stop = /* @__PURE__ */ new Set(["the", "and", "for", "with", "from", "this", "that", "bir", "ve", "ile", "i\xE7in", "bu"]);
-  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop.has(term)).slice(0, 12);
+  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop.has(term)).slice(0, 20);
+}
+function estimateTokens(value) {
+  return Math.ceil(value.length / 4);
 }
 function bullets(values) {
   return values.length === 0 ? "- None" : values.map((value) => `- ${value}`).join("\n");
 }
 
 // src/core/indexer.ts
-import { createHash as createHash3 } from "node:crypto";
+import { createHash as createHash5 } from "node:crypto";
 import { readFile as readFile2, stat } from "node:fs/promises";
 import path4 from "node:path";
 
 // src/core/graph/parser.ts
-import ts from "typescript";
 var SCRIPT_EXTENSIONS = /* @__PURE__ */ new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
-function parseSemanticFile(content, extension) {
+var typescriptPromise = null;
+async function parseSemanticFile(content, extension) {
   if (SCRIPT_EXTENSIONS.has(extension)) return parseTypeScript(content, extension);
   if (extension === ".py") return parsePython(content);
   return parseCStyle(content);
 }
-function parseTypeScript(content, extension) {
+async function loadTypeScript() {
+  typescriptPromise ??= import("typescript").then((loaded) => {
+    const compatible = loaded;
+    return compatible.default ?? compatible;
+  });
+  return typescriptPromise;
+}
+async function parseTypeScript(content, extension) {
+  const ts = await loadTypeScript();
   const kind = extension === ".tsx" || extension === ".jsx" ? ts.ScriptKind.TSX : extension === ".js" || extension === ".mjs" || extension === ".cjs" ? ts.ScriptKind.JS : ts.ScriptKind.TS;
   const source = ts.createSourceFile(`file${extension}`, content, ts.ScriptTarget.Latest, true, kind);
   const symbols = [];
@@ -1528,20 +1883,20 @@ function parseTypeScript(content, extension) {
       if (target === "require" && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) imports.add(node.arguments[0].text);
       if (expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) imports.add(node.arguments[0].text);
     }
-    if (ts.isIdentifier(node) && isReferenceIdentifier(node)) references.push({ from: scope.at(-1) ?? null, target: node.text, kind: "references", line: line(node) });
+    if (ts.isIdentifier(node) && isReferenceIdentifier(ts, node)) references.push({ from: scope.at(-1) ?? null, target: node.text, kind: "references", line: line(node) });
     ts.forEachChild(node, visit);
     if (pushed) scope.pop();
   };
   visit(source);
   return { symbols: dedupeSymbols(symbols), imports: [...imports], references: dedupeReferences(references) };
 }
-function isReferenceIdentifier(node) {
+function isReferenceIdentifier(ts, node) {
   const parent = node.parent;
   if (!parent) return false;
-  if (isDeclarationIdentifier(node) || ts.isPropertyAccessExpression(parent) && parent.name === node || ts.isImportSpecifier(parent)) return false;
+  if (isDeclarationIdentifier(ts, node) || ts.isPropertyAccessExpression(parent) && parent.name === node || ts.isImportSpecifier(parent)) return false;
   return !ts.isPropertyAssignment(parent) || parent.initializer === node;
 }
-function isDeclarationIdentifier(node) {
+function isDeclarationIdentifier(ts, node) {
   const parent = node.parent;
   return Boolean(parent && (ts.isVariableDeclaration(parent) && parent.name === node || ts.isFunctionDeclaration(parent) && parent.name === node || ts.isClassDeclaration(parent) && parent.name === node || ts.isInterfaceDeclaration(parent) && parent.name === node || ts.isTypeAliasDeclaration(parent) && parent.name === node || ts.isParameter(parent) && parent.name === node || ts.isMethodDeclaration(parent) && parent.name === node || ts.isPropertyDeclaration(parent) && parent.name === node));
 }
@@ -1627,10 +1982,18 @@ async function indexRepository(store, git) {
     }
     const isTest = isTestPath(relativePath);
     const fileId = `file:${relativePath}`;
-    store.upsertGraphNode({ id: fileId, type: isTest ? "test" : "file", label: path4.basename(relativePath), path: relativePath, symbol: null, contentHash: sha2562(content), metadata: { bytes: info.size, extension, parser: parserName(extension) } });
+    store.upsertGraphNode({
+      id: fileId,
+      type: isTest ? "test" : "file",
+      label: path4.basename(relativePath),
+      path: relativePath,
+      symbol: null,
+      contentHash: sha2562(content),
+      metadata: { bytes: info.size, lineCount: content.split("\n").length, extension, parser: parserName(extension) }
+    });
     result.filesIndexed += 1;
     if (isTest) result.testsIndexed += 1;
-    const parsed = parseSemanticFile(content, extension);
+    const parsed = await parseSemanticFile(content, extension);
     entries.push({ relativePath, extension, parsed });
     for (const symbol of parsed.symbols) {
       const symbolId = `symbol:${relativePath}:${symbol.kind}:${symbol.name}`;
@@ -1686,7 +2049,7 @@ function toPosix(value) {
   return value.split(path4.sep).join("/");
 }
 function sha2562(value) {
-  return createHash3("sha256").update(value).digest("hex");
+  return createHash5("sha256").update(value).digest("hex");
 }
 
 // src/integrations/github.ts
@@ -3579,7 +3942,7 @@ minimatch.escape = escape2;
 minimatch.unescape = unescape2;
 
 // src/core/secret-scan.ts
-import { createHash as createHash4 } from "node:crypto";
+import { createHash as createHash6 } from "node:crypto";
 import { readFile as readFile3 } from "node:fs/promises";
 import path6 from "node:path";
 var RULES = [
@@ -3650,7 +4013,7 @@ function makeFinding(ruleId, file, text2, index, value) {
     ruleId,
     file,
     line: 1 + text2.slice(0, index).split("\n").length - 1,
-    fingerprint: createHash4("sha256").update(`${ruleId}\0${value}`).digest("hex").slice(0, 16),
+    fingerprint: createHash6("sha256").update(`${ruleId}\0${value}`).digest("hex").slice(0, 16),
     preview: redact(value)
   };
 }
@@ -3758,6 +4121,7 @@ function appendBounded(current, chunk) {
 // src/core/verifier.ts
 var execAsync = promisify2(exec);
 var MAX_OUTPUT2 = 8e3;
+var ERROR_MARKER = /\b(?:error|fail(?:ed|ure)?|exception|fatal|panic|assertion)\b/iu;
 var PhaseVerifier = class {
   constructor(commandTimeoutMs = 12e4) {
     this.commandTimeoutMs = commandTimeoutMs;
@@ -3772,8 +4136,8 @@ var PhaseVerifier = class {
     const commands = [];
     const deterministicPrerequisitesPassed = scopeViolations.length === 0 && secretScan.passed && options.budget.passed;
     if (deterministicPrerequisitesPassed) {
-      await this.runSequence(options.selectiveCommands ?? [], git.root, selectiveCommands);
-      if (selectiveCommands.every((command2) => command2.passed)) await this.runSequence(phase.acceptanceCommands, git.root, commands);
+      await this.runSequence(options.selectiveCommands ?? [], git.root, selectiveCommands, options.previousFailures ?? []);
+      if (selectiveCommands.every((command2) => command2.passed)) await this.runSequence(phase.acceptanceCommands, git.root, commands, options.previousFailures ?? []);
     }
     const commandGatePassed = selectiveCommands.length === (options.selectiveCommands ?? []).length && selectiveCommands.every((command2) => command2.passed) && commands.length === phase.acceptanceCommands.length && commands.every((command2) => command2.passed);
     const blocking = phase.criticBlocking === true || options.contract.critic?.blocking === true;
@@ -3796,36 +4160,135 @@ var PhaseVerifier = class {
   }
   async runCommands(commands, cwd) {
     const evidence = [];
-    await this.runSequence(commands, cwd, evidence);
+    await this.runSequence(commands, cwd, evidence, []);
     return evidence;
   }
-  async runSequence(commands, cwd, evidence) {
+  async runSequence(commands, cwd, evidence, previousFailures) {
     for (const command2 of commands) {
-      const result = await this.runCommand(command2, cwd);
+      const previous = previousFailures.find((failure) => failure.command === command2) ?? null;
+      const result = await this.runCommand(command2, cwd, previous);
       evidence.push(result);
       if (!result.passed) break;
     }
   }
-  async runCommand(command2, cwd) {
+  async runCommand(command2, cwd, previous) {
     const started = performance.now();
     try {
       const { stdout, stderr } = await execAsync(command2, { cwd, encoding: "utf8", timeout: this.commandTimeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true });
-      return { command: command2, exitCode: 0, passed: true, durationMs: Math.round(performance.now() - started), stdout: truncate(stdout), stderr: truncate(stderr), timedOut: false };
+      const compressedOut = compressCommandOutput(stdout, null);
+      const compressedErr = compressCommandOutput(stderr, null);
+      return {
+        command: command2,
+        exitCode: 0,
+        passed: true,
+        durationMs: Math.round(performance.now() - started),
+        stdout: compressedOut.output,
+        stderr: compressedErr.output,
+        timedOut: false,
+        compression: mergeCompression(compressedOut.compression, compressedErr.compression)
+      };
     } catch (error2) {
       const failure = error2;
-      return { command: command2, exitCode: typeof failure.code === "number" ? failure.code : null, passed: false, durationMs: Math.round(performance.now() - started), stdout: truncate(failure.stdout ?? ""), stderr: truncate(failure.stderr ?? failure.message), timedOut: Boolean(failure.killed) || failure.code === "ETIMEDOUT" };
+      const compressedOut = compressCommandOutput(failure.stdout ?? "", previous ? { output: previous.stdout, attempt: previous.attempt } : null);
+      const compressedErr = compressCommandOutput(failure.stderr ?? failure.message, previous ? { output: previous.stderr, attempt: previous.attempt } : null);
+      return {
+        command: command2,
+        exitCode: typeof failure.code === "number" ? failure.code : null,
+        passed: false,
+        durationMs: Math.round(performance.now() - started),
+        stdout: compressedOut.output,
+        stderr: compressedErr.output,
+        timedOut: Boolean(failure.killed) || failure.code === "ETIMEDOUT",
+        compression: mergeCompression(compressedOut.compression, compressedErr.compression)
+      };
     }
   }
 };
-function skippedCritic(blocking) {
-  return { configured: false, blocking, passed: !blocking, summary: "Critic did not run because an earlier deterministic gate failed.", findings: [], rawOutput: "" };
+function compressCommandOutput(value, previous, maxChars = MAX_OUTPUT2) {
+  const cleaned = stripCommandNoise(value);
+  const previousCleaned = previous ? stripCommandNoise(previous.output) : "";
+  const delta = previous ? lineDelta(cleaned, previousCleaned, previous.attempt) : { text: cleaned, unchangedLines: 0 };
+  const output = markerAwareTruncate(delta.text, maxChars);
+  return {
+    output,
+    compression: {
+      originalChars: value.length,
+      emittedChars: output.length,
+      unchangedLines: delta.unchangedLines,
+      previousAttempt: previous?.attempt ?? null
+    }
+  };
 }
-function truncate(value) {
-  if (value.length <= MAX_OUTPUT2) return value;
-  const half = Math.floor((MAX_OUTPUT2 - 40) / 2);
+function stripCommandNoise(value) {
+  const lines = value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").replaceAll("\r\n", "\n").split("\n");
+  const filtered = [];
+  for (const line of lines) {
+    if (/^\s*at\s+(?:node:internal|internal\/)/u.test(line)) continue;
+    const normalized = line.replace(/[ \t]+$/u, "");
+    if (normalized === "" && filtered.at(-1) === "") continue;
+    if (normalized !== "" && normalized === filtered.at(-1)) continue;
+    filtered.push(normalized);
+  }
+  return filtered.join("\n").trim();
+}
+function lineDelta(current, previous, previousAttempt) {
+  const currentLines = current.split("\n");
+  const previousLines = previous.split("\n");
+  let prefix = 0;
+  while (prefix < currentLines.length && prefix < previousLines.length && currentLines[prefix] === previousLines[prefix]) prefix += 1;
+  let suffix = 0;
+  while (suffix < currentLines.length - prefix && suffix < previousLines.length - prefix && currentLines[currentLines.length - 1 - suffix] === previousLines[previousLines.length - 1 - suffix]) suffix += 1;
+  const unchangedLines = prefix + suffix;
+  if (unchangedLines === 0) return { text: current, unchangedLines: 0 };
+  const middle = currentLines.slice(prefix, currentLines.length - suffix);
+  const contextBefore = currentLines.slice(Math.max(0, prefix - 2), prefix);
+  const contextAfter = suffix > 0 ? currentLines.slice(currentLines.length - suffix, Math.min(currentLines.length, currentLines.length - suffix + 2)) : [];
+  return {
+    text: [
+      ...contextBefore,
+      `...[${unchangedLines} lines unchanged from attempt ${previousAttempt}]...`,
+      ...middle,
+      ...contextAfter
+    ].join("\n"),
+    unchangedLines
+  };
+}
+function markerAwareTruncate(value, maxChars) {
+  if (value.length <= maxChars) return value;
+  const lines = value.split("\n");
+  const markers = lines.map((line, index) => ERROR_MARKER.test(line) ? index : -1).filter((index) => index >= 0);
+  if (markers.length === 0) return headTail(value, maxChars);
+  const selected = /* @__PURE__ */ new Set();
+  for (const marker of markers.slice(0, 8)) for (let index = Math.max(0, marker - 3); index <= Math.min(lines.length - 1, marker + 5); index += 1) selected.add(index);
+  for (let index = 0; index < Math.min(8, lines.length); index += 1) selected.add(index);
+  for (let index = Math.max(0, lines.length - 8); index < lines.length; index += 1) selected.add(index);
+  const ordered = [...selected].sort((left, right) => left - right);
+  const chunks = [];
+  let previousIndex = -2;
+  for (const index of ordered) {
+    if (index > previousIndex + 1) chunks.push("...[non-actionable output omitted]...");
+    chunks.push(lines[index] ?? "");
+    previousIndex = index;
+  }
+  const focused = chunks.join("\n");
+  return focused.length <= maxChars ? focused : headTail(focused, maxChars);
+}
+function headTail(value, maxChars) {
+  const half = Math.max(1, Math.floor((maxChars - 40) / 2));
   return `${value.slice(0, half)}
 ...[output truncated]...
 ${value.slice(-half)}`;
+}
+function mergeCompression(left, right) {
+  return {
+    originalChars: left.originalChars + right.originalChars,
+    emittedChars: left.emittedChars + right.emittedChars,
+    unchangedLines: left.unchangedLines + right.unchangedLines,
+    previousAttempt: left.previousAttempt ?? right.previousAttempt
+  };
+}
+function skippedCritic(blocking) {
+  return { configured: false, blocking, passed: !blocking, summary: "Critic did not run because an earlier deterministic gate failed.", findings: [], rawOutput: "" };
 }
 
 // src/core/orchestrator.ts
@@ -4118,17 +4581,44 @@ var KeepCodingService = class _KeepCodingService {
     return { project, index, nextAction: project.planVersion === 0 ? "save_plan" : "get_context" };
   }
   savePlan(contract, phases) {
+    const warnings = lintAcceptanceCommands(phases, contract);
     const snapshot = this.store.savePlan(contract, phases);
-    return { project: snapshot.project, phases: snapshot.phases, nextAction: "start_phase" };
+    return { project: snapshot.project, phases: snapshot.phases, commandQualityWarnings: warnings, nextAction: "start_phase" };
   }
   amendPlan(amendment) {
-    return { snapshot: this.store.amendPlan(amendment), nextAction: "get_context" };
+    const contract = this.store.getProject()?.contract ?? null;
+    const warnings = lintAcceptanceCommands(amendment.addPhases, contract);
+    return { snapshot: this.store.amendPlan(amendment), commandQualityWarnings: warnings, nextAction: "get_context" };
   }
   context(maxChars) {
-    return compileContext(this.store, maxChars);
+    const playbook = this.relevantPlaybook();
+    const context = compileContextEnvelope(this.store, { ...maxChars !== void 0 ? { maxChars } : {}, playbook });
+    this.recordPluginContextUsage(context);
+    return context.context ?? "";
+  }
+  contextEnvelope(sinceSequence, maxChars) {
+    const envelope = compileContextEnvelope(this.store, {
+      ...sinceSequence !== void 0 ? { sinceSequence } : {},
+      ...maxChars !== void 0 ? { maxChars } : {},
+      playbook: this.relevantPlaybook()
+    });
+    this.recordPluginContextUsage(envelope);
+    return { ...envelope, sequence: this.store.latestEventSequence() };
   }
   impact(target, depth) {
     return { target, nodes: this.store.impact(target, depth), impactedTests: this.store.impactedTests([target]) };
+  }
+  expandGraph(terms, nodeIds, limit = 50) {
+    const bounded = Math.max(1, Math.min(limit, 200));
+    const exact = nodeIds.map((id) => this.store.graphNode(id)).filter((node) => node !== null);
+    const searched = terms.length > 0 ? this.store.searchGraph(terms, bounded) : [];
+    const nodes = [...new Map([...exact, ...searched].map((node) => [node.id, node])).values()].slice(0, bounded);
+    return { nodes, count: nodes.length, tier: 1, requested: { terms, nodeIds } };
+  }
+  fileDigest(filePath) {
+    const digest = this.store.fileDigest(filePath);
+    if (!digest) throw new Error(`indexed file not found: ${filePath}`);
+    return digest;
   }
   async startPhase(phaseId) {
     this.store.setPhaseBaseline(phaseId, await this.git.workingTreeSnapshot());
@@ -4145,7 +4635,15 @@ var KeepCodingService = class _KeepCodingService {
     } finally {
       playbook.close();
     }
+    this.store.appendEvent("playbook_failure_compounded", phaseId, { fingerprint: failure.fingerprint });
     return failure;
+  }
+  recordHostTokenUsage(tokens) {
+    if (!Number.isFinite(tokens) || tokens <= 0) return;
+    const project = this.store.getProject();
+    if (!project) return;
+    this.store.recordBudgetUsage("project", project.id, { tokens: Math.ceil(tokens) }, "budget_host_tokens_recorded");
+    if (project.currentPhaseId) this.store.recordBudgetUsage("phase", project.currentPhaseId, { tokens: Math.ceil(tokens) }, "budget_host_tokens_recorded");
   }
   async checkpoint(phaseId, summary) {
     const phase = this.store.getPhase(phaseId);
@@ -4160,13 +4658,17 @@ var KeepCodingService = class _KeepCodingService {
     const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
     const impactedTests2 = this.store.impactedTests(changedFiles);
     const selectiveCommands = project.contract.selectiveTests && impactedTests2.length > 0 ? [project.contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests2.map(shellQuote2).join(" "))] : [];
+    const previousFailures = [.../* @__PURE__ */ new Set([...selectiveCommands, ...verifying.acceptanceCommands])].map((command2) => this.store.latestCommandFailure(phaseId, command2)).filter((record2) => record2 !== null);
     const evidence = await new PhaseVerifier().verify(this.git, verifying, {
       ...baseline ? { baseline } : {},
       selectiveCommands,
       budget: this.store.budgetEvidence(phaseId),
       contract: project.contract,
-      impactedCompletedPhases
+      impactedCompletedPhases,
+      previousFailures
     });
+    this.persistCommandFailures(phaseId, phase.attempts + 1, [...evidence.selectiveCommands, ...evidence.commands]);
+    this.recordCommandOutputUsage(phaseId, [...evidence.selectiveCommands, ...evidence.commands]);
     if (evidence.passed) {
       evidence.gitSha = await this.git.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
     }
@@ -4202,6 +4704,7 @@ var KeepCodingService = class _KeepCodingService {
     if (!project?.contract) throw new Error("project contract is missing");
     const fullSuite = project.contract.selectiveTests?.fullSuiteCommands ?? [];
     const commands = await new PhaseVerifier().runCommands(fullSuite, this.git.root);
+    this.recordCommandOutputUsage(project.currentPhaseId, commands);
     if (commands.length !== fullSuite.length || commands.some((command2) => !command2.passed)) {
       this.store.appendEvent("project_completion_gate_failed", null, { commands });
       throw new Error("full-suite project completion gate failed");
@@ -4233,9 +4736,48 @@ var KeepCodingService = class _KeepCodingService {
     if (!phase) throw new Error(`unknown phase: ${phaseId}`);
     const playbook = new PlaybookStore();
     try {
-      return { template: playbook.rememberPhase(project.root, phase, [project.contract.goal]) };
+      const pattern = playbook.rememberPhase(project.root, phase, [project.contract.goal]);
+      this.store.appendEvent("playbook_pattern_recorded", phaseId, { pattern: pattern.pattern });
+      return { pattern };
     } finally {
       playbook.close();
+    }
+  }
+  relevantPlaybook() {
+    const project = this.store.getProject();
+    if (!project?.contract?.playbookOptIn) return [];
+    const phase = this.store.currentPhase();
+    const query = [project.contract.goal, phase?.title, phase?.goal, ...phase?.allowedScope ?? []].filter(Boolean).join(" ");
+    const playbook = new PlaybookStore();
+    try {
+      return playbook.suggest(tokenize(query).join(" "), 3);
+    } finally {
+      playbook.close();
+    }
+  }
+  recordPluginContextUsage(envelope) {
+    if (envelope.unchanged || !envelope.context || envelope.estimatedTokens <= 0) return;
+    const project = this.store.getProject();
+    if (!project) return;
+    const delta = { tokens: envelope.estimatedTokens, estimatedTokens: envelope.estimatedTokens };
+    this.store.recordBudgetUsage("project", project.id, delta, "plugin_token_context_estimated");
+    if (project.currentPhaseId) this.store.recordBudgetUsage("phase", project.currentPhaseId, delta, "plugin_token_context_estimated");
+  }
+  recordCommandOutputUsage(phaseId, commands) {
+    const chars = commands.reduce((sum, command2) => sum + command2.stdout.length + command2.stderr.length, 0);
+    const tokens = Math.ceil(chars / 4);
+    if (tokens <= 0) return;
+    const project = this.store.getProject();
+    if (!project) return;
+    const delta = { tokens, estimatedTokens: tokens };
+    this.store.recordBudgetUsage("project", project.id, delta, "plugin_token_command_output_estimated");
+    if (phaseId) this.store.recordBudgetUsage("phase", phaseId, delta, "plugin_token_command_output_estimated");
+  }
+  persistCommandFailures(phaseId, attempt, commands) {
+    for (const command2 of commands) {
+      if (command2.passed) continue;
+      const fingerprint = createHash7("sha256").update(`${command2.command}\0${command2.stdout}\0${command2.stderr}`).digest("hex").slice(0, 24);
+      this.store.recordCommandFailure({ phaseId, command: command2.command, attempt, stdout: command2.stdout, stderr: command2.stderr, fingerprint, createdAt: (/* @__PURE__ */ new Date()).toISOString() });
     }
   }
   rememberSuccessfulPhase(phase) {
@@ -4244,6 +4786,7 @@ var KeepCodingService = class _KeepCodingService {
     try {
       const project = this.store.getProject();
       playbook.rememberPhase(project?.root ?? this.git.root, phase, [project?.contract?.goal ?? phase.goal]);
+      this.store.appendEvent("playbook_pattern_recorded", phase.id, { phaseId: phase.id });
     } finally {
       playbook.close();
     }
@@ -4254,18 +4797,24 @@ function shellQuote2(value) {
 }
 
 // src/hooks/handler.ts
+var CONTEXT_EVENTS = /* @__PURE__ */ new Set(["SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact"]);
 async function handleHook(event, input) {
   const candidate = typeof input.cwd === "string" ? input.cwd : process.cwd();
   const git = await GitRepository.open(candidate).catch(() => null);
   if (!git) return { continue: true };
   const stateExists = existsSync(path8.join(git.root, ".keep-coding", "state.db"));
+  const runtime = typeof input.runtime === "string" ? input.runtime : "codex";
+  const session = typeof input.session_id === "string" && input.session_id.trim() ? input.session_id.trim() : "default";
   if (event === "UserPromptSubmit" && !stateExists) {
     const prompt = typeof input.prompt === "string" ? input.prompt : "";
     const detection = detectLargeProject(prompt, { force: /(?:@keep coding|keep-coding:activate)/iu.test(prompt) });
     if (!detection.activate) return { continue: true, detection };
     return withService(git.root, async (service) => {
       await service.initialize(prompt);
-      return contextOutput(event, `${service.context()}
+      service.recordHostTokenUsage(extractUsageTokens(input));
+      const envelope = service.contextEnvelope();
+      service.store.setLastDeliveredSequence(cursorKey(runtime, session, event), envelope.sequence);
+      return contextOutput(event, `${envelope.context ?? ""}
 
 Activation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.reasons.join("; ")}.`);
     });
@@ -4274,22 +4823,27 @@ Activation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.r
   return withService(git.root, async (service) => {
     const project = service.store.getProject();
     if (!project) return { continue: true };
-    if (event === "PreCompact" || event === "SessionEnd") {
-      service.store.appendEvent(event === "PreCompact" ? "context_compacting" : "session_ended", project.currentPhaseId, { runtime: input.runtime ?? "codex" });
+    service.recordHostTokenUsage(extractUsageTokens(input));
+    if (event === "SessionEnd") {
+      service.store.appendEvent("session_ended", project.currentPhaseId, { runtime, session });
       return { continue: true };
     }
-    const directive = await adapterById(typeof input.runtime === "string" ? input.runtime : "codex").translate({
+    const progressSequence = service.store.latestEventSequence();
+    if (event === "Stop" && input.stop_hook_active && progressSequence <= service.store.lastStopProgressSequence()) {
+      return { continue: true, systemMessage: "Keep Coding released the stop guard because no new durable progress was recorded." };
+    }
+    const cursor = cursorKey(runtime, session, event);
+    const lastDelivered = CONTEXT_EVENTS.has(event) ? service.store.getLastDeliveredSequence(cursor) : void 0;
+    if (lastDelivered !== void 0 && progressSequence <= lastDelivered) return { continue: true };
+    const directive = await adapterById(runtime).translate({
       name: event,
       cwd: git.root,
       ...input.prompt !== void 0 ? { prompt: input.prompt } : {},
-      ...input.stop_hook_active !== void 0 ? { stopGuardActive: input.stop_hook_active } : {}
+      ...input.stop_hook_active !== void 0 ? { stopGuardActive: input.stop_hook_active } : {},
+      ...lastDelivered !== void 0 ? { sinceSequence: lastDelivered } : {}
     }, service);
     if (event === "Stop" && !directive.continue) {
-      const sequence = service.store.latestEventSequence();
-      if (input.stop_hook_active && sequence <= service.store.lastStopProgressSequence()) {
-        return { continue: true, systemMessage: "Keep Coding released the stop guard because no new durable progress was recorded." };
-      }
-      service.store.setLastStopProgressSequence(sequence);
+      service.store.setLastStopProgressSequence(progressSequence);
       return {
         decision: "block",
         reason: `Keep Coding project is ${project.status}. Resume from durable state:
@@ -4297,11 +4851,32 @@ Activation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.r
 ${directive.blockReason ?? service.context(7e3)}`
       };
     }
+    if (lastDelivered !== void 0) service.store.setLastDeliveredSequence(cursor, directive.sequence ?? service.store.latestEventSequence());
     return directive.context ? contextOutput(event, directive.context) : { continue: true };
   });
 }
 function contextOutput(event, additionalContext) {
   return { continue: true, hookSpecificOutput: { hookEventName: event, additionalContext } };
+}
+function cursorKey(runtime, session, event) {
+  return `${runtime}:${session}:${event}`.replace(/[^a-z0-9:._-]/giu, "-").slice(0, 240);
+}
+function extractUsageTokens(input) {
+  const candidates = [input.token_usage, input.usage];
+  for (const candidate of candidates) {
+    if (typeof candidate === "number") return candidate;
+    if (!candidate || typeof candidate !== "object") continue;
+    const usage = candidate;
+    const total = numberValue(usage.total_tokens ?? usage.totalTokens ?? usage.tokens);
+    if (total > 0) return total;
+    const inputTokens = numberValue(usage.input_tokens ?? usage.inputTokens);
+    const outputTokens = numberValue(usage.output_tokens ?? usage.outputTokens);
+    if (inputTokens + outputTokens > 0) return inputTokens + outputTokens;
+  }
+  return 0;
+}
+function numberValue(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 async function withService(root, operation) {
   const service = await KeepCodingService.open(root);
@@ -4507,7 +5082,7 @@ __export(util_exports, {
   promiseAllObject: () => promiseAllObject,
   propertyKeyTypes: () => propertyKeyTypes,
   randomString: () => randomString,
-  required: () => required2,
+  required: () => required3,
   safeExtend: () => safeExtend,
   shallowClone: () => shallowClone,
   slugify: () => slugify,
@@ -4978,7 +5553,7 @@ function partial(Class2, schema, mask) {
   });
   return clone(schema, def);
 }
-function required2(Class2, schema, mask) {
+function required3(Class2, schema, mask) {
   const def = mergeDefs(schema._zod.def, {
     get shape() {
       const oldShape = schema._zod.def.shape;
@@ -11096,9 +11671,9 @@ function requiredClientCapabilitiesForInputRequest(entry) {
       return;
   }
 }
-function missingClientCapabilities(required3, declared) {
+function missingClientCapabilities(required4, declared) {
   const missing = {};
-  for (const [capability, requirement] of Object.entries(required3)) {
+  for (const [capability, requirement] of Object.entries(required4)) {
     if (requirement === void 0) continue;
     const declaredValue = declared === void 0 ? void 0 : declared[capability];
     if (declaredValue === void 0) {
@@ -14438,11 +15013,11 @@ function isLibraryFormatPattern(format, pattern, vendor) {
 function promptArgumentsFromStandardSchema(schema) {
   const jsonSchema = standardSchemaToJsonSchema(schema, "input");
   const properties = jsonSchema.properties || {};
-  const required3 = jsonSchema.required || [];
+  const required4 = jsonSchema.required || [];
   return Object.entries(properties).map(([name, prop]) => ({
     name,
     description: prop?.description,
-    required: required3.includes(name)
+    required: required4.includes(name)
   }));
 }
 function isJsonObject(value) {
@@ -17153,8 +17728,8 @@ var require_dataType = /* @__PURE__ */ __commonJSMin(((exports) => {
     return types2;
   }
   exports.getSchemaTypes = getSchemaTypes;
-  function getJSONTypes(ts2) {
-    const types2 = Array.isArray(ts2) ? ts2 : ts2 ? [ts2] : [];
+  function getJSONTypes(ts) {
+    const types2 = Array.isArray(ts) ? ts : ts ? [ts] : [];
     if (types2.every(rules_1.isJSONType)) return types2;
     throw new Error("type must be JSONType or JSONType[]: " + types2.join(","));
   }
@@ -18032,30 +18607,30 @@ var require_validate = /* @__PURE__ */ __commonJSMin(((exports) => {
     });
     narrowSchemaTypes(it, types2);
   }
-  function checkMultipleTypes(it, ts2) {
-    if (ts2.length > 1 && !(ts2.length === 2 && ts2.includes("null"))) strictTypesError(it, "use allowUnionTypes to allow union type keyword");
+  function checkMultipleTypes(it, ts) {
+    if (ts.length > 1 && !(ts.length === 2 && ts.includes("null"))) strictTypesError(it, "use allowUnionTypes to allow union type keyword");
   }
-  function checkKeywordTypes(it, ts2) {
+  function checkKeywordTypes(it, ts) {
     const rules = it.self.RULES.all;
     for (const keyword in rules) {
       const rule = rules[keyword];
       if (typeof rule == "object" && (0, applicability_1.shouldUseRule)(it.schema, rule)) {
         const { type } = rule.definition;
-        if (type.length && !type.some((t) => hasApplicableType(ts2, t))) strictTypesError(it, `missing type "${type.join(",")}" for keyword "${keyword}"`);
+        if (type.length && !type.some((t) => hasApplicableType(ts, t))) strictTypesError(it, `missing type "${type.join(",")}" for keyword "${keyword}"`);
       }
     }
   }
   function hasApplicableType(schTs, kwdT) {
     return schTs.includes(kwdT) || kwdT === "number" && schTs.includes("integer");
   }
-  function includesType(ts2, t) {
-    return ts2.includes(t) || t === "integer" && ts2.includes("number");
+  function includesType(ts, t) {
+    return ts.includes(t) || t === "integer" && ts.includes("number");
   }
   function narrowSchemaTypes(it, withTypes) {
-    const ts2 = [];
-    for (const t of it.dataTypes) if (includesType(withTypes, t)) ts2.push(t);
-    else if (withTypes.includes("integer") && t === "number") ts2.push("integer");
-    it.dataTypes = ts2;
+    const ts = [];
+    for (const t of it.dataTypes) if (includesType(withTypes, t)) ts.push(t);
+    else if (withTypes.includes("integer") && t === "number") ts.push("integer");
+    it.dataTypes = ts;
   }
   function strictTypesError(it, msg) {
     const schemaPath = it.schemaEnv.baseId + it.errSchemaPath;
@@ -21113,8 +21688,8 @@ var require_discriminator = /* @__PURE__ */ __commonJSMin(((exports) => {
         }
         if (!tagRequired) throw new Error(`discriminator: "${tagName}" must be required`);
         return oneOfMapping;
-        function hasRequired({ required: required3 }) {
-          return Array.isArray(required3) && required3.includes(tagName);
+        function hasRequired({ required: required4 }) {
+          return Array.isArray(required4) && required4.includes(tagName);
         }
         function addMappings(sch, i) {
           if (sch.const) addMapping(sch.const, i);
@@ -23081,11 +23656,11 @@ function resolveLegacyShimOptions(options) {
 function coerceEmbeddedInputRequest(method, key, entry) {
   if (entry === null || typeof entry !== "object" || typeof entry.method !== "string") throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an invalid input request '${key}': each inputRequests entry must be an embedded elicitation/create, sampling/createMessage, or roots/list request`);
   const embedded = entry;
-  const required3 = requiredClientCapabilitiesForInputRequest(embedded);
-  if (required3 === void 0) throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an input request '${key}' of kind '${embedded.method}', which is not an embedded request the 2026-07-28 revision defines`);
+  const required4 = requiredClientCapabilitiesForInputRequest(embedded);
+  if (required4 === void 0) throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an input request '${key}' of kind '${embedded.method}', which is not an embedded request the 2026-07-28 revision defines`);
   return {
     embedded,
-    required: required3
+    required: required4
   };
 }
 function syntheticElicitationId() {
@@ -23129,9 +23704,9 @@ var LegacyInputRequiredShim = class {
         const declared = this._host.resolvedClientCapabilities(ctx);
         const coerced = [];
         for (const [key, entry] of Object.entries(inputRequests)) {
-          const { embedded, required: required3 } = coerceEmbeddedInputRequest(method, key, entry);
+          const { embedded, required: required4 } = coerceEmbeddedInputRequest(method, key, entry);
           if (embedded.method !== "roots/list" && embedded.params === void 0) throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an input request '${key}' of kind '${embedded.method}' without params`);
-          if (missingClientCapabilities(required3, declared) !== void 0) return legacyShimFailure(method, `Cannot request input '${key}' (${embedded.method}): the client on this 2025-era connection did not declare the required capability${declared === void 0 ? " (no client capabilities are available on this connection \u2014 per-request legacy serving cannot receive server-to-client requests)" : ""}`);
+          if (missingClientCapabilities(required4, declared) !== void 0) return legacyShimFailure(method, `Cannot request input '${key}' (${embedded.method}): the client on this 2025-era connection did not declare the required capability${declared === void 0 ? " (no client capabilities are available on this connection \u2014 per-request legacy serving cannot receive server-to-client requests)" : ""}`);
           coerced.push([key, embedded]);
         }
         const roundAbort = linkedRoundAbort(outerSignal);
@@ -23442,8 +24017,8 @@ var Server = class extends Protocol {
     if (hasInputRequests) {
       const declared = this._inputRequestCapabilityView(ctx);
       for (const [key, entry] of Object.entries(inputRequests)) {
-        const { embedded, required: required3 } = coerceEmbeddedInputRequest(method, key, entry);
-        const missing = missingClientCapabilities(required3, declared);
+        const { embedded, required: required4 } = coerceEmbeddedInputRequest(method, key, entry);
+        const missing = missingClientCapabilities(required4, declared);
         if (missing !== void 0) throw new MissingRequiredClientCapabilityError({ requiredCapabilities: missing }, `Cannot request input '${key}' (${embedded.method}): the request's client capabilities do not declare the required capability`);
       }
     }
@@ -25437,9 +26012,9 @@ function createMcpHandler(factory, options = {}) {
     const meta2 = route.messageKind === "request" ? requestMetaOf(route.message.params) : void 0;
     const declaredClientCapabilities = meta2?.[CLIENT_CAPABILITIES_META_KEY];
     if (route.messageKind === "request") {
-      const required3 = requiredClientCapabilitiesForRequest(route.message.method);
-      if (required3 !== void 0) {
-        const missing = missingClientCapabilities(required3, declaredClientCapabilities);
+      const required4 = requiredClientCapabilitiesForRequest(route.message.method);
+      if (required4 !== void 0) {
+        const missing = missingClientCapabilities(required4, declaredClientCapabilities);
         if (missing !== void 0) {
           const error2 = new MissingRequiredClientCapabilityError({ requiredCapabilities: missing });
           reportError(error2);
@@ -25679,6 +26254,7 @@ var phaseDefinition = object({
   allowedScope: array(string2()).min(1),
   acceptanceCommands: array(string2().min(1)).min(1),
   maxAttempts: number2().int().min(1).max(10).default(3),
+  verificationKind: _enum(["code", "non-code"]).optional(),
   budget: budgetSchema.optional(),
   criticBlocking: boolean2().optional(),
   requiresApproval: boolean2().optional(),
@@ -25699,11 +26275,12 @@ var contractSchema = object({
 });
 function createServer(options = {}) {
   const server = new McpServer(
-    { name: "keep-coding", version: "0.2.0" },
+    { name: "keep-coding", version: "0.2.1" },
     {
       instructions: [
         "Use one evidence-gated workflow; amend plans only through amend_plan.",
         "Deterministic commands, secret scanning, budget checks, impact-aware reverification, and pending approvals are authoritative.",
+        "Prefer delta get_context, get_file_digest, and Tier-1 expand_graph over redundant broad reads.",
         "Remote edits remain bounded by the active phase allowedScope."
       ].join(" ")
     }
@@ -25720,14 +26297,14 @@ function createServer(options = {}) {
     server,
     options,
     "save_plan",
-    "Save the initial measurable contract and acyclic phase DAG.",
+    "Save the initial measurable contract and acyclic phase DAG; returns command-quality warnings.",
     rootSchema.extend({ contract: contractSchema, phases: array(phaseDefinition).min(1) }),
     async (service, input) => {
       validateCommands(options, input.phases);
       return service.savePlan(input.contract, input.phases);
     }
   );
-  register2(server, options, "amend_plan", "Version an auditable plan amendment without destroying completed evidence.", rootSchema.extend({
+  register2(server, options, "amend_plan", "Version an auditable plan amendment without destroying completed evidence; returns command-quality warnings.", rootSchema.extend({
     reason: string2().min(10),
     add_phases: array(phaseDefinition),
     supersede_phase_ids: array(string2()),
@@ -25741,14 +26318,16 @@ function createServer(options = {}) {
       ...input.contract_patch ? { contractPatch: input.contract_patch } : {}
     });
   });
-  register2(
-    server,
-    options,
-    "get_context",
-    "Get compact durable context and snapshot.",
-    rootSchema.extend({ max_chars: number2().int().min(1e3).max(3e4).optional() }),
-    async (service, input) => ({ context: service.context(input.max_chars), snapshot: service.store.snapshot() })
-  );
+  register2(server, options, "get_context", "Get sequence-aware compact durable context; structured snapshot is opt-in.", rootSchema.extend({
+    max_chars: number2().int().min(1e3).max(3e4).optional(),
+    since_sequence: number2().int().nonnegative().optional(),
+    include_snapshot: boolean2().default(false),
+    usage_tokens: number2().int().nonnegative().optional()
+  }), async (service, input) => {
+    if (input.usage_tokens) service.recordHostTokenUsage(input.usage_tokens);
+    const envelope = service.contextEnvelope(input.since_sequence, input.max_chars);
+    return input.include_snapshot ? { ...envelope, snapshot: service.store.snapshot() } : envelope;
+  });
   register2(
     server,
     options,
@@ -25756,6 +26335,26 @@ function createServer(options = {}) {
     "Compute explainable file or symbol blast radius and impacted tests.",
     rootSchema.extend({ target: string2().min(1), max_depth: number2().int().min(1).max(8).default(4) }),
     async (service, input) => service.impact(input.target, input.max_depth)
+  );
+  register2(
+    server,
+    options,
+    "expand_graph",
+    "Expand exact Tier-1 graph detail only when dependency detail is needed.",
+    rootSchema.extend({
+      terms: array(string2().min(1)).default([]),
+      node_ids: array(string2().min(1)).default([]),
+      limit: number2().int().min(1).max(200).default(50)
+    }).refine((input) => input.terms.length > 0 || input.node_ids.length > 0, "terms or node_ids is required"),
+    async (service, input) => service.expandGraph(input.terms, input.node_ids, input.limit)
+  );
+  register2(
+    server,
+    options,
+    "get_file_digest",
+    "Return indexed symbols, imports, hash, lines, and last modifying phase without reading the file.",
+    rootSchema.extend({ file_path: string2().min(1) }),
+    async (service, input) => service.fileDigest(input.file_path)
   );
   register2(
     server,
@@ -25797,14 +26396,16 @@ function createServer(options = {}) {
     rootSchema.extend({ approval_id: string2().min(1), approved: boolean2(), note: string2().default("") }),
     async (service, input) => service.store.resolveApproval(input.approval_id, input.approved, input.note)
   );
-  register2(server, options, "record_budget_usage", "Record token, cost, and wall-clock usage for enforceable budgets.", rootSchema.extend({
+  register2(server, options, "record_budget_usage", "Record token, estimated-token, cost, and wall-clock usage for enforceable budgets.", rootSchema.extend({
     scope: _enum(["project", "phase"]),
     scope_id: string2().min(1),
     tokens: number2().int().nonnegative().optional(),
+    estimated_tokens: number2().int().nonnegative().optional(),
     cost_usd: number2().nonnegative().optional(),
     wall_clock_ms: number2().int().nonnegative().optional()
   }), async (service, input) => service.store.recordBudgetUsage(input.scope, input.scope_id, {
     ...input.tokens !== void 0 ? { tokens: input.tokens } : {},
+    ...input.estimated_tokens !== void 0 ? { estimatedTokens: input.estimated_tokens } : {},
     ...input.cost_usd !== void 0 ? { costUsd: input.cost_usd } : {},
     ...input.wall_clock_ms !== void 0 ? { wallClockMs: input.wall_clock_ms } : {}
   }));
@@ -25820,7 +26421,7 @@ function createServer(options = {}) {
     server,
     options,
     "suggest_phases",
-    "Consult the opt-in cross-project playbook.",
+    "Consult the opt-in compressed cross-project playbook.",
     rootSchema.extend({ query: string2().min(1) }),
     async (service, input) => service.suggestPhases(input.query)
   );
@@ -25828,7 +26429,7 @@ function createServer(options = {}) {
     server,
     options,
     "remember_phase_template",
-    "Persist a successful phase into the opt-in playbook.",
+    "Persist a successful phase as a compact deduplicated playbook pattern.",
     rootSchema.extend({ phase_id: string2().min(1) }),
     async (service, input) => service.rememberPhaseTemplate(input.phase_id)
   );
@@ -25882,7 +26483,7 @@ function createServer(options = {}) {
     server,
     options,
     "record_failure",
-    "Deduplicate a failed approach and compound opt-in playbook memory.",
+    "Deduplicate a normalized failed approach and compound opt-in playbook memory.",
     rootSchema.extend({ phase_id: string2().min(1), summary: string2().min(1), fingerprint: string2().optional() }),
     async (service, input) => service.recordFailure(input.phase_id, input.summary, input.fingerprint)
   );
@@ -25925,7 +26526,7 @@ function validateCommands(options, phases) {
   for (const phase of phases) for (const command2 of phase.acceptanceCommands) options.validateAcceptanceCommand?.(command2);
 }
 function register2(server, options, name, description, inputSchema, operation) {
-  const readOnlyTools = ["get_context", "get_impact", "suggest_phases", "list_files", "read_file", "search_code", "get_diff", "get_status"];
+  const readOnlyTools = ["get_context", "get_impact", "expand_graph", "get_file_digest", "suggest_phases", "list_files", "read_file", "search_code", "get_diff", "get_status"];
   const config2 = {
     description,
     inputSchema,
@@ -26249,7 +26850,7 @@ var PayloadTooLargeError = class extends Error {
 
 // src/eval/runner.ts
 import { execFile as execFile2 } from "node:child_process";
-import { createHash as createHash5 } from "node:crypto";
+import { createHash as createHash8 } from "node:crypto";
 import { mkdir as mkdir2, readFile as readFile5, rm as rm2, writeFile } from "node:fs/promises";
 import path12 from "node:path";
 import { promisify as promisify3 } from "node:util";
@@ -26311,7 +26912,7 @@ async function runEvaluation(configPath) {
   const outputDirectory = path12.resolve(base, config2.outputDirectory);
   const { stdout: startingShaOutput } = await execFileAsync2("git", ["rev-parse", "HEAD"], { cwd: repository, encoding: "utf8" });
   const startingSha = startingShaOutput.trim();
-  const promptHash = createHash5("sha256").update(prompt).digest("hex");
+  const promptHash = createHash8("sha256").update(prompt).digest("hex");
   const workspace = path12.join(outputDirectory, "worktrees");
   await rm2(outputDirectory, { recursive: true, force: true });
   await mkdir2(workspace, { recursive: true });
@@ -26459,6 +27060,7 @@ function escapeHtml(value) {
 }
 
 // src/entry.ts
+var VERSION = "0.2.1";
 var [command = "help", argument] = process.argv.slice(2);
 try {
   switch (command) {
@@ -26481,7 +27083,7 @@ try {
       await withService2(argument ?? process.cwd(), async (service) => service.store.snapshot());
       break;
     case "context":
-      await withService2(argument ?? process.cwd(), async (service) => ({ context: service.context() }));
+      await withService2(argument ?? process.cwd(), async (service) => service.contextEnvelope());
       break;
     case "index":
       await withService2(argument ?? process.cwd(), async (service) => indexRepository(service.store, service.git));
@@ -26503,10 +27105,13 @@ try {
       break;
     case "--version":
     case "version":
-      process.stdout.write("0.2.0\n");
+      process.stdout.write(`${VERSION}
+`);
       break;
     default:
-      process.stdout.write("Keep Coding v0.2.0\nUsage: keep-coding <mcp|mcp-http|hook|init|status|context|index|impact|detect|dashboard|pr-description|eval|version> [path]\n");
+      process.stdout.write(`Keep Coding v${VERSION}
+Usage: keep-coding <mcp|mcp-http|hook|init|status|context|index|impact|detect|dashboard|pr-description|eval|version> [path]
+`);
   }
 } catch (error2) {
   process.stderr.write(`${error2 instanceof Error ? error2.stack ?? error2.message : String(error2)}
