@@ -1,12 +1,6 @@
 name: Materialize verified v0.4
 
 on:
-  push:
-    branches:
-      - agent/semantic-parity-evidence-distribution
-    paths:
-      - .github/workflows/materialize-v040.yml
-      - .publish/v040-overlay-06.b64
   pull_request:
     branches:
       - main
@@ -23,7 +17,7 @@ concurrency:
 
 jobs:
   materialize:
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,16 +35,34 @@ jobs:
         run: |
           set -euo pipefail
           cat > /tmp/part-checksums <<'EOF'
-          aa73f319e2d0056d1215ae8b470412c654144abb4d3c03fcab266b46ecb5903c  .publish/v040-overlay-00.b64
+          aa4f4c5e7ec8c12c166130571dfe219bdc0bee1d08210e72b2202e74bccf9055  .publish/v040-overlay-00a.b64
+          9c3805613c31129b3ae6c26a32df385c3f4e3a59ab4624c727283fcc56b0a52c  .publish/v040-overlay-00b.b64
           b1b524cb45850aedd1daad1cf7fa2dc3ae2a6ee91bffcbb7e479fdfa932e1d1b  .publish/v040-overlay-01.b64
           25f80b9fb15516fdef691ca4cb032f1918d84f238592c505e116f5722029f041  .publish/v040-overlay-02.b64
           459bd03d3243e7d53437b5022d9f3e9d93484151f9a4a7303de1459d35615c50  .publish/v040-overlay-03.b64
-          1e3ca723df96b26c16754bff1fcba31661b610ab0c292839d5e7031036a962d4  .publish/v040-overlay-04.b64
-          f227ad1b65613c4a0e3b16714dcfb1e6efadb639d07422502d20f9eab329d95c  .publish/v040-overlay-05.b64
-          5f222f1b2167344a3918457284a5f664e69ad505fe2f1073c4ac5cc04550f673  .publish/v040-overlay-06.b64
+          d336dd85ab3a2350a55745b0e7bde5c640ff786537ea6278029bcd3b223f5891  .publish/v040-overlay-04a.b64
+          554283e6e7433ef2800ad008f229eaa05f77330a3d1e638071cebf7660afd151  .publish/v040-overlay-04b.b64
+          8cd3ed99e928224611e8abefded834bd8b33caa532e473ae6877fd7bbbc1577f  .publish/v040-tail-00.b64
+          902844b65e22b76429d31db426929141ca4aa15a668198457bfb6d34c827d5cb  .publish/v040-tail-01.b64
+          6c6f596f3dd6d118cc70ece475bdbff0efce765033e3f0dff9eefa04835ac438  .publish/v040-tail-rest-00.b64
+          047e65eb6bd2439d21ee68363d9ff4273fc0a8d1162cf6cc861c8017e493c83c  .publish/v040-tail-rest-01.b64
+          3ea7b083eb35c3f1f882e46e2d315cb270ca5e4c2b17d1f6f959654603920054  .publish/v040-tail-rest-02.b64
           EOF
           sha256sum --check /tmp/part-checksums
-          cat .publish/v040-overlay-{00..06}.b64 | base64 --decode > /tmp/v040-overlay.tar.xz
+          cat \
+            .publish/v040-overlay-00a.b64 \
+            .publish/v040-overlay-00b.b64 \
+            .publish/v040-overlay-01.b64 \
+            .publish/v040-overlay-02.b64 \
+            .publish/v040-overlay-03.b64 \
+            .publish/v040-overlay-04a.b64 \
+            .publish/v040-overlay-04b.b64 \
+            .publish/v040-tail-00.b64 \
+            .publish/v040-tail-01.b64 \
+            .publish/v040-tail-rest-00.b64 \
+            .publish/v040-tail-rest-01.b64 \
+            .publish/v040-tail-rest-02.b64 \
+            | base64 --decode > /tmp/v040-overlay.tar.xz
           echo 'ce48ff77d56c3daa029482298428f185c7f6ec0005bc815da5a8b76b3c2f77c2  /tmp/v040-overlay.tar.xz' | sha256sum --check
           tar -xJf /tmp/v040-overlay.tar.xz
 
