@@ -50,9 +50,14 @@ export async function handleHook(event: string, input: HookInput): Promise<HookO
       return { continue: true };
     }
 
+    const progressSequence = service.store.latestEventSequence();
+    if (event === "Stop" && input.stop_hook_active && progressSequence <= service.store.lastStopProgressSequence()) {
+      return { continue: true, systemMessage: "Keep Coding released the stop guard because no new durable progress was recorded." };
+    }
+
     const cursor = cursorKey(runtime, session, event);
     const lastDelivered = CONTEXT_EVENTS.has(event) ? service.store.getLastDeliveredSequence(cursor) : undefined;
-    if (lastDelivered !== undefined && service.store.latestEventSequence() <= lastDelivered) return { continue: true };
+    if (lastDelivered !== undefined && progressSequence <= lastDelivered) return { continue: true };
 
     const directive = await adapterById(runtime).translate({
       name: event,
@@ -62,11 +67,7 @@ export async function handleHook(event: string, input: HookInput): Promise<HookO
       ...(lastDelivered !== undefined ? { sinceSequence: lastDelivered } : {})
     }, service);
     if (event === "Stop" && !directive.continue) {
-      const sequence = service.store.latestEventSequence();
-      if (input.stop_hook_active && sequence <= service.store.lastStopProgressSequence()) {
-        return { continue: true, systemMessage: "Keep Coding released the stop guard because no new durable progress was recorded." };
-      }
-      service.store.setLastStopProgressSequence(sequence);
+      service.store.setLastStopProgressSequence(progressSequence);
       return {
         decision: "block",
         reason: `Keep Coding project is ${project.status}. Resume from durable state:\n\n${directive.blockReason ?? service.context(7_000)}`
