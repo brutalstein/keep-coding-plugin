@@ -42,6 +42,8 @@ npm run check
 
 `npm run check` runs lint, strict TypeScript, source coverage, production build, compiled-artifact smoke tests, the context payload benchmark, documentation/version checks, and plugin validation. The committed distributable is `plugins/keep-coding/dist/keep-coding.mjs`.
 
+Verified source suite: 51 tests across 16 files. The post-build artifact suite adds three compiled-binary scenarios, and the context benchmark runs separately.
+
 ## CLI
 
 ```bash
