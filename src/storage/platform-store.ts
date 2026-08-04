@@ -122,7 +122,11 @@ export class PlatformStore extends ProjectStore {
     const symbols = (this.platform.db.prepare("SELECT * FROM graph_nodes WHERE path = ? AND type = 'symbol' AND active = 1 ORDER BY CAST(json_extract(metadata_json,'$.line') AS INTEGER), label").all(normalized) as DbRow[])
       .map((row) => {
         const item = json<Record<string, unknown>>(row.metadata_json);
-        return { name: text(row.label), kind: String(item.kind ?? "symbol"), line: Number(item.line ?? 0) };
+        return {
+          name: text(row.label),
+          kind: typeof item.kind === "string" ? item.kind : "symbol",
+          line: typeof item.line === "number" ? item.line : 0
+        };
       });
     const imports = (this.platform.db.prepare("SELECT target_id FROM graph_edges WHERE source_id = ? AND type = 'imports' ORDER BY target_id").all(`file:${normalized}`) as DbRow[])
       .map((row) => text(row.target_id).replace(/^file:/, ""));
