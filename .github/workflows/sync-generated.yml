@@ -1,0 +1,41 @@
+name: Synchronize Generated Files
+
+on:
+  push:
+    branches:
+      - agent/critical-fixes-token-efficiency
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-generated-critical-fixes
+  cancel-in-progress: true
+
+jobs:
+  synchronize:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/critical-fixes-token-efficiency
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm install --package-lock-only --ignore-scripts
+      - run: npm ci
+      - run: npm run build
+      - name: Commit lockfile and bundle
+        run: |
+          if git diff --quiet -- package-lock.json plugins/keep-coding/dist/keep-coding.mjs plugins/keep-coding/dist/keep-coding.mjs.map; then
+            echo "Generated files are current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json plugins/keep-coding/dist/keep-coding.mjs plugins/keep-coding/dist/keep-coding.mjs.map
+          git commit -m "Synchronize 0.2.1 generated files"
+          git push origin HEAD:agent/critical-fixes-token-efficiency
