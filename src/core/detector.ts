@@ -1,9 +1,9 @@
 const PROJECT_SIGNALS: Array<{ pattern: RegExp; weight: number; reason: string }> = [
   { pattern: /\b(end[- ]to[- ]end|uçtan uca|full|complete|entire|whole|tüm|bütün)\b/iu, weight: 2, reason: "end-to-end scope" },
   { pattern: /\b(architecture|mimari|migration|refactor|production[- ]ready|github[- ]ready)\b/iu, weight: 2, reason: "architecture or production scope" },
-  { pattern: /\b(test|tests|testler|ci|deploy|integration|entegrasyon|documentation|dokümantasyon)\b/iu, weight: 1, reason: "delivery disciplines" },
+  { pattern: /\b(test|tests|testler|ci|deploy|deployment|integration|entegrasyon|documentation|dokümantasyon)\b/iu, weight: 1, reason: "delivery disciplines" },
   { pattern: /\b(phase|phases|faz|fazlar|multi[- ]agent|parallel|paralel)\b/iu, weight: 2, reason: "multi-phase execution" },
-  { pattern: /\b(build|create|implement|develop|kur|oluştur|geliştir|yap|ekle|tasarla)\b/iu, weight: 1, reason: "implementation action" }
+  { pattern: /\b(build|create|implement|develop|rewrite|kur|oluştur|geliştir|yap|ekle|tasarla)\b/iu, weight: 1, reason: "implementation action" }
 ];
 
 export interface DetectionOptions { force?: boolean; threshold?: number }
@@ -11,6 +11,7 @@ export interface DetectionSignal { reason: string; weight: number }
 export interface DetectionResult {
   activate: boolean;
   score: number;
+  /** Heuristic signal strength in [0,1], not a calibrated probability. */
   confidence: number;
   threshold: number;
   signals: DetectionSignal[];
@@ -37,10 +38,15 @@ export function detectLargeProject(prompt: string, options: DetectionOptions = {
   return {
     activate: manualOverride || score >= threshold,
     score,
-    confidence: manualOverride ? 1 : Math.min(0.99, score / (threshold + 3)),
+    confidence: manualOverride ? 1 : heuristicStrength(score, threshold),
     threshold,
     signals,
     reasons: signals.map((signal) => `${signal.reason} (+${signal.weight})`),
     manualOverride
   };
+}
+
+function heuristicStrength(score: number, threshold: number): number {
+  if (score >= threshold) return Math.min(0.99, 0.55 + (score - threshold) * 0.07);
+  return Math.max(0, Math.min(0.49, (score / Math.max(1, threshold)) * 0.49));
 }
