@@ -40,7 +40,7 @@ try {
     timeout: 15_000
   });
   assertProcess(hook, "production CLI hook");
-  const output = JSON.parse(hook.stdout) as { continue?: unknown };
+  const output = JSON.parse(hook.stdout);
   if (output.continue !== true) throw new Error("production hook did not continue gracefully outside Git");
 } finally {
   await rm(nonGit, { recursive: true, force: true });
