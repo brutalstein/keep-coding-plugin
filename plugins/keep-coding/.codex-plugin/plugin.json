@@ -1,24 +1,24 @@
 {
   "name": "keep-coding",
-  "version": "0.2.0",
-  "description": "Evidence-gated durable memory for long-running coding agents.",
+  "version": "0.2.1",
+  "description": "Evidence-gated, token-efficient durable memory for long-running coding agents.",
   "author": {
     "name": "Keep Coding contributors"
   },
   "license": "MIT",
-  "keywords": ["codex", "agents", "project-memory", "verification", "mcp", "semantic-impact"],
+  "keywords": ["codex", "agents", "project-memory", "verification", "mcp", "semantic-impact", "token-efficiency"],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "Keep Coding",
-    "shortDescription": "Keep large agent projects coherent and verified.",
-    "longDescription": "Turns large project prompts into adaptive durable contracts, dependency-aware phases, semantic impact analysis, evidence-backed checkpoints, approvals, budgets, and resumable cross-runtime context.",
+    "shortDescription": "Keep large agent projects coherent, efficient, and verified.",
+    "longDescription": "Turns large project prompts into adaptive durable contracts, dependency-aware phases, semantic impact analysis, evidence-backed checkpoints, approvals, budgets, delta context delivery, and resumable cross-runtime state.",
     "developerName": "Keep Coding contributors",
     "category": "Productivity",
     "capabilities": ["Interactive", "Write"],
     "defaultPrompt": [
       "Build this project end to end and keep every phase verified.",
-      "Continue the active project from its latest checkpoint."
+      "Continue the active project from its latest checkpoint without retransmitting unchanged context."
     ]
   }
 }
