@@ -1,0 +1,42 @@
+name: Synchronize Final Bundle
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-final-bundle-critical-fixes
+  cancel-in-progress: true
+
+jobs:
+  synchronize:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref == 'agent/critical-fixes-token-efficiency' &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Commit final bundle when changed
+        run: |
+          if git diff --quiet -- plugins/keep-coding/dist/keep-coding.mjs; then
+            echo "Committed production bundle is current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugins/keep-coding/dist/keep-coding.mjs
+          git commit -m "Synchronize final 0.2.1 bundle"
+          git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
