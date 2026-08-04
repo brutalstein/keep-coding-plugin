@@ -21,15 +21,14 @@ export interface ContextCompileOptions {
 }
 
 export function compileContext(store: ContextStore, maxChars = DEFAULT_MAX_CHARS): string {
-  return compileContextEnvelope(store, { maxChars }).context ?? "";
+  const envelope = compileContextEnvelope(store, { maxChars });
+  return envelope.unchanged ? "" : envelope.context;
 }
 
 export function compileContextEnvelope(store: ContextStore, options: ContextCompileOptions = {}): ContextEnvelope {
   const sequence = store.latestEventSequence();
   const since = options.sinceSequence;
-  if (since !== undefined && since >= sequence) {
-    return { unchanged: true, sequence, changedSections: [], unchangedSections: ALL_SECTIONS, estimatedTokens: 0 };
-  }
+  if (since !== undefined && since >= sequence) return { unchanged: true, sequence };
 
   const snapshot = store.snapshot();
   const active = snapshot.project.currentPhaseId
