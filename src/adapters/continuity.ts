@@ -14,7 +14,7 @@ export class CodexContinuityAdapter implements ContinuityAdapter {
   readonly id = "codex";
   async translate(event: RuntimeEvent, service: KeepCodingService | null): Promise<RuntimeDirective> {
     if (!service) return { continue: true };
-    if (["SessionStart", "PostCompact", "UserPromptSubmit"].includes(event.name)) return contextDirective(service, event.sinceSequence);
+    if (["SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact"].includes(event.name)) return contextDirective(service, event.sinceSequence);
     if (event.name === "Stop") {
       const project = service.store.getProject();
       if (!project || ["COMPLETED", "BLOCKED", "BLOCKED_BUDGET"].includes(project.status)) return { continue: true };
