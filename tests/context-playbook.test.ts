@@ -21,7 +21,10 @@ describe("playbook context projection", () => {
         resolution: [`resolution ${index}`], applicabilityScope: ["src/auth/**"], score: 1 - index / 10,
         successCount: 5 - index, sourceProjects: ["project"]
       }));
-      const context = compileContextEnvelope(store, { playbook: patterns }).context ?? "";
+      const envelope = compileContextEnvelope(store, { playbook: patterns });
+      expect(envelope.unchanged).toBe(false);
+      if (envelope.unchanged) throw new Error("expected playbook context");
+      const context = envelope.context;
       expect(context).toContain("Auth pattern 0");
       expect(context).toContain("Auth pattern 2");
       expect(context).not.toContain("Auth pattern 3");
