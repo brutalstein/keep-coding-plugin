@@ -1,4 +1,4 @@
-import ts from "typescript";
+import type * as TypeScript from "typescript";
 
 export interface ParsedSymbol {
   name: string;
@@ -20,14 +20,24 @@ export interface ParsedFile {
 }
 
 const SCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+let typescriptPromise: Promise<typeof TypeScript> | null = null;
 
-export function parseSemanticFile(content: string, extension: string): ParsedFile {
+export async function parseSemanticFile(content: string, extension: string): Promise<ParsedFile> {
   if (SCRIPT_EXTENSIONS.has(extension)) return parseTypeScript(content, extension);
   if (extension === ".py") return parsePython(content);
   return parseCStyle(content);
 }
 
-function parseTypeScript(content: string, extension: string): ParsedFile {
+async function loadTypeScript(): Promise<typeof TypeScript> {
+  typescriptPromise ??= import("typescript").then((loaded) => {
+    const compatible = loaded as typeof loaded & { default?: typeof TypeScript };
+    return compatible.default ?? compatible;
+  });
+  return typescriptPromise;
+}
+
+async function parseTypeScript(content: string, extension: string): Promise<ParsedFile> {
+  const ts = await loadTypeScript();
   const kind = extension === ".tsx" || extension === ".jsx" ? ts.ScriptKind.TSX
     : extension === ".js" || extension === ".mjs" || extension === ".cjs" ? ts.ScriptKind.JS
       : ts.ScriptKind.TS;
@@ -37,14 +47,14 @@ function parseTypeScript(content: string, extension: string): ParsedFile {
   const references: ParsedReference[] = [];
   const scope: string[] = [];
 
-  const line = (node: ts.Node): number => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
-  const nameOf = (node: ts.Node): string | null => {
+  const line = (node: TypeScript.Node): number => source.getLineAndCharacterOfPosition(node.getStart(source)).line + 1;
+  const nameOf = (node: TypeScript.Node): string | null => {
     if (ts.isIdentifier(node)) return node.text;
     if (ts.isStringLiteral(node) || ts.isNumericLiteral(node)) return node.text;
     return null;
   };
 
-  const visit = (node: ts.Node): void => {
+  const visit = (node: TypeScript.Node): void => {
     let pushed = false;
     if (ts.isClassDeclaration(node) && node.name) {
       symbols.push({ name: node.name.text, kind: "class", line: line(node) });
@@ -85,7 +95,7 @@ function parseTypeScript(content: string, extension: string): ParsedFile {
       if (target === "require" && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) imports.add(node.arguments[0].text);
       if (expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) imports.add(node.arguments[0].text);
     }
-    if (ts.isIdentifier(node) && isReferenceIdentifier(node)) references.push({ from: scope.at(-1) ?? null, target: node.text, kind: "references", line: line(node) });
+    if (ts.isIdentifier(node) && isReferenceIdentifier(ts, node)) references.push({ from: scope.at(-1) ?? null, target: node.text, kind: "references", line: line(node) });
     ts.forEachChild(node, visit);
     if (pushed) scope.pop();
   };
@@ -93,14 +103,14 @@ function parseTypeScript(content: string, extension: string): ParsedFile {
   return { symbols: dedupeSymbols(symbols), imports: [...imports], references: dedupeReferences(references) };
 }
 
-function isReferenceIdentifier(node: ts.Identifier): boolean {
+function isReferenceIdentifier(ts: typeof TypeScript, node: TypeScript.Identifier): boolean {
   const parent = node.parent;
   if (!parent) return false;
-  if ((isDeclarationIdentifier(node) || ts.isPropertyAccessExpression(parent) && parent.name === node) || ts.isImportSpecifier(parent)) return false;
+  if ((isDeclarationIdentifier(ts, node) || ts.isPropertyAccessExpression(parent) && parent.name === node) || ts.isImportSpecifier(parent)) return false;
   return !ts.isPropertyAssignment(parent) || parent.initializer === node;
 }
 
-function isDeclarationIdentifier(node: ts.Identifier): boolean {
+function isDeclarationIdentifier(ts: typeof TypeScript, node: TypeScript.Identifier): boolean {
   const parent = node.parent;
   return Boolean(parent && (
     (ts.isVariableDeclaration(parent) && parent.name === node) ||
