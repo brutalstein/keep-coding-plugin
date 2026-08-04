@@ -12,6 +12,7 @@ import { CriticRunner } from "./critic.js";
 const execAsync = promisify(exec);
 const MAX_OUTPUT = 8_000;
 const ERROR_MARKER = /\b(?:error|fail(?:ed|ure)?|exception|fatal|panic|assertion)\b/iu;
+const ANSI_ESCAPE_PATTERN = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "gu");
 
 export interface VerificationOptions {
   baseline?: Record<string, string>;
@@ -120,7 +121,7 @@ export function compressCommandOutput(value: string, previous: PreviousOutput | 
 }
 
 export function stripCommandNoise(value: string): string {
-  const lines = value.replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").replaceAll("\r\n", "\n").split("\n");
+  const lines = value.replace(ANSI_ESCAPE_PATTERN, "").replaceAll("\r\n", "\n").split("\n");
   const filtered: string[] = [];
   for (const line of lines) {
     if (/^\s*at\s+(?:node:internal|internal\/)/u.test(line)) continue;
