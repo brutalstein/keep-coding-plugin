@@ -1,20 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { FailureRecord, PhaseDefinition } from "../domain/model.js";
+import type { FailureRecord, PhaseDefinition, PlaybookPattern } from "../domain/model.js";
 
 type Row = Record<string, unknown>;
-
-export interface PlaybookSuggestion {
-  id: string;
-  title: string;
-  score: number;
-  phase: PhaseDefinition;
-  sourceProject: string;
-  successCount: number;
-}
 
 export class PlaybookStore {
   private readonly db: DatabaseSync;
@@ -28,27 +19,49 @@ export class PlaybookStore {
         id TEXT PRIMARY KEY, title TEXT NOT NULL, keywords_json TEXT NOT NULL, phase_json TEXT NOT NULL,
         source_project TEXT NOT NULL, success_count INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS playbook_patterns (
+        id TEXT PRIMARY KEY, signature TEXT NOT NULL UNIQUE, pattern TEXT NOT NULL,
+        trigger_conditions_json TEXT NOT NULL, resolution_json TEXT NOT NULL,
+        applicability_scope_json TEXT NOT NULL, source_projects_json TEXT NOT NULL,
+        success_count INTEGER NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS failure_patterns (
         fingerprint TEXT PRIMARY KEY, summary TEXT NOT NULL, resolution TEXT, occurrences INTEGER NOT NULL,
         source_project TEXT NOT NULL, updated_at TEXT NOT NULL
       );
     `);
+    this.migrateLegacyTemplates();
   }
 
   close(): void { this.db.close(); }
 
-  rememberPhase(sourceProject: string, phase: PhaseDefinition, keywords: string[]): PlaybookSuggestion {
-    const normalizedKeywords = normalizeKeywords([phase.title, phase.goal, ...keywords].join(" "));
-    const row = this.db.prepare("SELECT * FROM phase_templates WHERE source_project = ? AND title = ?").get(sourceProject, phase.title) as Row | undefined;
+  rememberPhase(sourceProject: string, phase: PhaseDefinition, keywords: string[]): PlaybookPattern {
+    const tuple = compactPhase(phase, keywords);
+    const signature = patternSignature(tuple.pattern, tuple.triggerConditions, tuple.resolution, tuple.applicabilityScope);
+    const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature) as Row | undefined;
     const now = new Date().toISOString();
-    const id = row ? String(row.id) : randomUUID();
+    const id = existing ? String(existing.id) : signature;
+    const sources = existing
+      ? [...new Set([...jsonArray(existing.source_projects_json), sourceProject])]
+      : [sourceProject];
     this.db.prepare(`
-      INSERT INTO phase_templates (id, title, keywords_json, phase_json, source_project, success_count, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 1, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET keywords_json = excluded.keywords_json, phase_json = excluded.phase_json,
-        success_count = phase_templates.success_count + 1, updated_at = excluded.updated_at
-    `).run(id, phase.title, JSON.stringify(normalizedKeywords), JSON.stringify(phase), sourceProject, now, now);
-    return mustSuggestion(this.db.prepare("SELECT * FROM phase_templates WHERE id = ?").get(id), 1);
+      INSERT INTO playbook_patterns (
+        id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
+        source_projects_json, success_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(signature) DO UPDATE SET
+        pattern = excluded.pattern,
+        trigger_conditions_json = excluded.trigger_conditions_json,
+        resolution_json = excluded.resolution_json,
+        applicability_scope_json = excluded.applicability_scope_json,
+        source_projects_json = excluded.source_projects_json,
+        success_count = playbook_patterns.success_count + 1,
+        updated_at = excluded.updated_at
+    `).run(
+      id, signature, tuple.pattern, JSON.stringify(tuple.triggerConditions), JSON.stringify(tuple.resolution),
+      JSON.stringify(tuple.applicabilityScope), JSON.stringify(sources), now, now
+    );
+    return patternFromRow(required(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature) as Row | undefined), 1);
   }
 
   rememberFailure(sourceProject: string, failure: FailureRecord): void {
@@ -58,33 +71,86 @@ export class PlaybookStore {
       ON CONFLICT(fingerprint) DO UPDATE SET summary = excluded.summary,
         resolution = COALESCE(excluded.resolution, failure_patterns.resolution),
         occurrences = failure_patterns.occurrences + excluded.occurrences,
+        source_project = CASE
+          WHEN instr(failure_patterns.source_project, excluded.source_project) > 0 THEN failure_patterns.source_project
+          ELSE failure_patterns.source_project || ',' || excluded.source_project
+        END,
         updated_at = excluded.updated_at
     `).run(failure.fingerprint, failure.summary, failure.resolution, failure.count, sourceProject, new Date().toISOString());
   }
 
-  suggest(query: string, limit = 8): PlaybookSuggestion[] {
+  suggest(query: string, limit = 8): PlaybookPattern[] {
     const terms = normalizeKeywords(query);
-    const rows = this.db.prepare("SELECT * FROM phase_templates ORDER BY success_count DESC, updated_at DESC LIMIT 200").all() as Row[];
+    const rows = this.db.prepare("SELECT * FROM playbook_patterns ORDER BY success_count DESC, updated_at DESC LIMIT 300").all() as Row[];
     return rows.map((row) => {
-      const keywords = JSON.parse(String(row.keywords_json)) as string[];
-      const overlap = terms.filter((term) => keywords.includes(term)).length;
+      const triggers = jsonArray(row.trigger_conditions_json);
+      const patternTerms = normalizeKeywords(String(row.pattern));
+      const searchable = new Set([...triggers, ...patternTerms]);
+      const overlap = terms.filter((term) => searchable.has(term)).length;
       const score = terms.length === 0 ? 0 : overlap / terms.length + Math.min(0.25, Number(row.success_count) / 100);
-      return mustSuggestion(row, score);
-    }).filter((suggestion) => suggestion.score > 0).sort((left, right) => right.score - left.score).slice(0, limit);
+      return patternFromRow(row, score);
+    }).filter((suggestion) => suggestion.score > 0)
+      .sort((left, right) => right.score - left.score || right.successCount - left.successCount)
+      .slice(0, Math.max(1, Math.min(limit, 20)));
+  }
+
+  private migrateLegacyTemplates(): void {
+    const legacy = this.db.prepare("SELECT * FROM phase_templates").all() as Row[];
+    for (const row of legacy) {
+      const phase = JSON.parse(String(row.phase_json)) as PhaseDefinition;
+      const tuple = compactPhase(phase, jsonArray(row.keywords_json));
+      const signature = patternSignature(tuple.pattern, tuple.triggerConditions, tuple.resolution, tuple.applicabilityScope);
+      const now = String(row.updated_at);
+      this.db.prepare(`
+        INSERT OR IGNORE INTO playbook_patterns (
+          id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
+          source_projects_json, success_count, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        signature, signature, tuple.pattern, JSON.stringify(tuple.triggerConditions), JSON.stringify(tuple.resolution),
+        JSON.stringify(tuple.applicabilityScope), JSON.stringify([String(row.source_project)]),
+        Number(row.success_count), String(row.created_at), now
+      );
+    }
   }
 }
 
-function mustSuggestion(row: Row | undefined, score: number): PlaybookSuggestion {
-  if (!row) throw new Error("playbook write failed");
+function compactPhase(phase: PhaseDefinition, keywords: string[]): Omit<PlaybookPattern, "id" | "score" | "successCount" | "sourceProjects"> {
   return {
-    id: String(row.id), title: String(row.title), score,
-    phase: JSON.parse(String(row.phase_json)) as PhaseDefinition,
-    sourceProject: String(row.source_project), successCount: Number(row.success_count)
+    pattern: phase.title.trim(),
+    triggerConditions: normalizeKeywords([phase.title, phase.goal, ...keywords].join(" ")),
+    resolution: [phase.goal.trim(), ...phase.acceptanceCommands.map((command) => command.trim())].filter(Boolean).slice(0, 6),
+    applicabilityScope: [...new Set(phase.allowedScope.map((scope) => scope.trim()).filter(Boolean))].slice(0, 12)
   };
 }
 
-function normalizeKeywords(value: string): string[] {
+function patternFromRow(row: Row, score: number): PlaybookPattern {
+  return {
+    id: String(row.id), pattern: String(row.pattern), score,
+    triggerConditions: jsonArray(row.trigger_conditions_json),
+    resolution: jsonArray(row.resolution_json),
+    applicabilityScope: jsonArray(row.applicability_scope_json),
+    sourceProjects: jsonArray(row.source_projects_json),
+    successCount: Number(row.success_count)
+  };
+}
+
+function patternSignature(pattern: string, triggers: string[], resolution: string[], scope: string[]): string {
+  const canonical = JSON.stringify({
+    pattern: pattern.toLowerCase().replace(/\s+/g, " ").trim(),
+    triggers: [...triggers].sort(), resolution: resolution.map(normalizeText), scope: [...scope].sort()
+  });
+  return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
+}
+function normalizeText(value: string): string {
+  return value.toLowerCase().replace(/(?:[a-z]:\\|\/)(?:[^\s]+[\\/])+[^\s]+/giu, "<path>")
+    .replace(/\b\d+\b/gu, "<n>").replace(/\s+/gu, " ").trim();
+}
+function normalizeKeywords(value: string | string[]): string[] {
+  const source = Array.isArray(value) ? value.join(" ") : value;
   const stop = new Set(["the", "and", "for", "with", "from", "this", "that", "phase", "build", "create", "bir", "ve", "ile", "için", "faz"]);
-  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])]
+  return [...new Set(source.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])]
     .filter((term) => !stop.has(term)).slice(0, 40);
 }
+function jsonArray(value: unknown): string[] { return JSON.parse(String(value)) as string[]; }
+function required<T>(value: T | null | undefined): T { if (value === null || value === undefined) throw new Error("playbook write failed"); return value; }
