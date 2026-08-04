@@ -21,7 +21,7 @@ export interface DetectionResult {
 
 export function detectLargeProject(prompt: string, options: DetectionOptions = {}): DetectionResult {
   const normalized = prompt.replace(/\s+/g, " ").trim();
-  const threshold = options.threshold ?? 5;
+  const threshold = options.threshold ?? 4;
   const signals: DetectionSignal[] = [];
   if (normalized.length >= 700) signals.push({ reason: "long specification", weight: 3 });
   else if (normalized.length >= 300) signals.push({ reason: "substantial specification", weight: 2 });
