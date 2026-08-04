@@ -53,8 +53,8 @@ describe("context compiler", () => {
         });
       }
       const context = compileContext(store, 12_000);
-      const graph = context.split("## Semantic graph — Tier 0")[1] ?? "";
-      expect(graph.split("\n").slice(0, 4)).toHaveLength(4);
+      const graphBody = (context.split("## Semantic graph — Tier 0")[1] ?? "").split("\n\n")[0] ?? "";
+      expect(graphBody.trim().split("\n")).toHaveLength(2);
       expect(context).not.toContain("server499");
       expect(context).toContain("Use `expand_graph`");
     } finally { store.close(); }
