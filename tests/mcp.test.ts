@@ -15,9 +15,11 @@ describe("MCP protocol", () => {
     await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name)).toEqual([
-      "initialize_project", "save_plan", "get_context", "start_phase", "list_files", "read_file",
-      "search_code", "get_diff", "apply_patch", "record_decision", "record_failure", "checkpoint_phase",
-      "get_status", "complete_project"
+      "initialize_project", "save_plan", "amend_plan", "get_context", "get_impact", "start_phase",
+      "prepare_parallel_phases", "checkpoint_parallel_phase", "request_approval", "resolve_approval",
+      "record_budget_usage", "restore_phase_baseline", "suggest_phases", "remember_phase_template",
+      "list_files", "read_file", "search_code", "get_diff", "apply_patch", "record_decision",
+      "record_failure", "checkpoint_phase", "get_status", "complete_project"
     ]);
     await client.close();
     await server.close();

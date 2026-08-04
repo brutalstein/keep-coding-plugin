@@ -1,105 +1,46 @@
-const LARGE_PROJECT_TERMS = [
-  "end-to-end",
-  "end to end",
-  "uçtan uca",
-  "full project",
-  "complete project",
-  "entire project",
-  "whole project",
-  "koca proje",
-  "tüm proje",
-  "bütün proje",
-  "architecture",
-  "mimari",
-  "migration",
-  "migrate",
-  "refactor",
-  "production-ready",
-  "production ready",
-  "github-ready",
-  "githuba atmalık",
-  "phases",
-  "fazlar",
-  "modular",
-  "modüler",
-  "tests",
-  "testler",
-  "deploy",
-  "integration",
-  "entegrasyon"
+const PROJECT_SIGNALS: Array<{ pattern: RegExp; weight: number; reason: string }> = [
+  { pattern: /\b(end[- ]to[- ]end|uçtan uca|full|complete|entire|whole|tüm|bütün)\b/iu, weight: 2, reason: "end-to-end scope" },
+  { pattern: /\b(architecture|mimari|migration|refactor|production[- ]ready|github[- ]ready)\b/iu, weight: 2, reason: "architecture or production scope" },
+  { pattern: /\b(test|tests|testler|ci|deploy|integration|entegrasyon|documentation|dokümantasyon)\b/iu, weight: 1, reason: "delivery disciplines" },
+  { pattern: /\b(phase|phases|faz|fazlar|multi[- ]agent|parallel|paralel)\b/iu, weight: 2, reason: "multi-phase execution" },
+  { pattern: /\b(build|create|implement|develop|kur|oluştur|geliştir|yap|ekle|tasarla)\b/iu, weight: 1, reason: "implementation action" }
 ];
 
-const IMPLEMENTATION_TERMS = [
-  "build",
-  "create",
-  "implement",
-  "develop",
-  "kur",
-  "oluştur",
-  "geliştir",
-  "yap",
-  "ekle",
-  "tasarla"
-];
-
+export interface DetectionOptions { force?: boolean; threshold?: number }
+export interface DetectionSignal { reason: string; weight: number }
 export interface DetectionResult {
   activate: boolean;
   score: number;
+  confidence: number;
+  threshold: number;
+  signals: DetectionSignal[];
   reasons: string[];
+  manualOverride: boolean;
 }
 
-export function detectLargeProject(prompt: string): DetectionResult {
-  const normalized = prompt.toLocaleLowerCase("tr-TR").replace(/\s+/g, " ").trim();
-  const words = normalized.length === 0 ? [] : normalized.split(" ");
-  const reasons: string[] = [];
-  let score = 0;
-
-  if (normalized.length >= 700) {
-    score += 3;
-    reasons.push("long specification");
-  } else if (normalized.length >= 300) {
-    score += 2;
-    reasons.push("substantial specification");
-  } else if (normalized.length >= 160) {
-    score += 1;
-    reasons.push("multi-sentence request");
-  }
-
-  if (words.length >= 120) {
-    score += 2;
-    reasons.push("many requirements");
-  } else if (words.length >= 60) {
-    score += 1;
-    reasons.push("several requirements");
-  }
-
-  const projectTerms = LARGE_PROJECT_TERMS.filter((term) => normalized.includes(term));
-  if (projectTerms.length >= 3) {
-    score += 3;
-    reasons.push("multiple project-scale signals");
-  } else if (projectTerms.length >= 1) {
-    score += 2;
-    reasons.push(`project signal: ${projectTerms[0]}`);
-  }
-
-  const actionCount = IMPLEMENTATION_TERMS.filter((term) => new RegExp(`(^|[^\\p{L}])${escapeRegExp(term)}([^\\p{L}]|$)`, "u").test(normalized)).length;
-  if (actionCount >= 2) {
-    score += 1;
-    reasons.push("multiple implementation actions");
-  }
-
+export function detectLargeProject(prompt: string, options: DetectionOptions = {}): DetectionResult {
+  const normalized = prompt.replace(/\s+/g, " ").trim();
+  const threshold = options.threshold ?? 5;
+  const signals: DetectionSignal[] = [];
+  if (normalized.length >= 700) signals.push({ reason: "long specification", weight: 3 });
+  else if (normalized.length >= 300) signals.push({ reason: "substantial specification", weight: 2 });
+  else if (normalized.length >= 160) signals.push({ reason: "multi-sentence request", weight: 1 });
+  const wordCount = normalized === "" ? 0 : normalized.split(" ").length;
+  if (wordCount >= 120) signals.push({ reason: "many requirements", weight: 2 });
+  else if (wordCount >= 60) signals.push({ reason: "several requirements", weight: 1 });
+  for (const signal of PROJECT_SIGNALS) if (signal.pattern.test(normalized)) signals.push({ reason: signal.reason, weight: signal.weight });
   const listItems = (prompt.match(/(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/g) ?? []).length;
-  if (listItems >= 5) {
-    score += 2;
-    reasons.push("large deliverable list");
-  } else if (listItems >= 2) {
-    score += 1;
-    reasons.push("deliverable list");
-  }
-
-  return { activate: score >= 4, score, reasons };
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (listItems >= 5) signals.push({ reason: "large deliverable list", weight: 2 });
+  else if (listItems >= 2) signals.push({ reason: "deliverable list", weight: 1 });
+  const score = signals.reduce((total, signal) => total + signal.weight, 0);
+  const manualOverride = options.force === true;
+  return {
+    activate: manualOverride || score >= threshold,
+    score,
+    confidence: manualOverride ? 1 : Math.min(0.99, score / (threshold + 3)),
+    threshold,
+    signals,
+    reasons: signals.map((signal) => `${signal.reason} (+${signal.weight})`),
+    manualOverride
+  };
 }

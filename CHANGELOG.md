@@ -1,17 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 — 2026-08-04
 
-- Added an opt-in Streamable HTTP MCP transport for custom ChatGPT apps.
-- Added canonical allowed-root, Host, request-size, bearer, and exact acceptance-command policies for remote deployments.
-- Added bounded remote repository tools for file listing, text reads, code search, Git diff inspection, and phase-scoped unified patches.
-- Added ChatGPT deployment documentation, security guidance, and HTTP/workspace tests.
+- Added versioned adaptive replanning and auditable phase supersession.
+- Added Git-native checkpoint commits, scoped restore, and parallel worktree orchestration.
+- Added parser-backed semantic impact analysis, selective tests, and impact-triggered reverification.
+- Added budget enforcement, human approvals, optional independent critic review, and opt-in playbook memory.
+- Added a loopback dashboard, runtime adapters, GitHub CI and PR generation, and expanded tests.
+- Preserved bounded remote ChatGPT workspace tools, exact command policies, always-on secret scanning, and migration compatibility with v0.1 state databases.
 
 ## 0.1.0 — 2026-08-02
 
 - First GitHub-ready product version.
-- Added the Keep Coding skill, Codex lifecycle hooks, and local MCP server.
-- Added durable SQLite state, phase DAG validation, failure memory, and code graph indexing.
-- Added scope- and command-gated checkpoints with bounded output and timeouts.
-- Added paired A/B worktree runner with Wilson intervals and exact McNemar statistics.
-- Added strict TypeScript, linting, coverage gates, protocol tests, documentation, and CI.
+- Added the Keep Coding skill, Codex lifecycle hooks, local and bounded HTTP MCP servers.
+- Added durable SQLite state, phase DAG validation, failure memory, code graph indexing, and paired evaluation.

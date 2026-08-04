@@ -2,57 +2,92 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { ProjectStore } from "../src/storage/store.js";
+import { PlatformStore } from "../src/storage/platform-store.js";
 import type { VerificationEvidence } from "../src/domain/model.js";
 
 const roots: string[] = [];
-afterEach(() => { while (roots.length) rmSync(roots.pop()!, { recursive: true, force: true }); });
+afterEach(() => { while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true }); });
 
-function store(): ProjectStore {
+function subject(): PlatformStore {
   const root = mkdtempSync(path.join(tmpdir(), "keep-coding-store-"));
   roots.push(root);
-  return new ProjectStore(root);
+  return new PlatformStore(root);
 }
 
-const contract = { goal: "Deliver a verified application", nonGoals: [], constraints: [], deliverables: ["application"], invariants: ["tests pass"], doneWhen: ["npm test passes"] };
+const contract = {
+  goal: "Deliver a verified application", nonGoals: [], constraints: [], deliverables: ["application"],
+  invariants: ["tests pass"], doneWhen: ["npm test passes"], budget: { maxTokens: 100 }, playbookOptIn: false
+};
 const phases = [
-  { id: "foundation", title: "Foundation", goal: "Create foundation", dependencies: [], allowedScope: ["src/**"], acceptanceCommands: ["npm test"], maxAttempts: 2 },
-  { id: "feature", title: "Feature", goal: "Build feature", dependencies: ["foundation"], allowedScope: ["src/**"], acceptanceCommands: ["npm test"], maxAttempts: 2 }
+  { id: "foundation", title: "Foundation", goal: "Create foundation", dependencies: [], allowedScope: ["src/**"], acceptanceCommands: ["npm test"], maxAttempts: 2, parallelSafe: true },
+  { id: "feature", title: "Feature", goal: "Build feature", dependencies: ["foundation"], allowedScope: ["docs/**"], acceptanceCommands: ["npm test"], maxAttempts: 2 }
 ];
 
+function evidence(passed = true): VerificationEvidence {
+  return {
+    passed, scopePassed: passed, scopeViolations: passed ? [] : ["README.md"],
+    changedFiles: passed ? ["src/a.ts"] : ["README.md"],
+    secretScan: { passed, scannedFiles: [], findings: [] },
+    budget: { passed, limits: {}, usage: { tokens: 0, costUsd: 0, wallClockMs: 0, updatedAt: "now" }, violations: passed ? [] : ["budget"] },
+    selectiveCommands: [], commands: passed ? [{ command: "npm test", exitCode: 0, passed: true, durationMs: 1, stdout: "", stderr: "", timedOut: false }] : [],
+    critic: { configured: false, blocking: false, passed: true, summary: "advisory", findings: [], rawOutput: "" },
+    impactedCompletedPhases: [], diffHash: "hash", gitSha: "abc"
+  };
+}
+
 describe("project state machine", () => {
-  it("unlocks dependent phases only after passing evidence", () => {
-    const subject = store();
-    subject.initialize("Build everything");
-    subject.savePlan(contract, phases);
-    expect(subject.getPhase("feature")?.status).toBe("PENDING");
-    subject.startPhase("foundation", "abc");
-    subject.markVerifying("foundation");
-    const evidence: VerificationEvidence = { passed: true, scopePassed: true, scopeViolations: [], changedFiles: ["src/a.ts"], commands: [{ command: "npm test", exitCode: 0, passed: true, durationMs: 1, stdout: "", stderr: "", timedOut: false }], diffHash: "hash", gitSha: "abc" };
-    subject.finishVerification("foundation", "done", evidence);
-    expect(subject.getPhase("foundation")?.status).toBe("COMPLETED");
-    expect(subject.getPhase("feature")?.status).toBe("READY");
-    subject.close();
+  it("preserves evidence across amendments and approvals", () => {
+    const store = subject();
+    store.initialize("Build everything");
+    store.savePlan(contract, phases);
+    store.startPhase("foundation", "abc");
+    store.markVerifying("foundation");
+    store.finishVerification("foundation", "done", evidence());
+    expect(store.getPhase("feature")?.status).toBe("READY");
+    const amended = store.amendPlan({
+      reason: "A discovered deployment requirement needs a final approval phase",
+      addPhases: [{ id: "approval", title: "Approval", goal: "Approve release", dependencies: ["feature"], allowedScope: ["docs/**"], acceptanceCommands: ["npm test"], maxAttempts: 1, requiresApproval: true }],
+      supersedePhaseIds: []
+    });
+    expect(amended.project.planVersion).toBe(2);
+    expect(amended.checkpoints).toHaveLength(1);
+    store.startPhase("feature", "abc");
+    store.markVerifying("feature");
+    store.finishVerification("feature", "done", { ...evidence(), changedFiles: ["docs/a.md"] });
+    expect(() => store.startPhase("approval", "abc")).toThrow(/awaiting human approval/);
+    const pending = store.listApprovals()[0]!;
+    store.resolveApproval(pending.id, true, "approved");
+    expect(store.startPhase("approval", "abc").status).toBe("IN_PROGRESS");
+    store.close();
   });
 
-  it("blocks a phase after its attempt budget", () => {
-    const subject = store();
-    subject.initialize("Build everything");
-    subject.savePlan(contract, [{ ...phases[0]!, maxAttempts: 1 }]);
-    subject.startPhase("foundation", "abc");
-    subject.markVerifying("foundation");
-    subject.finishVerification("foundation", "failed", { passed: false, scopePassed: false, scopeViolations: ["README.md"], changedFiles: ["README.md"], commands: [], diffHash: "hash", gitSha: "abc" });
-    expect(subject.getProject()?.status).toBe("BLOCKED");
-    expect(subject.getPhase("foundation")?.status).toBe("BLOCKED");
-    subject.close();
+  it("enforces budgets, reverification, impact and worktree records", () => {
+    const store = subject();
+    const project = store.initialize("Build everything");
+    store.savePlan(contract, [phases[0]!]);
+    store.recordBudgetUsage("project", project.id, { tokens: 101 });
+    expect(store.budgetEvidence("foundation").passed).toBe(false);
+    store.startPhase("foundation", "abc");
+    store.markVerifying("foundation");
+    store.finishVerification("foundation", "done", evidence());
+    expect(store.markReverification(["foundation"], "later change", "other")).toEqual(["foundation"]);
+    store.setWorktree({ phaseId: "foundation", path: "/tmp/w", branch: "b", status: "prepared", baseSha: "abc", createdAt: "now" });
+    expect(store.getWorktree("foundation")?.branch).toBe("b");
+    store.upsertGraphNode({ id: "file:src/a.ts", type: "file", label: "a.ts", path: "src/a.ts", symbol: null, contentHash: "x", metadata: {} });
+    expect(store.impact("src/a.ts")[0]?.node.path).toBe("src/a.ts");
+    store.close();
   });
 
-  it("rejects cycles and no-op checks", () => {
-    const subject = store();
-    subject.initialize("Build everything");
-    expect(() => subject.savePlan(contract, [{ ...phases[0]!, acceptanceCommands: ["true"] }])).toThrow(/no-op/);
-    expect(() => subject.savePlan(contract, [{ ...phases[0]!, dependencies: ["feature"] }, { ...phases[1]!, dependencies: ["foundation"] }])).toThrow(/cycle/);
-    subject.close();
+  it("rejects cycles and blocks budget failures", () => {
+    const store = subject();
+    store.initialize("Build");
+    expect(() => store.savePlan(contract, [{ ...phases[0]!, acceptanceCommands: ["true"] }])).toThrow(/no-op/);
+    expect(() => store.savePlan(contract, [{ ...phases[0]!, dependencies: ["feature"] }, { ...phases[1]!, dependencies: ["foundation"] }])).toThrow(/cycle/);
+    store.savePlan(contract, [{ ...phases[0]!, maxAttempts: 1 }]);
+    store.startPhase("foundation", "abc");
+    store.markVerifying("foundation");
+    store.finishVerification("foundation", "failed", evidence(false));
+    expect(store.getProject()?.status).toBe("BLOCKED_BUDGET");
+    store.close();
   });
 });
-
