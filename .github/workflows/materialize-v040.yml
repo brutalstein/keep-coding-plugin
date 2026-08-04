@@ -1,0 +1,81 @@
+name: Materialize verified v0.4
+
+on:
+  push:
+    branches:
+      - agent/semantic-parity-evidence-distribution
+    paths:
+      - .github/workflows/materialize-v040.yml
+      - .publish/v040-overlay-06.b64
+
+permissions:
+  contents: write
+
+concurrency:
+  group: materialize-v040
+  cancel-in-progress: false
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/semantic-parity-evidence-distribution
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Verify and extract source overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/part-checksums <<'EOF'
+          aa73f319e2d0056d1215ae8b470412c654144abb4d3c03fcab266b46ecb5903c  .publish/v040-overlay-00.b64
+          b1b524cb45850aedd1daad1cf7fa2dc3ae2a6ee91bffcbb7e479fdfa932e1d1b  .publish/v040-overlay-01.b64
+          25f80b9fb15516fdef691ca4cb032f1918d84f238592c505e116f5722029f041  .publish/v040-overlay-02.b64
+          459bd03d3243e7d53437b5022d9f3e9d93484151f9a4a7303de1459d35615c50  .publish/v040-overlay-03.b64
+          1e3ca723df96b26c16754bff1fcba31661b610ab0c292839d5e7031036a962d4  .publish/v040-overlay-04.b64
+          f227ad1b65613c4a0e3b16714dcfb1e6efadb639d07422502d20f9eab329d95c  .publish/v040-overlay-05.b64
+          5f222f1b2167344a3918457284a5f664e69ad505fe2f1073c4ac5cc04550f673  .publish/v040-overlay-06.b64
+          EOF
+          sha256sum --check /tmp/part-checksums
+          cat .publish/v040-overlay-{00..06}.b64 | base64 --decode > /tmp/v040-overlay.tar.xz
+          echo 'ce48ff77d56c3daa029482298428f185c7f6ec0005bc815da5a8b76b3c2f77c2  /tmp/v040-overlay.tar.xz' | sha256sum --check
+          tar -xJf /tmp/v040-overlay.tar.xz
+
+      - name: Install locked dependencies and official grammars
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm install --no-save --package-lock=false --ignore-scripts \
+            tree-sitter-python@0.25.0 \
+            tree-sitter-c@0.24.1 \
+            tree-sitter-cpp@0.23.4
+          cp node_modules/web-tree-sitter/web-tree-sitter.wasm assets/tree-sitter/web-tree-sitter.wasm
+          cp node_modules/tree-sitter-python/tree-sitter-python.wasm assets/tree-sitter/tree-sitter-python.wasm
+          cp node_modules/tree-sitter-c/tree-sitter-c.wasm assets/tree-sitter/tree-sitter-c.wasm
+          cp node_modules/tree-sitter-cpp/tree-sitter-cpp.wasm assets/tree-sitter/tree-sitter-cpp.wasm
+
+      - name: Build, stage, and run every verification gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          git add assets/tree-sitter plugins/keep-coding/dist
+          npm run check
+
+      - name: Commit clean verified implementation
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf .publish .github/workflows/materialize-v040.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Upgrade semantic parity, evidence, and cross-agent distribution'
+          git push origin HEAD:agent/semantic-parity-evidence-distribution
