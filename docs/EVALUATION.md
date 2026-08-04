@@ -35,3 +35,16 @@ A small p-value is not an effect size, and a large p-value with few runs is not 
 - A verifier can reward superficial solutions or miss regressions.
 - Hook availability and trust state must be confirmed before treatment runs.
 - Tasks used while developing Keep Coding should be separated from the final holdout set.
+
+## Assumption-ledger dimension
+
+Set `assumptionLedger.enabled` in the evaluation configuration to include the correction subsystem in a paired experiment. Keep the task corpus, starting commit, verifier commands, model settings, and arm ordering identical. The runner propagates `KEEP_CODING_ASSUMPTION_LEDGER=1|0` to the evaluated process and omits the entire metrics section when disabled.
+
+The subsystem metrics are:
+
+- **Correction containment rate:** completed corrections with `outcome=contained` divided by all completed contained/expanded corrections, with a Wilson 95% interval.
+- **Tokens per correction:** project-scoped recorded token counter at the successful correction checkpoint minus the counter captured by `invalidate_assumption`; phase counters are deliberately excluded to prevent double counting.
+- **Anti-pattern hit rate:** distinct proactive correction warnings fired divided by matching situations in the frozen corpus.
+- **Enabled-vs-disabled outcome:** an optional paired success comparison summarized by the same exact McNemar function used by the main A/B report.
+
+Self-reported confidence is not treated as calibrated probability. Evaluate confidence calibration indirectly through containment, repeated correction frequency, and the relationship between confidence bands and later invalidations.

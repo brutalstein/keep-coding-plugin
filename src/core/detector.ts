@@ -50,3 +50,29 @@ function heuristicStrength(score: number, threshold: number): number {
   if (score >= threshold) return Math.min(0.99, 0.55 + (score - threshold) * 0.07);
   return Math.max(0, Math.min(0.49, (score / Math.max(1, threshold)) * 0.49));
 }
+
+const AMBIGUITY_SIGNALS: Array<{ pattern: RegExp; weight: number; reason: string }> = [
+  { pattern: /\b(various|several|some|appropriate(?:ly)?|as needed|edge cases?|stuff|things|çeşitli|bazı|birkaç|uygun şekilde|gerektiği kadar|duruma göre)\b/iu, weight: 2, reason: "vague quantifier or outcome" },
+  { pattern: /\b(it|they|them|this|that|those|o|onu|bunu|bunları|şunu|onları)\b/iu, weight: 1, reason: "potential unresolved reference" },
+  { pattern: /\b(handle|support|improve|optimize|düzelt|iyileştir|ele al|destekle)\b/iu, weight: 1, reason: "underspecified implementation verb" }
+];
+
+export interface AmbiguityResult {
+  high: boolean;
+  score: number;
+  threshold: number;
+  signals: DetectionSignal[];
+  reasons: string[];
+}
+
+export function assessAmbiguity(goal: string, doneWhen: string[] = [], threshold = 3): AmbiguityResult {
+  const normalized = goal.replace(/\s+/gu, " ").trim();
+  const signals: DetectionSignal[] = [];
+  for (const signal of AMBIGUITY_SIGNALS) if (signal.pattern.test(normalized)) signals.push({ reason: signal.reason, weight: signal.weight });
+  const criteria = doneWhen.map((item) => item.trim()).filter(Boolean);
+  const genericCriteria = criteria.length === 0 || criteria.every((item) => /^(?:tests?|checks?|testler|kontroller)\s+(?:pass|passes|geçer|geçsin)$/iu.test(item));
+  const preciseArtifact = /(?:GET|POST|PUT|DELETE|PATCH)\s+\/\S+|\b(?:returns?|columns?|schema|status\s*code|latency|milliseconds?|bytes?|tested by|test file|döndürür|kolonlar?|şema|durum kodu)\b/iu.test(normalized);
+  if (genericCriteria && !preciseArtifact) signals.push({ reason: "missing measurable acceptance criteria", weight: 2 });
+  const score = signals.reduce((total, signal) => total + signal.weight, 0);
+  return { high: score >= threshold, score, threshold, signals, reasons: signals.map((signal) => `${signal.reason} (+${signal.weight})`) };
+}

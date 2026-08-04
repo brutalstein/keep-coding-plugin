@@ -35,6 +35,36 @@ export interface BudgetUsage {
 export interface BudgetEvidence { passed: boolean; limits: BudgetLimits; usage: BudgetUsage; violations: string[] }
 export interface CriticPolicy { enabled: boolean; blocking: boolean }
 export interface SelectiveTestPolicy { commandTemplate: string; fullSuiteCommands: string[] }
+export interface AssumptionAlternative { interpretation: string; whyRejected: string }
+export type AssumptionStatus = "open" | "confirmed" | "invalidated";
+export interface AssumptionRecord {
+  id: string;
+  phaseId: string | null;
+  statement: string;
+  confidence: number;
+  alternatives: AssumptionAlternative[];
+  status: AssumptionStatus;
+  createdAt: string;
+  resolvedAt: string | null;
+  resolutionEvidence: string | null;
+  explicitLinkedAt: string | null;
+}
+export interface BlastRadius { nodeIds: string[]; files: string[]; decisionIds: string[] }
+export interface CorrectionScopeExpansion { nodeIds: string[]; justification: string; expandedAt: string }
+export interface CorrectionRecord {
+  id: string;
+  assumptionId: string;
+  phaseId: string | null;
+  rootCause: string;
+  blastRadius: BlastRadius;
+  blastRadiusSize: number;
+  appliedAt: string;
+  outcome: "contained" | "expanded" | null;
+  expansions: CorrectionScopeExpansion[];
+  completedAt: string | null;
+  tokenStart: number;
+  tokenEnd: number | null;
+}
 
 export interface ProjectContract {
   goal: string;
@@ -47,6 +77,7 @@ export interface ProjectContract {
   critic?: CriticPolicy | undefined;
   selectiveTests?: SelectiveTestPolicy | undefined;
   playbookOptIn?: boolean | undefined;
+  assumptionConfidenceThreshold?: number | undefined;
 }
 
 export type ProjectContractPatch = {
@@ -158,7 +189,7 @@ export interface WorktreeRecord { phaseId: string; path: string; branch: string;
 
 export interface GraphNode {
   id: string;
-  type: "file" | "symbol" | "requirement" | "phase" | "decision" | "test" | "module";
+  type: "file" | "symbol" | "requirement" | "phase" | "decision" | "assumption" | "test" | "module";
   label: string;
   path: string | null;
   symbol: string | null;
@@ -169,14 +200,14 @@ export interface GraphNode {
 export interface GraphEdge {
   sourceId: string;
   targetId: string;
-  type: "imports" | "contains" | "calls" | "references" | "tested_by" | "implements" | "modifies" | "verified_by" | "depends_on" | "supersedes";
+  type: "imports" | "contains" | "calls" | "references" | "tested_by" | "implements" | "modifies" | "verified_by" | "depends_on" | "depends_on_assumption" | "supersedes";
   metadata: Record<string, unknown>;
 }
 
 export interface ImpactNode { node: GraphNode; distance: number; via: GraphEdge["type"] | null }
 export interface EventRecord { sequence: number; timestamp: string; type: string; phaseId: string | null; payload: Record<string, unknown> }
 
-export type ContextSection = "header" | "contract" | "active_phase" | "approvals" | "budget" | "decisions" | "failures" | "checkpoints" | "graph" | "playbook";
+export type ContextSection = "header" | "contract" | "active_phase" | "approvals" | "budget" | "decisions" | "assumptions" | "corrections" | "failures" | "checkpoints" | "graph" | "playbook";
 export type ContextEnvelope =
   | { unchanged: true; sequence: number }
   | {
@@ -206,6 +237,7 @@ export interface FileDigest {
 
 export interface PlaybookPattern {
   id: string;
+  kind?: "phase" | "anti_pattern" | undefined;
   pattern: string;
   triggerConditions: string[];
   resolution: string[];
@@ -213,12 +245,15 @@ export interface PlaybookPattern {
   score: number;
   successCount: number;
   sourceProjects: string[];
+  metadata?: Record<string, unknown> | undefined;
 }
 
 export interface ProjectSnapshot {
   project: ProjectRecord;
   phases: PhaseRecord[];
   decisions: DecisionRecord[];
+  assumptions: AssumptionRecord[];
+  corrections: CorrectionRecord[];
   failures: FailureRecord[];
   approvals?: ApprovalRecord[] | undefined;
   checkpoints: CheckpointRecord[];

@@ -4,7 +4,7 @@ Keep Coding is a runtime-agnostic durable-memory and verification layer for long
 
 ## Status
 
-**Current release: v0.2.1.** This release fixes the v0.2.0 production bundle crash, makes the compiled artifact executable in CI, and adds token-efficient context delivery. The v0.2 platform capabilities remain intact: adaptive replanning, worktree parallelism, semantic impact analysis, budgets, approvals, critic review, dashboard, and GitHub integration.
+**Current release: v0.3.0.** This release adds an assumption ledger and bounded blast-radius correction protocol on top of the v0.2.1 evidence and token-efficiency platform. Wrong interpretations are now durable graph entities: the agent records them before implementation, links the artifacts that depend on them, invalidates them into a computed correction radius, and cannot silently edit outside that radius.
 
 ## Core guarantees
 
@@ -13,6 +13,8 @@ Keep Coding is a runtime-agnostic durable-memory and verification layer for long
 - Plan amendments are versioned; completed evidence is never silently overwritten.
 - Remote workspace access remains root-confined and patch writes remain phase-scoped.
 - `npm run check` executes the built production artifact; source-only green tests cannot mask a broken distributable.
+- Low-confidence open assumptions and high-ambiguity phases cannot pass a checkpoint without explicit resolution.
+- Correction edits are restricted to the intersection of the phase scope and the computed/justifiably expanded blast radius.
 
 ## Platform capabilities
 
@@ -27,6 +29,10 @@ Keep Coding is a runtime-agnostic durable-memory and verification layer for long
 - Indexed `get_file_digest` for low-token orientation before full file reads
 - Failure-output diffing, marker-aware truncation, normalized failure clustering, and token telemetry
 - Compact opt-in cross-project playbook patterns
+- Durable assumptions linked to exact files, symbols, and decisions
+- Cycle-safe, hop-limited correction blast radii with contained/expanded outcome tracking
+- Bilingual ambiguity pre-flight, blocking low-confidence critic escalation, and non-blocking apology-language correction nudges
+- Cross-project correction anti-patterns with measured hit rate and deduplication
 - Loopback-only read-only dashboard
 - Codex, Claude-style hook, and generic polling continuity adapters
 - GitHub CI and decision-sourced PR-description generation
@@ -42,7 +48,7 @@ npm run check
 
 `npm run check` runs lint, strict TypeScript, source coverage, production build, compiled-artifact smoke tests, the context payload benchmark, documentation/version checks, and plugin validation. The committed distributable is `plugins/keep-coding/dist/keep-coding.mjs`.
 
-Verified source suite: 51 tests across 16 files. The post-build artifact suite adds three compiled-binary scenarios, and the context benchmark runs separately.
+Verified source suite: 107 tests across 26 files. The post-build artifact suite adds four compiled-binary scenarios, and the context benchmark runs separately.
 
 ## CLI
 
@@ -64,6 +70,12 @@ Initialize and save a plan, start ready phases, apply scoped edits, checkpoint, 
 Use `get_context` without `include_snapshot` for normal reasoning. Pass the last `sequence` as `since_sequence`; an unchanged project returns a near-zero `{ "unchanged": true, "sequence": ... }` response. Request `include_snapshot: true` only for structured tooling or debugging. Prefer `get_file_digest` before a full file read, and call `expand_graph` only when exact dependency nodes are needed.
 
 Normal ChatGPT can use the bounded `mcp-http` surface described in [docs/CHATGPT_APP.md](docs/CHATGPT_APP.md). Codex uses plugin hooks. Other runtimes can use the adapter layer or poll the CLI.
+
+## Assumption and correction protocol
+
+When an interpretation is uncertain, call `record_assumption` before editing, then `link_assumption` to the exact graph nodes that were built because of it. Resolve it with `confirm_assumption`, or call `invalidate_assumption` to compute a bounded correction radius. A correction checkpoint may touch only files inside both the original phase scope and that radius. `expand_correction_scope` requires a non-empty justification and records the expansion for review.
+
+The default confidence threshold is `0.6` and can be changed with `contract.assumptionConfidenceThreshold`. Matching contained corrections can be promoted into the opt-in playbook as anti-patterns and surfaced before the same mistake is repeated. Evaluation reports include containment rate, Wilson 95% confidence interval, project-scoped tokens per correction, anti-pattern hit rate, and an optional enabled-vs-disabled paired comparison.
 
 ## Architecture and evaluation
 

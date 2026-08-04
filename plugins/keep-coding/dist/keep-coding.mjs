@@ -89,6 +89,22 @@ function heuristicStrength(score, threshold) {
   if (score >= threshold) return Math.min(0.99, 0.55 + (score - threshold) * 0.07);
   return Math.max(0, Math.min(0.49, score / Math.max(1, threshold) * 0.49));
 }
+var AMBIGUITY_SIGNALS = [
+  { pattern: /\b(various|several|some|appropriate(?:ly)?|as needed|edge cases?|stuff|things|çeşitli|bazı|birkaç|uygun şekilde|gerektiği kadar|duruma göre)\b/iu, weight: 2, reason: "vague quantifier or outcome" },
+  { pattern: /\b(it|they|them|this|that|those|o|onu|bunu|bunları|şunu|onları)\b/iu, weight: 1, reason: "potential unresolved reference" },
+  { pattern: /\b(handle|support|improve|optimize|düzelt|iyileştir|ele al|destekle)\b/iu, weight: 1, reason: "underspecified implementation verb" }
+];
+function assessAmbiguity(goal, doneWhen = [], threshold = 3) {
+  const normalized = goal.replace(/\s+/gu, " ").trim();
+  const signals = [];
+  for (const signal of AMBIGUITY_SIGNALS) if (signal.pattern.test(normalized)) signals.push({ reason: signal.reason, weight: signal.weight });
+  const criteria = doneWhen.map((item) => item.trim()).filter(Boolean);
+  const genericCriteria = criteria.length === 0 || criteria.every((item) => /^(?:tests?|checks?|testler|kontroller)\s+(?:pass|passes|geçer|geçsin)$/iu.test(item));
+  const preciseArtifact = /(?:GET|POST|PUT|DELETE|PATCH)\s+\/\S+|\b(?:returns?|columns?|schema|status\s*code|latency|milliseconds?|bytes?|tested by|test file|döndürür|kolonlar?|şema|durum kodu)\b/iu.test(normalized);
+  if (genericCriteria && !preciseArtifact) signals.push({ reason: "missing measurable acceptance criteria", weight: 2 });
+  const score = signals.reduce((total, signal) => total + signal.weight, 0);
+  return { high: score >= threshold, score, threshold, signals, reasons: signals.map((signal) => `${signal.reason} (+${signal.weight})`) };
+}
 
 // src/core/git.ts
 import { createHash } from "node:crypto";
@@ -216,11 +232,17 @@ function splitNull(value) {
 // src/core/service.ts
 import { createHash as createHash7 } from "node:crypto";
 
-// src/storage/platform-store.ts
-import { createHash as createHash3 } from "node:crypto";
+// src/core/signature.ts
+import { createHash as createHash2 } from "node:crypto";
+function normalizeDiagnosticText(value) {
+  return value.toLowerCase().replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/giu, "<timestamp>").replace(/(?:[a-z]:\\|\/)(?:[^\s:]+[\\/])+[^\s:]+/giu, "<path>").replace(/:\d+(?::\d+)?\b/gu, ":<line>").replace(/0x[0-9a-f]+/giu, "<hex>").replace(/\b\d+\b/gu, "<n>").replace(/\s+/gu, " ").trim();
+}
+function normalizedDiagnosticSignature(value, length = 24) {
+  return createHash2("sha256").update(normalizeDiagnosticText(value)).digest("hex").slice(0, length);
+}
 
 // src/storage/store.ts
-import { randomUUID, createHash as createHash2 } from "node:crypto";
+import { randomUUID, createHash as createHash3 } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path2 from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -243,7 +265,7 @@ var ProjectStore = class {
     const existing = this.getProject();
     if (existing) return existing;
     const now2 = (/* @__PURE__ */ new Date()).toISOString();
-    const id = createHash2("sha256").update(this.projectRoot).digest("hex").slice(0, 16);
+    const id = createHash3("sha256").update(this.projectRoot).digest("hex").slice(0, 16);
     this.db.prepare(`
       INSERT INTO project (id, root, original_prompt, status, contract_json, plan_version, current_phase_id, created_at, updated_at)
       VALUES (?, ?, ?, 'PLANNING', NULL, 0, NULL, ?, ?)
@@ -399,6 +421,223 @@ var ProjectStore = class {
     this.appendEvent("project_completed", null, { phaseCount: phases.length });
     return must(this.getProject(), "project completion failed");
   }
+  recordAssumption(input) {
+    if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
+      throw new Error("INVALID_CONFIDENCE: confidence must be a finite number in [0, 1]");
+    }
+    if (!Array.isArray(input.alternatives)) throw new Error("INVALID_ALTERNATIVES: alternatives must be an array");
+    if (input.phaseId !== null) must(this.getPhase(input.phaseId), `unknown phase: ${input.phaseId}`);
+    const statement = input.statement.trim();
+    if (!statement) throw new Error("assumption statement is required");
+    const id = randomUUID();
+    const createdAt = (/* @__PURE__ */ new Date()).toISOString();
+    this.db.prepare(`
+      INSERT INTO assumptions (id, phase_id, statement, confidence, alternatives_json, status, created_at, resolved_at, resolution_evidence, explicit_linked_at)
+      VALUES (?, ?, ?, ?, ?, 'open', ?, NULL, NULL, NULL)
+    `).run(id, input.phaseId, statement, input.confidence, JSON.stringify(input.alternatives), createdAt);
+    this.upsertGraphNode({
+      id,
+      type: "assumption",
+      label: statement,
+      path: null,
+      symbol: null,
+      contentHash: sha256(statement),
+      metadata: { phaseId: input.phaseId, confidence: input.confidence, alternatives: input.alternatives, status: "open" }
+    });
+    if (input.phaseId) this.upsertGraphEdge({ sourceId: `phase:${input.phaseId}`, targetId: id, type: "implements", metadata: { entity: "assumption" } });
+    this.appendEvent("assumption_recorded", input.phaseId, { id, statement, confidence: input.confidence });
+    return id;
+  }
+  getAssumption(id) {
+    const row = this.db.prepare("SELECT * FROM assumptions WHERE id = ?").get(id);
+    return row ? assumptionFromRow(row) : null;
+  }
+  listAssumptions(phaseId, status) {
+    const clauses = [];
+    const values = [];
+    if (phaseId !== void 0) {
+      clauses.push(phaseId === null ? "phase_id IS NULL" : "phase_id = ?");
+      if (phaseId !== null) values.push(phaseId);
+    }
+    if (status !== void 0) {
+      clauses.push("status = ?");
+      values.push(status);
+    }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    return this.db.prepare(`SELECT * FROM assumptions${where} ORDER BY confidence ASC, created_at ASC`).all(...values).map(assumptionFromRow);
+  }
+  setAssumptionStatus(id, status, evidence = "") {
+    const current = must(this.getAssumption(id), `unknown assumption: ${id}`);
+    if (current.status !== "open") throw new Error(`one-way transition: ${current.status} -> ${status} is not allowed`);
+    if (status === "open") return current;
+    const resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
+    this.db.prepare("UPDATE assumptions SET status = ?, resolved_at = ?, resolution_evidence = ? WHERE id = ?").run(status, resolvedAt, evidence.trim() || null, id);
+    const node = this.getGraphNode(id);
+    if (node) this.upsertGraphNode({ ...node, metadata: { ...node.metadata, status, resolvedAt } });
+    this.appendEvent(status === "confirmed" ? "assumption_confirmed" : "assumption_invalidated", current.phaseId, { id, evidence: evidence.trim() });
+    return must(this.getAssumption(id), "assumption status update failed");
+  }
+  confirmAssumption(id, evidence) {
+    return this.setAssumptionStatus(id, "confirmed", evidence);
+  }
+  linkAssumption(assumptionId, nodeIds, explicit = true) {
+    const assumption = must(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
+    if (assumption.status !== "open") throw new Error(`assumption ${assumptionId} is ${assumption.status}`);
+    let linked = 0;
+    for (const requested of [...new Set(nodeIds)]) {
+      const nodeId = this.resolveGraphNodeId(requested);
+      if (!nodeId) throw new Error(`unknown graph node: ${requested}`);
+      this.upsertGraphEdge({ sourceId: assumptionId, targetId: nodeId, type: "depends_on_assumption", metadata: { explicit } });
+      linked += 1;
+    }
+    if (explicit) this.db.prepare("UPDATE assumptions SET explicit_linked_at = ? WHERE id = ?").run((/* @__PURE__ */ new Date()).toISOString(), assumptionId);
+    this.appendEvent(explicit ? "assumption_linked" : "assumption_auto_linked", assumption.phaseId, { assumptionId, nodeIds, linked });
+    return linked;
+  }
+  autoLinkChangedFiles(phaseId, changedFiles) {
+    const candidates = this.listAssumptions(phaseId, "open").filter((item) => item.explicitLinkedAt === null);
+    if (candidates.length !== 1 || changedFiles.length === 0) return 0;
+    const nodeIds = changedFiles.map((file) => {
+      const normalized = file.replaceAll("\\", "/").replace(/^\.\//u, "");
+      const id = `file:${normalized}`;
+      if (!this.getGraphNode(id)) this.upsertGraphNode({ id, type: "file", label: normalized, path: normalized, symbol: null, contentHash: null, metadata: { autoLinked: true } });
+      return id;
+    });
+    return this.linkAssumption(candidates[0].id, nodeIds, false);
+  }
+  getGraphNode(id) {
+    const row = this.db.prepare("SELECT * FROM graph_nodes WHERE id = ? AND active = 1").get(id);
+    return row ? graphNodeFromRow(row) : null;
+  }
+  getEdgesFrom(sourceId, type) {
+    const rows = type ? this.db.prepare("SELECT * FROM graph_edges WHERE source_id = ? AND type = ? ORDER BY target_id").all(sourceId, type) : this.db.prepare("SELECT * FROM graph_edges WHERE source_id = ? ORDER BY type, target_id").all(sourceId);
+    return rows.map(graphEdgeFromRow);
+  }
+  addEdge(sourceId, targetId, type, metadata = {}) {
+    this.upsertGraphEdge({ sourceId, targetId, type, metadata });
+  }
+  computeBlastRadius(assumptionId, options = {}) {
+    must(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
+    const maxHops = Math.max(0, Math.min(options.maxHops ?? 3, 12));
+    const direct = this.getEdgesFrom(assumptionId, "depends_on_assumption").map((edge) => edge.targetId);
+    if (direct.length === 0) return { nodeIds: [], files: [], decisionIds: [] };
+    const visited = /* @__PURE__ */ new Set();
+    const queue = direct.map((id) => ({ id, depth: 0 }));
+    while (queue.length > 0 && visited.size < 2e3) {
+      const current = queue.shift();
+      if (visited.has(current.id)) continue;
+      visited.add(current.id);
+      if (current.depth >= maxHops) continue;
+      for (const edge of this.getEdgesFrom(current.id)) {
+        if (edge.type === "depends_on_assumption") continue;
+        if (!visited.has(edge.targetId)) queue.push({ id: edge.targetId, depth: current.depth + 1 });
+      }
+    }
+    const nodes = [...visited].map((id) => this.getGraphNode(id)).filter((node) => node !== null);
+    const files = [...new Set(nodes.map((node) => node.path).filter((value) => Boolean(value)))].sort();
+    const decisionIds = [...new Set(nodes.filter((node) => node.type === "decision").map((node) => node.id.replace(/^decision:/u, "")))].sort();
+    return { nodeIds: [...visited].sort(), files, decisionIds };
+  }
+  invalidateAssumption(id, rootCause, maxHops = 3, tokenStart = 0) {
+    const assumption = must(this.getAssumption(id), `unknown assumption: ${id}`);
+    if (assumption.status !== "open") throw new Error(`assumption ${id} is already ${assumption.status}`);
+    const cause = rootCause.trim();
+    if (!cause) throw new Error("root cause is required");
+    const blastRadius = this.computeBlastRadius(id, { maxHops });
+    const correctionId = randomUUID();
+    const appliedAt = (/* @__PURE__ */ new Date()).toISOString();
+    this.transaction(() => {
+      this.db.prepare("UPDATE assumptions SET status='invalidated',resolved_at=?,resolution_evidence=? WHERE id=?").run(appliedAt, cause, id);
+      this.db.prepare(`
+        INSERT INTO corrections (id, assumption_id, phase_id, root_cause, blast_radius_json, blast_radius_size, applied_at, outcome, expansions_json, completed_at, token_start, token_end)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, '[]', NULL, ?, NULL)
+      `).run(correctionId, id, assumption.phaseId, cause, JSON.stringify(blastRadius), blastRadius.nodeIds.length, appliedAt, tokenStart);
+      this.appendEvent("assumption_invalidated", assumption.phaseId, { id, rootCause: cause, correctionId });
+      this.appendEvent("correction_recorded", assumption.phaseId, { correctionId, assumptionId: id, blastRadiusSize: blastRadius.nodeIds.length });
+    });
+    return must(this.getCorrection(correctionId), "correction insert failed");
+  }
+  getCorrection(id) {
+    const row = this.db.prepare("SELECT * FROM corrections WHERE id = ?").get(id);
+    return row ? correctionFromRow(row) : null;
+  }
+  listCorrections(phaseId) {
+    if (phaseId === void 0) return this.db.prepare("SELECT * FROM corrections ORDER BY applied_at").all().map(correctionFromRow);
+    const rows = phaseId === null ? this.db.prepare("SELECT * FROM corrections WHERE phase_id IS NULL ORDER BY applied_at").all() : this.db.prepare("SELECT * FROM corrections WHERE phase_id = ? ORDER BY applied_at").all(phaseId);
+    return rows.map(correctionFromRow);
+  }
+  activeCorrection(phaseId) {
+    const row = this.db.prepare("SELECT * FROM corrections WHERE phase_id = ? AND completed_at IS NULL ORDER BY applied_at DESC LIMIT 1").get(phaseId);
+    return row ? correctionFromRow(row) : null;
+  }
+  expandCorrectionScope(id, additionalNodeIds, justification) {
+    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const reason = justification.trim();
+    if (!reason) throw new Error("justification must be non-empty");
+    const normalized = [...new Set(additionalNodeIds.map((nodeId) => this.resolveGraphNodeId(nodeId) ?? nodeId))];
+    for (const nodeId of normalized) if (!this.getGraphNode(nodeId)) throw new Error(`unknown graph node: ${nodeId}`);
+    const expansion = { nodeIds: normalized, justification: reason, expandedAt: (/* @__PURE__ */ new Date()).toISOString() };
+    const expansions = [...correction.expansions, expansion];
+    this.db.prepare("UPDATE corrections SET expansions_json = ? WHERE id = ?").run(JSON.stringify(expansions), id);
+    this.appendEvent("correction_scope_expanded", correction.phaseId, { correctionId: id, nodeIds: normalized, justification: reason });
+    return must(this.getCorrection(id), "correction expansion failed");
+  }
+  assessCorrectionOutcome(id, changedFiles, tokenEnd, complete) {
+    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const original = new Set(correction.blastRadius.files);
+    const expandedFiles = new Set(correction.expansions.flatMap((item) => item.nodeIds.map((nodeId) => this.getGraphNode(nodeId)?.path).filter((value) => Boolean(value))));
+    const excess = changedFiles.filter((file) => !original.has(file));
+    const unauthorizedFiles = excess.filter((file) => !expandedFiles.has(file));
+    const outcome = excess.length === 0 ? "contained" : "expanded";
+    const completedAt = complete && unauthorizedFiles.length === 0 ? (/* @__PURE__ */ new Date()).toISOString() : null;
+    this.db.prepare("UPDATE corrections SET outcome = ?, completed_at = ?, token_end = ? WHERE id = ?").run(outcome, completedAt, tokenEnd, id);
+    this.appendEvent(unauthorizedFiles.length === 0 ? "correction_outcome_recorded" : "correction_scope_violation", correction.phaseId, {
+      correctionId: id,
+      outcome,
+      changedFiles,
+      unauthorizedFiles,
+      complete: completedAt !== null
+    });
+    return { correction: must(this.getCorrection(id), "correction outcome update failed"), unauthorizedFiles };
+  }
+  correctionAllowedFiles(id) {
+    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const expanded = correction.expansions.flatMap((item) => item.nodeIds.map((nodeId) => this.getGraphNode(nodeId)?.path).filter((value) => Boolean(value)));
+    return [.../* @__PURE__ */ new Set([...correction.blastRadius.files, ...expanded])].sort();
+  }
+  correctionRecordedSince(sequence) {
+    const row = this.db.prepare("SELECT 1 AS found FROM events WHERE sequence > ? AND type IN ('assumption_invalidated','correction_recorded') LIMIT 1").get(sequence);
+    return Boolean(row);
+  }
+  lastCheckpointEventSequence() {
+    const row = this.db.prepare("SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE type IN ('phase_completed','phase_verification_failed')").get();
+    return Number(row.sequence);
+  }
+  recordAntiPatternHits(phaseId, patternIds) {
+    let recorded = 0;
+    for (const patternId of [...new Set(patternIds)]) {
+      const key = `anti_pattern_hit:${phaseId ?? "project"}:${patternId}`;
+      const result = this.db.prepare("INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)").run(key, (/* @__PURE__ */ new Date()).toISOString());
+      if (Number(result.changes) === 0) continue;
+      recorded += 1;
+      this.appendEvent("anti_pattern_warning_fired", phaseId, { patternId });
+    }
+    return recorded;
+  }
+  countAntiPatternHits() {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'anti_pattern_hit:%'").get();
+    return Number(row.count);
+  }
+  totalRecordedTokens() {
+    const row = this.db.prepare("SELECT COALESCE(SUM(tokens),0) AS tokens FROM budget_usage WHERE scope = 'project'").get();
+    return Number(row?.tokens ?? 0);
+  }
+  resolveGraphNodeId(requested) {
+    if (this.getGraphNode(requested)) return requested;
+    if (this.getGraphNode(`decision:${requested}`)) return `decision:${requested}`;
+    if (this.getGraphNode(`file:${requested.replaceAll("\\", "/").replace(/^\.\//u, "")}`)) return `file:${requested.replaceAll("\\", "/").replace(/^\.\//u, "")}`;
+    return null;
+  }
   recordDecision(input) {
     const id = randomUUID();
     const createdAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -423,7 +662,7 @@ var ProjectStore = class {
   }
   recordFailure(phaseId, summary, fingerprint) {
     must(this.getPhase(phaseId), `unknown phase: ${phaseId}`);
-    const normalizedFingerprint = fingerprint?.trim() || sha256(normalizeFailure(summary)).slice(0, 24);
+    const normalizedFingerprint = fingerprint?.trim() || normalizedDiagnosticSignature(summary);
     const existing = this.db.prepare("SELECT * FROM failures WHERE phase_id = ? AND fingerprint = ?").get(phaseId, normalizedFingerprint);
     const now2 = (/* @__PURE__ */ new Date()).toISOString();
     if (existing) {
@@ -456,6 +695,8 @@ var ProjectStore = class {
       project: must(this.getProject(), "project is not initialized"),
       phases: this.listPhases(),
       decisions: this.listDecisions(),
+      assumptions: this.listAssumptions(),
+      corrections: this.listCorrections(),
       failures: this.listFailures(),
       checkpoints: this.listCheckpoints(),
       recentEvents: this.recentEvents()
@@ -503,7 +744,7 @@ var ProjectStore = class {
     `).run(edge.sourceId, edge.targetId, edge.type, JSON.stringify(edge.metadata), (/* @__PURE__ */ new Date()).toISOString());
   }
   clearFileGraph() {
-    this.db.exec("DELETE FROM graph_edges WHERE source_id LIKE 'file:%' OR target_id LIKE 'file:%' OR source_id LIKE 'symbol:%' OR target_id LIKE 'symbol:%'; DELETE FROM graph_nodes WHERE type IN ('file', 'symbol');");
+    this.db.exec("DELETE FROM graph_edges WHERE type != 'depends_on_assumption' AND (source_id LIKE 'file:%' OR target_id LIKE 'file:%' OR source_id LIKE 'symbol:%' OR target_id LIKE 'symbol:%'); DELETE FROM graph_nodes WHERE type IN ('file', 'symbol');");
   }
   searchGraph(terms, limit = 30) {
     if (terms.length === 0) return [];
@@ -558,6 +799,19 @@ var ProjectStore = class {
         id TEXT PRIMARY KEY, phase_id TEXT, title TEXT NOT NULL, rationale TEXT NOT NULL,
         alternatives_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS assumptions (
+        id TEXT PRIMARY KEY, phase_id TEXT, statement TEXT NOT NULL, confidence REAL NOT NULL,
+        alternatives_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT,
+        resolution_evidence TEXT, explicit_linked_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS corrections (
+        id TEXT PRIMARY KEY, assumption_id TEXT NOT NULL REFERENCES assumptions(id), phase_id TEXT,
+        root_cause TEXT NOT NULL, blast_radius_json TEXT NOT NULL, blast_radius_size INTEGER NOT NULL,
+        applied_at TEXT NOT NULL, outcome TEXT, expansions_json TEXT NOT NULL DEFAULT '[]', completed_at TEXT,
+        token_start INTEGER NOT NULL DEFAULT 0, token_end INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_assumptions_phase ON assumptions(phase_id, status);
+      CREATE INDEX IF NOT EXISTS idx_corrections_assumption ON corrections(assumption_id);
       CREATE TABLE IF NOT EXISTS failures (
         id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, fingerprint TEXT NOT NULL, summary TEXT NOT NULL,
         count INTEGER NOT NULL, last_seen_at TEXT NOT NULL, resolution TEXT,
@@ -590,6 +844,7 @@ function validateContract(contract) {
   if (contract.goal.trim().length < 10) throw new Error("contract goal is too short");
   if (contract.deliverables.length === 0) throw new Error("contract requires deliverables");
   if (contract.doneWhen.length === 0) throw new Error("contract requires measurable done-when criteria");
+  if (contract.assumptionConfidenceThreshold !== void 0 && (!Number.isFinite(contract.assumptionConfidenceThreshold) || contract.assumptionConfidenceThreshold < 0 || contract.assumptionConfidenceThreshold > 1)) throw new Error("assumptionConfidenceThreshold must be in [0, 1]");
 }
 function validatePlan(phases) {
   if (phases.length === 0) throw new Error("plan requires at least one phase");
@@ -677,6 +932,38 @@ function failureFromRow(row) {
     resolution: nullable(row.resolution)
   };
 }
+function assumptionFromRow(row) {
+  const alternatives = JSON.parse(String(row.alternatives_json));
+  if (!Array.isArray(alternatives)) throw new Error("INVALID_ALTERNATIVES: stored alternatives must be an array");
+  return {
+    id: String(row.id),
+    phaseId: nullable(row.phase_id),
+    statement: String(row.statement),
+    confidence: Number(row.confidence),
+    alternatives,
+    status: String(row.status),
+    createdAt: String(row.created_at),
+    resolvedAt: nullable(row.resolved_at),
+    resolutionEvidence: nullable(row.resolution_evidence),
+    explicitLinkedAt: nullable(row.explicit_linked_at)
+  };
+}
+function correctionFromRow(row) {
+  return {
+    id: String(row.id),
+    assumptionId: String(row.assumption_id),
+    phaseId: nullable(row.phase_id),
+    rootCause: String(row.root_cause),
+    blastRadius: JSON.parse(String(row.blast_radius_json)),
+    blastRadiusSize: Number(row.blast_radius_size),
+    appliedAt: String(row.applied_at),
+    outcome: row.outcome ? asText(row.outcome) : null,
+    expansions: JSON.parse(asText(row.expansions_json ?? "[]")),
+    completedAt: nullable(row.completed_at),
+    tokenStart: Number(row.token_start ?? 0),
+    tokenEnd: row.token_end === null || row.token_end === void 0 ? null : Number(row.token_end)
+  };
+}
 function checkpointFromRow(row) {
   return {
     id: String(row.id),
@@ -695,6 +982,14 @@ function eventFromRow(row) {
     type: String(row.type),
     phaseId: nullable(row.phase_id),
     payload: JSON.parse(String(row.payload_json))
+  };
+}
+function graphEdgeFromRow(row) {
+  return {
+    sourceId: String(row.source_id),
+    targetId: String(row.target_id),
+    type: String(row.type),
+    metadata: JSON.parse(String(row.metadata_json))
   };
 }
 function graphNodeFromRow(row) {
@@ -718,10 +1013,7 @@ function asText(value) {
   throw new Error("database returned a non-scalar value");
 }
 function sha256(value) {
-  return createHash2("sha256").update(value).digest("hex");
-}
-function normalizeFailure(value) {
-  return value.toLowerCase().replace(/0x[0-9a-f]+/g, "<hex>").replace(/\d+/g, "<n>").replace(/\s+/g, " ").trim();
+  return createHash3("sha256").update(value).digest("hex");
 }
 function must(value, message) {
   if (value === null || value === void 0) throw new Error(message);
@@ -1211,7 +1503,7 @@ var PlatformStore = class extends ProjectStore {
     return required(this.getProject(), "project completion failed");
   }
   recordFailure(phaseId, summary, fingerprint) {
-    return super.recordFailure(phaseId, summary, fingerprint?.trim() || failureSignature(summary));
+    return super.recordFailure(phaseId, summary, fingerprint?.trim() || normalizedDiagnosticSignature(summary));
   }
   requestApproval(phaseId, prompt) {
     return requestApproval(this.runtimeHost(), phaseId, prompt);
@@ -1387,10 +1679,6 @@ function commandFailureFromRow(row) {
     createdAt: text(row.created_at)
   };
 }
-function failureSignature(value) {
-  const normalized = value.toLowerCase().replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/giu, "<timestamp>").replace(/(?:[a-z]:\\|\/)(?:[^\s:]+[\\/])+[^\s:]+/giu, "<path>").replace(/:\d+(?::\d+)?\b/gu, ":<line>").replace(/0x[0-9a-f]+/giu, "<hex>").replace(/\b\d+\b/gu, "<n>").replace(/\s+/gu, " ").trim();
-  return createHash3("sha256").update(normalized).digest("hex").slice(0, 24);
-}
 function required(value, message) {
   if (value === null || value === void 0) throw new Error(message);
   return value;
@@ -1404,7 +1692,7 @@ import path3 from "node:path";
 import { DatabaseSync as DatabaseSync3 } from "node:sqlite";
 var PlaybookStore = class {
   db;
-  constructor(databasePath = path3.join(homedir(), ".keep-coding", "playbook.db")) {
+  constructor(databasePath = process.env.KEEP_CODING_PLAYBOOK_PATH?.trim() || path3.join(homedir(), ".keep-coding", "playbook.db")) {
     mkdirSync2(path3.dirname(databasePath), { recursive: true });
     this.db = new DatabaseSync3(databasePath);
     this.db.exec(`
@@ -1424,6 +1712,8 @@ var PlaybookStore = class {
         source_project TEXT NOT NULL, updated_at TEXT NOT NULL
       );
     `);
+    addColumn2(this.db, "playbook_patterns", "kind", "TEXT NOT NULL DEFAULT 'phase'");
+    addColumn2(this.db, "playbook_patterns", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
     this.migrateLegacyTemplates();
   }
   close() {
@@ -1439,8 +1729,8 @@ var PlaybookStore = class {
     this.db.prepare(`
       INSERT INTO playbook_patterns (
         id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
-        source_projects_json, success_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        source_projects_json, success_count, created_at, updated_at, kind, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'phase', '{}')
       ON CONFLICT(signature) DO UPDATE SET
         pattern = excluded.pattern,
         trigger_conditions_json = excluded.trigger_conditions_json,
@@ -1461,6 +1751,34 @@ var PlaybookStore = class {
       now2
     );
     return patternFromRow(required2(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature)), 1);
+  }
+  rememberCorrection(sourceProject, assumption, correction) {
+    const pattern = `Avoid assumption: ${assumption.statement}`;
+    const triggerConditions = normalizeKeywords(`${assumption.statement} ${correction.rootCause}`);
+    const resolution = [`Wrong assumption: ${assumption.statement}`, `Actual case: ${correction.rootCause}`];
+    const applicabilityScope = correction.blastRadius.files.slice(0, 12);
+    const signature = normalizedDiagnosticSignature(`${assumption.statement}
+${correction.rootCause}`, 32);
+    const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature);
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    const id = existing ? String(existing.id) : signature;
+    const sources = existing ? [.../* @__PURE__ */ new Set([...jsonArray(existing.source_projects_json), sourceProject])] : [sourceProject];
+    const metadata = { assumptionId: assumption.id, correctionId: correction.id, wrongAssumption: assumption.statement, actualCase: correction.rootCause, outcome: correction.outcome };
+    this.db.prepare(`
+      INSERT INTO playbook_patterns (
+        id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
+        source_projects_json, success_count, created_at, updated_at, kind, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'anti_pattern', ?)
+      ON CONFLICT(signature) DO UPDATE SET
+        pattern=excluded.pattern,trigger_conditions_json=excluded.trigger_conditions_json,resolution_json=excluded.resolution_json,
+        applicability_scope_json=excluded.applicability_scope_json,source_projects_json=excluded.source_projects_json,
+        success_count=playbook_patterns.success_count+1,updated_at=excluded.updated_at,kind='anti_pattern',metadata_json=excluded.metadata_json
+    `).run(id, signature, pattern, JSON.stringify(triggerConditions), JSON.stringify(resolution), JSON.stringify(applicabilityScope), JSON.stringify(sources), timestamp, timestamp, JSON.stringify(metadata));
+    return patternFromRow(required2(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature)), 1);
+  }
+  list(kind) {
+    const rows = kind ? this.db.prepare("SELECT * FROM playbook_patterns WHERE kind = ? ORDER BY updated_at DESC").all(kind) : this.db.prepare("SELECT * FROM playbook_patterns ORDER BY updated_at DESC").all();
+    return rows.map((row) => patternFromRow(row, 1));
   }
   rememberFailure(sourceProject, failure) {
     this.db.prepare(`
@@ -1484,7 +1802,7 @@ var PlaybookStore = class {
       const patternTerms = normalizeKeywords(String(row.pattern));
       const searchable = /* @__PURE__ */ new Set([...triggers, ...patternTerms]);
       const overlap = terms.filter((term) => searchable.has(term)).length;
-      const score = terms.length === 0 ? 0 : overlap / terms.length + Math.min(0.25, Number(row.success_count) / 100);
+      const score = terms.length === 0 || overlap === 0 ? 0 : overlap / terms.length + Math.min(0.25, Number(row.success_count) / 100);
       return patternFromRow(row, score);
     }).filter((suggestion) => suggestion.score > 0).sort((left, right) => right.score - left.score || right.successCount - left.successCount).slice(0, Math.max(1, Math.min(limit, 20)));
   }
@@ -1528,11 +1846,13 @@ function patternFromRow(row, score) {
     id: String(row.id),
     pattern: String(row.pattern),
     score,
+    kind: row.kind === "anti_pattern" ? "anti_pattern" : "phase",
     triggerConditions: jsonArray(row.trigger_conditions_json),
     resolution: jsonArray(row.resolution_json),
     applicabilityScope: jsonArray(row.applicability_scope_json),
     sourceProjects: jsonArray(row.source_projects_json),
-    successCount: Number(row.success_count)
+    successCount: Number(row.success_count),
+    metadata: row.metadata_json ? JSON.parse(scalar(row.metadata_json)) : {}
   };
 }
 function patternSignature(pattern, triggers, resolution, scope) {
@@ -1553,11 +1873,20 @@ function normalizeKeywords(value) {
   return [...new Set(source.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop.has(term)).slice(0, 40);
 }
 function jsonArray(value) {
-  return JSON.parse(String(value));
+  return JSON.parse(scalar(value));
+}
+function scalar(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
+  throw new Error("non-scalar playbook value");
 }
 function required2(value) {
   if (value === null || value === void 0) throw new Error("playbook write failed");
   return value;
+}
+function addColumn2(db, table, name, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((row) => String(row.name) === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
 }
 
 // src/core/command-quality.ts
@@ -1615,6 +1944,102 @@ function dedupeWarnings(values) {
   return [...new Map(values.map((warning) => [`${warning.phaseId}:${warning.code}:${warning.commands.join("|")}`, warning])).values()];
 }
 
+// src/core/critic.ts
+import { spawn } from "node:child_process";
+var MAX_OUTPUT = 32e3;
+var CriticRunner = class {
+  constructor(command2 = process.env.KEEP_CODING_CRITIC_COMMAND?.trim() ?? "", timeoutMs = 12e4) {
+    this.command = command2;
+    this.timeoutMs = timeoutMs;
+  }
+  command;
+  timeoutMs;
+  async review(input, blocking) {
+    if (!this.command) {
+      return {
+        configured: false,
+        blocking,
+        passed: !blocking,
+        summary: blocking ? "Blocking critic review was requested, but KEEP_CODING_CRITIC_COMMAND is not configured." : "Advisory critic is not configured; deterministic gates remain authoritative.",
+        findings: blocking ? [{ severity: "error", rule: "critic-not-configured", message: "Configure an independent critic command or make the critic advisory." }] : [],
+        rawOutput: ""
+      };
+    }
+    const result = await runCommand(this.command, input.root, JSON.stringify({ contract: input.contract, phase: input.phase, changedFiles: input.changedFiles, diff: input.diff }), this.timeoutMs);
+    if (result.code !== 0) {
+      return {
+        configured: true,
+        blocking,
+        passed: !blocking,
+        summary: `Critic command failed with exit code ${result.code ?? "unknown"}.`,
+        findings: [{ severity: blocking ? "error" : "warning", rule: "critic-command-failed", message: result.output.slice(-2e3) }],
+        rawOutput: result.output.slice(-MAX_OUTPUT)
+      };
+    }
+    try {
+      const parsed = JSON.parse(result.output);
+      const passed = parsed.passed === true;
+      const findings = Array.isArray(parsed.findings) ? parsed.findings.flatMap((finding) => normalizeFinding(finding)) : [];
+      return {
+        configured: true,
+        blocking,
+        passed: blocking ? passed : true,
+        summary: typeof parsed.summary === "string" ? parsed.summary : passed ? "Critic accepted the change." : "Critic raised advisory findings.",
+        findings,
+        rawOutput: result.output.slice(-MAX_OUTPUT)
+      };
+    } catch {
+      return {
+        configured: true,
+        blocking,
+        passed: !blocking,
+        summary: "Critic output was not valid JSON.",
+        findings: [{ severity: blocking ? "error" : "warning", rule: "critic-invalid-output", message: result.output.slice(-2e3) }],
+        rawOutput: result.output.slice(-MAX_OUTPUT)
+      };
+    }
+  }
+};
+function normalizeFinding(value) {
+  if (typeof value !== "object" || value === null) return [];
+  const item = value;
+  const severity = item.severity === "error" || item.severity === "warning" || item.severity === "info" ? item.severity : "warning";
+  if (typeof item.message !== "string") return [];
+  return [{ severity, rule: typeof item.rule === "string" ? item.rule : "critic", message: item.message, ...typeof item.file === "string" ? { file: item.file } : {} }];
+}
+async function runCommand(command2, cwd, input, timeoutMs) {
+  const shell = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
+  const args = process.platform === "win32" ? ["/d", "/s", "/c", command2] : ["-c", command2];
+  return new Promise((resolve) => {
+    const child = spawn(shell, args, { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    let settled = false;
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    const finish = (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, output });
+    };
+    child.stdout.on("data", (chunk) => {
+      output = appendBounded(output, String(chunk));
+    });
+    child.stderr.on("data", (chunk) => {
+      output = appendBounded(output, String(chunk));
+    });
+    child.on("error", (error2) => {
+      output = appendBounded(output, error2.message);
+      finish(null);
+    });
+    child.on("close", finish);
+    child.stdin.end(input);
+  });
+}
+function appendBounded(current, chunk) {
+  const combined = current + chunk;
+  return combined.length <= MAX_OUTPUT ? combined : combined.slice(-MAX_OUTPUT);
+}
+
 // src/core/context.ts
 var DEFAULT_MAX_CHARS = 12e3;
 var ALL_SECTIONS = [
@@ -1624,6 +2049,8 @@ var ALL_SECTIONS = [
   "approvals",
   "budget",
   "decisions",
+  "assumptions",
+  "corrections",
   "failures",
   "checkpoints",
   "graph",
@@ -1646,6 +2073,8 @@ function compileContextEnvelope(store, options = {}) {
     ["approvals", approvalSection(snapshot)],
     ["budget", budgetSection(snapshot)],
     ["decisions", decisionSection(snapshot)],
+    ["assumptions", assumptionSection(snapshot)],
+    ["corrections", correctionSection(snapshot, options.playbook ?? [])],
     ["failures", failureSection(snapshot)],
     ["checkpoints", checkpointSection(snapshot)],
     ["graph", graphSummarySection(related)],
@@ -1682,6 +2111,8 @@ function changedSectionsFromEvents(events) {
     if (/^approval_/u.test(type)) sections.add("approvals");
     if (/^(budget_|plugin_token_)/u.test(type)) sections.add("budget");
     if (/^decision_/u.test(type)) sections.add("decisions");
+    if (/^assumption_/u.test(type)) sections.add("assumptions");
+    if (/^correction_/u.test(type)) sections.add("corrections");
     if (/^failure_/u.test(type)) sections.add("failures");
     if (/^(phase_completed|phase_verification|project_completion_gate)/u.test(type)) sections.add("checkpoints");
     if (/^(repository_indexed|phase_completed|phase_reverification)/u.test(type)) sections.add("graph");
@@ -1718,10 +2149,13 @@ function phaseSection(snapshot) {
   const active = snapshot.project.currentPhaseId ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) : null;
   if (!active) return `## Phase status
 ${snapshot.phases.map((phase) => `- ${phase.id}: ${phase.status}`).join("\n") || "Plan not saved."}`;
+  const ambiguity = assessAmbiguity(active.goal, snapshot.project.contract?.doneWhen ?? []);
+  const hasAssumptions = snapshot.assumptions.some((assumption) => assumption.phaseId === active.id);
   return [
     "## Active phase",
     `${active.id} \u2014 ${active.title} [${active.status}]`,
     `Goal: ${active.goal}`,
+    ambiguity.high && !hasAssumptions ? `AMBIGUITY PREFLIGHT: record_assumption before any scoped edit (${ambiguity.reasons.join("; ")}).` : "",
     `Allowed scope:
 ${bullets(active.allowedScope)}`,
     `Acceptance commands:
@@ -1757,6 +2191,29 @@ function decisionSection(snapshot) {
   return decisions.length === 0 ? "" : `## Active decisions
 ${decisions.map((decision) => `- ${decision.title}: ${decision.rationale}`).join("\n")}`;
 }
+function assumptionSection(snapshot) {
+  const phaseId = snapshot.project.currentPhaseId;
+  const open = snapshot.assumptions.filter((assumption) => assumption.status === "open" && (phaseId === null || assumption.phaseId === phaseId)).sort((left, right) => left.confidence - right.confidence || left.createdAt.localeCompare(right.createdAt));
+  if (open.length === 0) return "";
+  const threshold = snapshot.project.contract?.assumptionConfidenceThreshold ?? 0.6;
+  return `## Open assumptions
+${open.map((assumption) => {
+    const line = `- ${assumption.id} [confidence ${assumption.confidence.toFixed(2)}]: ${assumption.statement}`;
+    return assumption.confidence < threshold ? `${line}
+  Confidence below ${threshold.toFixed(2)} \u2014 confirm or invalidate this assumption before checkpointing.` : line;
+  }).join("\n")}`;
+}
+function correctionSection(snapshot, patterns) {
+  const corrections = snapshot.corrections.slice(-8);
+  const antiPatterns = patterns.filter((pattern) => pattern.kind === "anti_pattern").slice(0, 3);
+  if (corrections.length === 0 && antiPatterns.length === 0) return "";
+  const lines = [
+    ...antiPatterns.map((pattern) => `- Relevant past correction: ${pattern.pattern} \u2192 ${pattern.resolution.join("; ")}`),
+    ...corrections.map((correction) => `- ${correction.id} [${correction.outcome ?? "pending"}] ${correction.rootCause}; radius=${correction.blastRadiusSize}`)
+  ];
+  return `## Known corrections
+${lines.join("\n")}`;
+}
 function failureSection(snapshot) {
   const unresolved = snapshot.failures.filter((failure) => failure.resolution === null);
   const failures = [...unresolved].sort((left, right) => right.count - left.count || right.lastSeenAt.localeCompare(left.lastSeenAt)).slice(0, 5);
@@ -1785,8 +2242,10 @@ function graphSummarySection(nodes) {
 }
 function playbookSection(patterns) {
   if (patterns.length === 0) return "";
+  const phases = patterns.filter((entry) => entry.kind !== "anti_pattern");
+  if (phases.length === 0) return "";
   return `## Relevant playbook patterns
-${patterns.slice(0, 3).map((entry) => `- ${entry.pattern}: ${entry.resolution.join("; ")} [scope: ${entry.applicabilityScope.join(", ")}]`).join("\n")}`;
+${phases.slice(0, 3).map((entry) => `- ${entry.pattern}: ${entry.resolution.join("; ")} [scope: ${entry.applicabilityScope.join(", ")}]`).join("\n")}`;
 }
 function fitSections(sections, maxChars) {
   const selected = [];
@@ -4023,102 +4482,6 @@ function redact(value) {
   return `${value.slice(0, 4)}\u2026${value.slice(-4)}`;
 }
 
-// src/core/critic.ts
-import { spawn } from "node:child_process";
-var MAX_OUTPUT = 32e3;
-var CriticRunner = class {
-  constructor(command2 = process.env.KEEP_CODING_CRITIC_COMMAND?.trim() ?? "", timeoutMs = 12e4) {
-    this.command = command2;
-    this.timeoutMs = timeoutMs;
-  }
-  command;
-  timeoutMs;
-  async review(input, blocking) {
-    if (!this.command) {
-      return {
-        configured: false,
-        blocking,
-        passed: !blocking,
-        summary: blocking ? "Blocking critic review was requested, but KEEP_CODING_CRITIC_COMMAND is not configured." : "Advisory critic is not configured; deterministic gates remain authoritative.",
-        findings: blocking ? [{ severity: "error", rule: "critic-not-configured", message: "Configure an independent critic command or make the critic advisory." }] : [],
-        rawOutput: ""
-      };
-    }
-    const result = await runCommand(this.command, input.root, JSON.stringify({ contract: input.contract, phase: input.phase, changedFiles: input.changedFiles, diff: input.diff }), this.timeoutMs);
-    if (result.code !== 0) {
-      return {
-        configured: true,
-        blocking,
-        passed: !blocking,
-        summary: `Critic command failed with exit code ${result.code ?? "unknown"}.`,
-        findings: [{ severity: blocking ? "error" : "warning", rule: "critic-command-failed", message: result.output.slice(-2e3) }],
-        rawOutput: result.output.slice(-MAX_OUTPUT)
-      };
-    }
-    try {
-      const parsed = JSON.parse(result.output);
-      const passed = parsed.passed === true;
-      const findings = Array.isArray(parsed.findings) ? parsed.findings.flatMap((finding) => normalizeFinding(finding)) : [];
-      return {
-        configured: true,
-        blocking,
-        passed: blocking ? passed : true,
-        summary: typeof parsed.summary === "string" ? parsed.summary : passed ? "Critic accepted the change." : "Critic raised advisory findings.",
-        findings,
-        rawOutput: result.output.slice(-MAX_OUTPUT)
-      };
-    } catch {
-      return {
-        configured: true,
-        blocking,
-        passed: !blocking,
-        summary: "Critic output was not valid JSON.",
-        findings: [{ severity: blocking ? "error" : "warning", rule: "critic-invalid-output", message: result.output.slice(-2e3) }],
-        rawOutput: result.output.slice(-MAX_OUTPUT)
-      };
-    }
-  }
-};
-function normalizeFinding(value) {
-  if (typeof value !== "object" || value === null) return [];
-  const item = value;
-  const severity = item.severity === "error" || item.severity === "warning" || item.severity === "info" ? item.severity : "warning";
-  if (typeof item.message !== "string") return [];
-  return [{ severity, rule: typeof item.rule === "string" ? item.rule : "critic", message: item.message, ...typeof item.file === "string" ? { file: item.file } : {} }];
-}
-async function runCommand(command2, cwd, input, timeoutMs) {
-  const shell = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
-  const args = process.platform === "win32" ? ["/d", "/s", "/c", command2] : ["-c", command2];
-  return new Promise((resolve) => {
-    const child = spawn(shell, args, { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-    let output = "";
-    let settled = false;
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-    const finish = (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve({ code, output });
-    };
-    child.stdout.on("data", (chunk) => {
-      output = appendBounded(output, String(chunk));
-    });
-    child.stderr.on("data", (chunk) => {
-      output = appendBounded(output, String(chunk));
-    });
-    child.on("error", (error2) => {
-      output = appendBounded(output, error2.message);
-      finish(null);
-    });
-    child.on("close", finish);
-    child.stdin.end(input);
-  });
-}
-function appendBounded(current, chunk) {
-  const combined = current + chunk;
-  return combined.length <= MAX_OUTPUT ? combined : combined.slice(-MAX_OUTPUT);
-}
-
 // src/core/verifier.ts
 var execAsync = promisify2(exec);
 var MAX_OUTPUT2 = 8e3;
@@ -4132,7 +4495,12 @@ var PhaseVerifier = class {
   async verify(git, phase, options) {
     const started = performance.now();
     const changedFiles = options.baseline ? await git.changedFilesSince(options.baseline) : await git.changedFiles();
-    const scopeViolations = phase.allowedScope.length === 0 ? [] : changedFiles.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false })));
+    const correctionScope = options.correctionAllowedFiles ? new Set(options.correctionAllowedFiles) : null;
+    const scopeViolations = changedFiles.filter((file) => {
+      const phaseAllows = phase.allowedScope.length === 0 || phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false }));
+      const correctionAllows = correctionScope === null || correctionScope.has(file);
+      return !phaseAllows || !correctionAllows;
+    });
     const secretScan = await scanChangedFiles(git.root, changedFiles);
     const selectiveCommands = [];
     const commands = [];
@@ -4142,8 +4510,9 @@ var PhaseVerifier = class {
       if (selectiveCommands.every((command2) => command2.passed)) await this.runSequence(phase.acceptanceCommands, git.root, commands, options.previousFailures ?? []);
     }
     const commandGatePassed = selectiveCommands.length === (options.selectiveCommands ?? []).length && selectiveCommands.every((command2) => command2.passed) && commands.length === phase.acceptanceCommands.length && commands.every((command2) => command2.passed);
-    const blocking = phase.criticBlocking === true || options.contract.critic?.blocking === true;
-    const critic = deterministicPrerequisitesPassed && commandGatePassed ? await (options.criticRunner ?? new CriticRunner()).review({ root: git.root, phase, contract: options.contract, changedFiles, diff: await git.diff() }, blocking) : skippedCritic(blocking);
+    const blocking = options.forceBlockingCritic === true || phase.criticBlocking === true || options.contract.critic?.blocking === true;
+    const criticEnabled = options.forceBlockingCritic === true || phase.criticBlocking === true || options.contract.critic?.enabled === true;
+    const critic = deterministicPrerequisitesPassed && commandGatePassed && criticEnabled ? await (options.criticRunner ?? new CriticRunner()).review({ root: git.root, phase, contract: options.contract, changedFiles, diff: await git.diff() }, blocking) : skippedCritic(blocking, criticEnabled);
     const scopePassed = scopeViolations.length === 0;
     return {
       passed: scopePassed && secretScan.passed && options.budget.passed && commandGatePassed && critic.passed,
@@ -4289,8 +4658,9 @@ function mergeCompression(left, right) {
     previousAttempt: left.previousAttempt ?? right.previousAttempt
   };
 }
-function skippedCritic(blocking) {
-  return { configured: false, blocking, passed: !blocking, summary: "Critic did not run because an earlier deterministic gate failed.", findings: [], rawOutput: "" };
+function skippedCritic(blocking, enabled = true) {
+  const summary = enabled ? "Critic did not run because an earlier deterministic gate failed." : "Critic review is disabled for this phase.";
+  return { configured: false, blocking, passed: !blocking, summary, findings: [], rawOutput: "" };
 }
 
 // src/core/orchestrator.ts
@@ -4622,6 +4992,24 @@ var KeepCodingService = class _KeepCodingService {
     if (!digest) throw new Error(`indexed file not found: ${filePath}`);
     return digest;
   }
+  recordAssumption(phaseId, statement, confidence, alternatives) {
+    const assumptionId = this.store.recordAssumption({ phaseId, statement, confidence, alternatives });
+    return { assumption_id: assumptionId, assumption: this.store.getAssumption(assumptionId) };
+  }
+  linkAssumption(assumptionId, nodeIds) {
+    return { linked: this.store.linkAssumption(assumptionId, nodeIds) };
+  }
+  confirmAssumption(assumptionId, evidence) {
+    return { status: "confirmed", assumption: this.store.confirmAssumption(assumptionId, evidence) };
+  }
+  invalidateAssumption(assumptionId, rootCause, maxHops) {
+    const correction = this.store.invalidateAssumption(assumptionId, rootCause, maxHops, this.store.totalRecordedTokens());
+    return { correction_id: correction.id, blast_radius: correction.blastRadius, blast_radius_size: correction.blastRadiusSize, correction };
+  }
+  expandCorrectionScope(correctionId, additionalNodeIds, justification) {
+    const correction = this.store.expandCorrectionScope(correctionId, additionalNodeIds, justification);
+    return { expanded: additionalNodeIds.length, correction };
+  }
   async startPhase(phaseId) {
     this.store.setPhaseBaseline(phaseId, await this.git.workingTreeSnapshot());
     const phase = this.store.startPhase(phaseId, await this.git.headSha());
@@ -4652,11 +5040,27 @@ var KeepCodingService = class _KeepCodingService {
     if (!phase) throw new Error(`unknown phase: ${phaseId}`);
     const project = this.store.getProject();
     if (!project?.contract) throw new Error("project contract is missing");
+    const baseline = this.store.getPhaseBaseline(phaseId) ?? void 0;
+    const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
+    this.store.autoLinkChangedFiles(phaseId, changedFiles);
+    const phaseAssumptions = this.store.listAssumptions(phaseId);
+    const ambiguity = assessAmbiguity(phase.goal, project.contract.doneWhen);
+    if (ambiguity.high && phaseAssumptions.length === 0) {
+      throw new Error(`HIGH_AMBIGUITY_WITHOUT_ASSUMPTION: record_assumption before checkpoint: ${ambiguity.reasons.join("; ")}`);
+    }
+    const threshold = project.contract.assumptionConfidenceThreshold ?? 0.6;
+    const unresolved = phaseAssumptions.filter((assumption) => assumption.status === "open" && assumption.confidence < threshold);
+    if (unresolved.length > 0) {
+      const critic = await new CriticRunner().review({ root: this.git.root, phase, contract: project.contract, changedFiles, diff: await this.git.diff() }, true);
+      this.store.appendEvent("assumption_critic_escalated", phaseId, { assumptionIds: unresolved.map((item) => item.id), critic });
+      const detail = unresolved.map((assumption) => `${assumption.id}: ${assumption.statement}`).join("; ");
+      throw new Error(`LOW_CONFIDENCE_ASSUMPTIONS: confirm or invalidate before checkpoint: ${detail}; critic=${critic.summary}`);
+    }
+    const correction = this.store.activeCorrection(phaseId);
+    const correctionAllowedFiles = correction ? this.store.correctionAllowedFiles(correction.id) : void 0;
     this.store.markVerifying(phaseId);
     const verifying = this.store.getPhase(phaseId);
     if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
-    const baseline = this.store.getPhaseBaseline(phaseId) ?? void 0;
-    const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
     const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
     const impactedTests2 = this.store.impactedTests(changedFiles);
     const selectiveCommands = project.contract.selectiveTests && impactedTests2.length > 0 ? [project.contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests2.map(shellQuote2).join(" "))] : [];
@@ -4667,12 +5071,24 @@ var KeepCodingService = class _KeepCodingService {
       budget: this.store.budgetEvidence(phaseId),
       contract: project.contract,
       impactedCompletedPhases,
-      previousFailures
+      previousFailures,
+      ...correctionAllowedFiles ? { correctionAllowedFiles } : {}
     });
     this.persistCommandFailures(phaseId, phase.attempts + 1, [...evidence.selectiveCommands, ...evidence.commands]);
     this.recordCommandOutputUsage(phaseId, [...evidence.selectiveCommands, ...evidence.commands]);
+    let correctionResult = null;
+    if (correction) {
+      const assessed = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), false);
+      correctionResult = assessed.correction;
+      if (assessed.unauthorizedFiles.length > 0) {
+        evidence.passed = false;
+        evidence.scopePassed = false;
+        evidence.scopeViolations = [.../* @__PURE__ */ new Set([...evidence.scopeViolations, ...assessed.unauthorizedFiles])];
+      }
+    }
     if (evidence.passed) {
       evidence.gitSha = await this.git.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
+      if (correction) correctionResult = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), true).correction;
     }
     const updated = this.store.finishVerification(phaseId, summary, evidence);
     let reverificationRequired = [];
@@ -4684,10 +5100,12 @@ var KeepCodingService = class _KeepCodingService {
         phaseId
       );
       this.rememberSuccessfulPhase(updated);
+      if (correctionResult?.completedAt) this.rememberCorrection(correctionResult);
     }
     return {
       phase: updated,
       evidence,
+      correction: correctionResult,
       reverificationRequired,
       project: this.store.getProject(),
       nextAction: evidence.passed ? this.store.currentPhase() ? "start_phase" : "complete_project" : "repair_phase"
@@ -4752,7 +5170,10 @@ var KeepCodingService = class _KeepCodingService {
     const query = [project.contract.goal, phase?.title, phase?.goal, ...phase?.allowedScope ?? []].filter(Boolean).join(" ");
     const playbook = new PlaybookStore();
     try {
-      return playbook.suggest(tokenize(query).join(" "), 3);
+      const suggestions = playbook.suggest(tokenize(query).join(" "), 3);
+      const antiPatternIds = suggestions.filter((pattern) => pattern.kind === "anti_pattern").map((pattern) => pattern.id);
+      if (antiPatternIds.length > 0) this.store.recordAntiPatternHits(phase?.id ?? null, antiPatternIds);
+      return suggestions;
     } finally {
       playbook.close();
     }
@@ -4781,6 +5202,19 @@ var KeepCodingService = class _KeepCodingService {
       if (command2.passed) continue;
       const fingerprint = createHash7("sha256").update(`${command2.command}\0${command2.stdout}\0${command2.stderr}`).digest("hex").slice(0, 24);
       this.store.recordCommandFailure({ phaseId, command: command2.command, attempt, stdout: command2.stdout, stderr: command2.stderr, fingerprint, createdAt: (/* @__PURE__ */ new Date()).toISOString() });
+    }
+  }
+  rememberCorrection(correction) {
+    const project = this.store.getProject();
+    if (!project?.contract?.playbookOptIn || correction.outcome === null) return;
+    const assumption = this.store.getAssumption(correction.assumptionId);
+    if (!assumption) return;
+    const playbook = new PlaybookStore();
+    try {
+      const pattern = playbook.rememberCorrection(project.root, assumption, correction);
+      this.store.appendEvent("playbook_antipattern_recorded", correction.phaseId, { correctionId: correction.id, patternId: pattern.id });
+    } finally {
+      playbook.close();
     }
   }
   rememberSuccessfulPhase(phase) {
@@ -4846,18 +5280,30 @@ Activation confidence ${(detection.confidence * 100).toFixed(0)}%: ${detection.r
       ...input.stop_hook_active !== void 0 ? { stopGuardActive: input.stop_hook_active } : {},
       ...lastDelivered !== void 0 ? { sinceSequence: lastDelivered } : {}
     }, service);
+    const nudge = event === "Stop" ? apologyLanguageNudge(input, service) : "";
     if (event === "Stop" && !directive.continue) {
       service.store.setLastStopProgressSequence(service.store.latestEventSequence());
       return {
         decision: "block",
         reason: `Keep Coding project is ${project.status}. Resume from durable state:
 
-${directive.blockReason ?? service.context(7e3)}`
+${directive.blockReason ?? service.context(7e3)}${nudge ? `
+
+${nudge}` : ""}`
       };
     }
     if (lastDelivered !== void 0) service.store.setLastDeliveredSequence(cursor, directive.sequence ?? service.store.latestEventSequence());
-    return directive.context ? contextOutput(event, directive.context) : { continue: true };
+    const additional = [directive.context, nudge].filter((value) => Boolean(value)).join("\n\n");
+    return additional ? contextOutput(event, additional) : { continue: true };
   });
+}
+function apologyLanguageNudge(input, service) {
+  const tail = [input.transcript_tail, input.transcript, input.message, input.prompt].find((value) => typeof value === "string") ?? "";
+  const apology = /\b(?:sorry|apolog(?:y|ize|ise|ized|ised)|misunderstood|wrong interpretation|start over|restart|özür dilerim|özür|yanlış anlamışım|yanlış anladım|baştan başla|baştan yapmak)\b/iu.test(tail);
+  if (!apology) return "";
+  const since = service.store.lastCheckpointEventSequence();
+  if (service.store.correctionRecordedSince(since)) return "";
+  return "A prior interpretation appears to be wrong. Call `invalidate_assumption` and use its bounded blast radius; do not apologize and restart broad work.";
 }
 function contextOutput(event, additionalContext) {
   return { continue: true, hookSpecificOutput: { hookEventName: event, additionalContext } };
@@ -26245,6 +26691,7 @@ var StdioServerTransport = class {
 var rootSchema = object({
   project_root: string2().min(1).refine(path9.isAbsolute, "project_root must be an absolute path").describe("Absolute path inside the target Git repository on the MCP server")
 });
+var assumptionAlternativeSchema = object({ interpretation: string2().min(1), whyRejected: string2().min(1) });
 var budgetSchema = object({
   maxTokens: number2().int().positive().optional(),
   maxCostUsd: number2().positive().optional(),
@@ -26275,17 +26722,19 @@ var contractSchema = object({
   budget: budgetSchema.optional(),
   critic: object({ enabled: boolean2(), blocking: boolean2() }).optional(),
   selectiveTests: object({ commandTemplate: string2().min(1), fullSuiteCommands: array(string2().min(1)) }).optional(),
-  playbookOptIn: boolean2().optional()
+  playbookOptIn: boolean2().optional(),
+  assumptionConfidenceThreshold: number2().min(0).max(1).optional()
 });
 function createServer(options = {}) {
   const server = new McpServer(
-    { name: "keep-coding", version: "0.2.1" },
+    { name: "keep-coding", version: "0.3.0" },
     {
       instructions: [
         "Use one evidence-gated workflow; amend plans only through amend_plan.",
         "Deterministic commands, secret scanning, budget checks, impact-aware reverification, and pending approvals are authoritative.",
         "Prefer delta get_context, get_file_digest, and Tier-1 expand_graph over redundant broad reads.",
-        "Remote edits remain bounded by the active phase allowedScope."
+        "Record uncertain interpretations before editing; invalidate wrong assumptions into bounded correction radii instead of restarting broadly.",
+        "Remote edits remain bounded by the active phase allowedScope and any active correction radius."
       ].join(" ")
     }
   );
@@ -26477,6 +26926,30 @@ function createServer(options = {}) {
     rootSchema.extend({ phase_id: string2().min(1), patch: string2().min(1).max(262144) }),
     (service, input) => service.workspace.applyPatch(input.phase_id, input.patch)
   );
+  register2(server, options, "record_assumption", "Record an uncertain semantic interpretation before implementation.", rootSchema.extend({
+    phase_id: string2().nullable().default(null),
+    statement: string2().min(1),
+    confidence: number2().finite().min(0).max(1),
+    alternatives: array(assumptionAlternativeSchema)
+  }), async (service, input) => service.recordAssumption(input.phase_id, input.statement, input.confidence, input.alternatives));
+  register2(server, options, "link_assumption", "Link an open assumption to exact file, symbol, or decision graph nodes.", rootSchema.extend({
+    assumption_id: string2().min(1),
+    node_ids: array(string2().min(1)).min(1)
+  }), async (service, input) => service.linkAssumption(input.assumption_id, input.node_ids));
+  register2(server, options, "confirm_assumption", "Confirm an open assumption with evidence.", rootSchema.extend({
+    assumption_id: string2().min(1),
+    evidence: string2().min(1)
+  }), async (service, input) => service.confirmAssumption(input.assumption_id, input.evidence));
+  register2(server, options, "invalidate_assumption", "Invalidate an assumption and compute its bounded graph blast radius.", rootSchema.extend({
+    assumption_id: string2().min(1),
+    root_cause: string2().min(1),
+    max_hops: number2().int().min(0).max(12).optional()
+  }), async (service, input) => service.invalidateAssumption(input.assumption_id, input.root_cause, input.max_hops));
+  register2(server, options, "expand_correction_scope", "Expand a correction radius with an explicit reviewable justification.", rootSchema.extend({
+    correction_id: string2().min(1),
+    additional_node_ids: array(string2().min(1)).min(1),
+    justification: string2().trim().min(1)
+  }), async (service, input) => service.expandCorrectionScope(input.correction_id, input.additional_node_ids, input.justification));
   register2(server, options, "record_decision", "Persist architectural rationale.", rootSchema.extend({
     phase_id: string2().nullable().default(null),
     title: string2().min(1),
@@ -26903,6 +27376,35 @@ function combination(n, k) {
   for (let index = 1; index <= smaller; index += 1) result = result * (n - smaller + index) / index;
   return result;
 }
+function summarizeAssumptionLedger(input) {
+  if (!Number.isInteger(input.antiPatternHits) || input.antiPatternHits < 0) throw new Error("anti-pattern hits must be a non-negative integer");
+  if (!Number.isInteger(input.matchingSituations) || input.matchingSituations < 0 || input.antiPatternHits > input.matchingSituations) {
+    throw new Error("invalid anti-pattern hit counts");
+  }
+  const completed = input.corrections.filter((correction) => correction.outcome !== null && correction.tokenEnd !== null);
+  const containedCorrections = completed.filter((correction) => correction.outcome === "contained").length;
+  const expandedCorrections = completed.filter((correction) => correction.outcome === "expanded").length;
+  const totalCorrectionTokens = completed.reduce((sum, correction) => {
+    const end = correction.tokenEnd ?? correction.tokenStart;
+    if (!Number.isFinite(correction.tokenStart) || !Number.isFinite(end) || correction.tokenStart < 0 || end < correction.tokenStart) {
+      throw new Error("invalid correction token counters");
+    }
+    return sum + (end - correction.tokenStart);
+  }, 0);
+  const completedCorrections = completed.length;
+  return {
+    completedCorrections,
+    containedCorrections,
+    expandedCorrections,
+    containmentRate: completedCorrections === 0 ? 0 : containedCorrections / completedCorrections,
+    containmentWilson95: completedCorrections === 0 ? [0, 0] : wilson95(containedCorrections, completedCorrections),
+    totalCorrectionTokens,
+    tokensPerCorrection: completedCorrections === 0 ? 0 : totalCorrectionTokens / completedCorrections,
+    antiPatternHits: input.antiPatternHits,
+    matchingSituations: input.matchingSituations,
+    antiPatternHitRate: input.matchingSituations === 0 ? 0 : input.antiPatternHits / input.matchingSituations
+  };
+}
 
 // src/eval/runner.ts
 var execFileAsync2 = promisify3(execFile2);
@@ -26929,7 +27431,7 @@ async function runEvaluation(configPath) {
         await execFileAsync2("git", ["worktree", "add", "--detach", target, "HEAD"], { cwd: repository });
         const started = performance.now();
         const command2 = (arm === "baseline" ? config2.baseline : config2.keepCoding).command;
-        const agent = await run(command2, target, prompt, config2.timeoutMs ?? 18e5);
+        const agent = await run(command2, target, prompt, config2.timeoutMs ?? 18e5, config2.assumptionLedger?.enabled === true);
         const verifierResults = [];
         for (const verifier of config2.verifierCommands) {
           const checked = await runShell(verifier, target, config2.timeoutMs ?? 18e5);
@@ -26957,25 +27459,42 @@ async function runEvaluation(configPath) {
     keepCoding: Boolean(results.find((item) => item.pair === index + 1 && item.arm === "keep-coding")?.success)
   }));
   const statistics = summarizeOutcomes(pairs);
+  const assumptionLedger = assumptionLedgerEvaluation(config2);
+  const report = {
+    metadata: { startingSha, promptHash, generatedAt: (/* @__PURE__ */ new Date()).toISOString() },
+    statistics,
+    ...assumptionLedger ? { assumptionLedger } : {}
+  };
   await mkdir2(outputDirectory, { recursive: true });
   await writeFile(path12.join(outputDirectory, "raw.jsonl"), `${results.map((item) => JSON.stringify(item)).join("\n")}
 `);
-  await writeFile(path12.join(outputDirectory, "summary.json"), `${JSON.stringify({ metadata: { startingSha, promptHash, generatedAt: (/* @__PURE__ */ new Date()).toISOString() }, statistics }, null, 2)}
+  await writeFile(path12.join(outputDirectory, "summary.json"), `${JSON.stringify(report, null, 2)}
 `);
-  await writeFile(path12.join(outputDirectory, "summary.md"), markdownSummary(statistics));
-  return { statistics, outputDirectory };
+  await writeFile(path12.join(outputDirectory, "summary.md"), markdownSummary(statistics, assumptionLedger));
+  return { statistics, ...assumptionLedger ? { assumptionLedger } : {}, outputDirectory };
+}
+function assumptionLedgerEvaluation(config2) {
+  const ledger = config2.assumptionLedger;
+  if (!ledger?.enabled) return null;
+  const metrics = summarizeAssumptionLedger({
+    corrections: ledger.corrections ?? [],
+    antiPatternHits: ledger.antiPatternHits ?? 0,
+    matchingSituations: ledger.matchingSituations ?? 0
+  });
+  const paired = ledger.pairedOutcomes?.map((item) => ({ baseline: item.disabled, keepCoding: item.enabled }));
+  return { metrics, ...paired && paired.length > 0 ? { enabledVsDisabled: summarizeOutcomes(paired) } : {} };
 }
 function validateConfig(config2) {
   if (!Number.isInteger(config2.runs) || config2.runs < 1) throw new Error("runs must be a positive integer");
   if (config2.baseline.command.length === 0 || config2.keepCoding.command.length === 0) throw new Error("both commands are required");
   if (config2.verifierCommands.length === 0) throw new Error("at least one independent verifier command is required");
 }
-async function run(command2, cwd, input, timeout) {
+async function run(command2, cwd, input, timeout, assumptionLedgerEnabled) {
   const [executable, ...args] = command2;
   if (!executable) throw new Error("empty command");
   return new Promise((resolve) => {
     const child = import("node:child_process").then(({ spawn: spawn3 }) => {
-      const process4 = spawn3(executable, args, { cwd, env: processEnv(), stdio: ["pipe", "pipe", "pipe"], timeout });
+      const process4 = spawn3(executable, args, { cwd, env: processEnv(assumptionLedgerEnabled), stdio: ["pipe", "pipe", "pipe"], timeout });
       let output = "";
       process4.stdout.on("data", (chunk) => {
         output += String(chunk);
@@ -27000,12 +27519,12 @@ async function runShell(command2, cwd, timeout) {
     return { code: typeof failure.code === "number" ? failure.code : null, output: `${failure.stdout ?? ""}${failure.stderr ?? failure.message}` };
   }
 }
-function processEnv() {
-  return { ...process.env, KEEP_CODING_EVAL: "1" };
+function processEnv(assumptionLedgerEnabled) {
+  return { ...process.env, KEEP_CODING_EVAL: "1", KEEP_CODING_ASSUMPTION_LEDGER: assumptionLedgerEnabled ? "1" : "0" };
 }
-function markdownSummary(value) {
+function markdownSummary(value, ledger) {
   const percent = (input) => `${(input * 100).toFixed(1)}%`;
-  return `# Keep Coding evaluation
+  const base = `# Keep Coding evaluation
 
 | Metric | Baseline | Keep Coding |
 |---|---:|---:|
@@ -27016,6 +27535,21 @@ function markdownSummary(value) {
 Absolute paired delta: **${percent(value.absoluteDelta)}**  
 Exact McNemar p-value: **${value.mcnemarExactP.toFixed(4)}**
 `;
+  if (!ledger) return base;
+  const metrics = ledger.metrics;
+  return `${base}
+## Assumption ledger
+
+| Metric | Value |
+|---|---:|
+| Contained corrections | ${metrics.containedCorrections}/${metrics.completedCorrections} |
+| Containment rate | ${percent(metrics.containmentRate)} |
+| Containment Wilson 95% CI | ${percent(metrics.containmentWilson95[0])}\u2013${percent(metrics.containmentWilson95[1])} |
+| Tokens per correction | ${metrics.tokensPerCorrection.toFixed(1)} |
+| Anti-pattern hit rate | ${percent(metrics.antiPatternHitRate)} |
+${ledger.enabledVsDisabled ? `
+Enabled-vs-disabled exact McNemar p-value: **${ledger.enabledVsDisabled.mcnemarExactP.toFixed(4)}**
+` : ""}`;
 }
 
 // src/dashboard/server.ts
@@ -27064,7 +27598,7 @@ function escapeHtml(value) {
 }
 
 // src/entry.ts
-var VERSION = "0.2.1";
+var VERSION = "0.3.0";
 var [command = "help", argument] = process.argv.slice(2);
 try {
   switch (command) {

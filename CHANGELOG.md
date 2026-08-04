@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 — 2026-08-04
+
+- Added a durable assumption ledger with validated confidence, alternatives, terminal status transitions, and graph links to files, symbols, and decisions.
+- Added bounded correction records with hop-limited cycle-safe blast-radius traversal, explicit scope expansion, and contained/expanded outcomes.
+- Added MCP tools for recording, linking, confirming, invalidating, and expanding assumptions/corrections, including conservative single-assumption auto-linking.
+- Added delta-aware open-assumption and correction context, ambiguity pre-flight, low-confidence checkpoint enforcement, and mandatory blocking critic escalation.
+- Added cross-project correction anti-patterns, bilingual apology-language nudges, and a non-negotiable skill protocol for structured correction instead of apology-and-restart.
+- Added assumption-ledger evaluation metrics: containment rate with Wilson interval, project-scoped tokens per correction, anti-pattern hit rate, and enabled-vs-disabled McNemar comparison.
+- Expanded the source suite from 51 to 107 tests and added a compiled-artifact correction lifecycle scenario.
+
 ## 0.2.1 — 2026-08-04
 
 - Fixed a packaging defect where the published `dist/keep-coding.mjs` crashed on every invocation because the TypeScript compiler was unintentionally bundled into ESM output.

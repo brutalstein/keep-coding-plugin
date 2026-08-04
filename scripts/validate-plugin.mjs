@@ -14,7 +14,7 @@ for (const key of required) {
 }
 if (manifest.name !== "keep-coding") throw new Error("plugin name mismatch");
 if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(manifest.version)) throw new Error("invalid semver");
-if (manifest.version !== "0.2.1") throw new Error(`plugin manifest version drift: ${manifest.version}`);
+if (manifest.version !== "0.3.0") throw new Error(`plugin manifest version drift: ${manifest.version}`);
 if (manifest.mcpServers !== "./.mcp.json") throw new Error("MCP manifest is not declared");
 if (!("keep_coding" in mcp.mcpServers)) throw new Error("keep_coding MCP server is missing");
 if (mcp.mcpServers.keep_coding.cwd !== ".") throw new Error("MCP cwd must resolve from plugin root");
@@ -30,7 +30,7 @@ for (const relative of [
 
 const version = spawnSync(process.execPath, [dist, "version"], { encoding: "utf8", timeout: 15_000 });
 assertProcess(version, "production CLI version");
-if (version.stdout.trim() !== "0.2.1") throw new Error(`production CLI version mismatch: ${version.stdout.trim()}`);
+if (version.stdout.trim() !== "0.3.0") throw new Error(`production CLI version mismatch: ${version.stdout.trim()}`);
 
 const nonGit = await mkdtemp(path.join(tmpdir(), "keep-coding-validate-"));
 try {

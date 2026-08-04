@@ -43,7 +43,7 @@ function textResult(result: Awaited<ReturnType<Client["callTool"]>>): Record<str
 
 describe("compiled Keep Coding artifact", () => {
   it("runs version and detection without evaluating the graph parser", () => {
-    expect(run(["version"]).stdout.trim()).toBe("0.2.1");
+    expect(run(["version"]).stdout.trim()).toBe("0.3.0");
     const detection = JSON.parse(run(["detect"], "Build a production-ready complete project with architecture, tests, CI, deployment and phases.").stdout) as { activate: boolean };
     expect(detection.activate).toBe(true);
     expect(statSync(DIST).size).toBeLessThan(3_000_000);
@@ -100,4 +100,54 @@ describe("compiled Keep Coding artifact", () => {
       await client.close().catch(() => undefined);
     }
   });
+
+  it("executes the compiled assumption and bounded-correction lifecycle", async () => {
+    const root = repository("keep-coding-dist-assumptions-");
+    const transport = new StdioClientTransport({ command: process.execPath, args: [DIST, "mcp"], cwd: process.cwd(), stderr: "pipe" });
+    const client = new Client({ name: "keep-coding-dist-assumptions", version: "1.0.0" });
+    try {
+      await client.connect(transport);
+      await client.callTool({ name: "initialize_project", arguments: { project_root: root, prompt: "Update src/value.js to export the exact numeric value 2 and verify it with node syntax checking." } });
+      await client.callTool({
+        name: "save_plan",
+        arguments: {
+          project_root: root,
+          contract: {
+            goal: "Update src/value.js to export the exact numeric value 2.", nonGoals: [], constraints: [],
+            deliverables: ["Updated value module"], invariants: ["Only src/value.js changes"],
+            doneWhen: ["node --check src/value.js exits zero"], assumptionConfidenceThreshold: 0.6
+          },
+          phases: [{
+            id: "correct-value", title: "Correct value", goal: "Set src/value.js export to numeric value 2 and run node syntax validation.",
+            dependencies: [], allowedScope: ["src/value.js"], acceptanceCommands: ["node --check src/value.js"],
+            verificationKind: "code", maxAttempts: 2
+          }]
+        }
+      });
+      await client.callTool({ name: "start_phase", arguments: { project_root: root, phase_id: "correct-value" } });
+      const recorded = textResult(await client.callTool({
+        name: "record_assumption",
+        arguments: {
+          project_root: root, phase_id: "correct-value", statement: "The requested value should be represented as the number 2",
+          confidence: 0.8, alternatives: [{ interpretation: "String value '2'", whyRejected: "The requirement explicitly says numeric" }]
+        }
+      }));
+      const assumptionId = String(recorded.assumption_id);
+      await client.callTool({ name: "link_assumption", arguments: { project_root: root, assumption_id: assumptionId, node_ids: ["file:src/value.js"] } });
+      const invalidated = textResult(await client.callTool({
+        name: "invalidate_assumption",
+        arguments: { project_root: root, assumption_id: assumptionId, root_cause: "The correct numeric value is 3, not 2", max_hops: 1 }
+      }));
+      expect((invalidated.blast_radius as { files?: string[] }).files).toEqual(["src/value.js"]);
+      writeFileSync(path.join(root, "src", "value.js"), "export const value = 3;\n");
+      const checkpoint = textResult(await client.callTool({
+        name: "checkpoint_phase", arguments: { project_root: root, phase_id: "correct-value", summary: "corrected bounded value" }
+      }));
+      expect((checkpoint.evidence as { passed?: boolean }).passed).toBe(true);
+      expect((checkpoint.correction as { outcome?: string }).outcome).toBe("contained");
+    } finally {
+      await client.close().catch(() => undefined);
+    }
+  });
+
 });

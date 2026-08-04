@@ -8,7 +8,7 @@ import { runEvaluation } from "./eval/runner.js";
 import { startDashboard } from "./dashboard/server.js";
 import { generatePullRequestDescription } from "./integrations/github.js";
 
-const VERSION = "0.2.1";
+const VERSION = "0.3.0";
 const [command = "help", argument] = process.argv.slice(2);
 
 try {

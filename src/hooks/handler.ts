@@ -15,6 +15,9 @@ export interface HookInput {
   session_id?: string;
   usage?: unknown;
   token_usage?: unknown;
+  transcript_tail?: string;
+  transcript?: string;
+  message?: string;
   [key: string]: unknown;
 }
 export type HookOutput = Record<string, unknown>;
@@ -67,16 +70,27 @@ export async function handleHook(event: string, input: HookInput): Promise<HookO
       ...(input.stop_hook_active !== undefined ? { stopGuardActive: input.stop_hook_active } : {}),
       ...(lastDelivered !== undefined ? { sinceSequence: lastDelivered } : {})
     }, service);
+    const nudge = event === "Stop" ? apologyLanguageNudge(input, service) : "";
     if (event === "Stop" && !directive.continue) {
       service.store.setLastStopProgressSequence(service.store.latestEventSequence());
       return {
         decision: "block",
-        reason: `Keep Coding project is ${project.status}. Resume from durable state:\n\n${directive.blockReason ?? service.context(7_000)}`
+        reason: `Keep Coding project is ${project.status}. Resume from durable state:\n\n${directive.blockReason ?? service.context(7_000)}${nudge ? `\n\n${nudge}` : ""}`
       };
     }
     if (lastDelivered !== undefined) service.store.setLastDeliveredSequence(cursor, directive.sequence ?? service.store.latestEventSequence());
-    return directive.context ? contextOutput(event, directive.context) : { continue: true };
+    const additional = [directive.context, nudge].filter((value): value is string => Boolean(value)).join("\n\n");
+    return additional ? contextOutput(event, additional) : { continue: true };
   });
+}
+
+export function apologyLanguageNudge(input: HookInput, service: KeepCodingService): string {
+  const tail = [input.transcript_tail, input.transcript, input.message, input.prompt].find((value): value is string => typeof value === "string") ?? "";
+  const apology = /\b(?:sorry|apolog(?:y|ize|ise|ized|ised)|misunderstood|wrong interpretation|start over|restart|özür dilerim|özür|yanlış anlamışım|yanlış anladım|baştan başla|baştan yapmak)\b/iu.test(tail);
+  if (!apology) return "";
+  const since = service.store.lastCheckpointEventSequence();
+  if (service.store.correctionRecordedSince(since)) return "";
+  return "A prior interpretation appears to be wrong. Call `invalidate_assumption` and use its bounded blast radius; do not apologize and restart broad work.";
 }
 
 function contextOutput(event: string, additionalContext: string): HookOutput {

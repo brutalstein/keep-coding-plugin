@@ -2,8 +2,15 @@ import { randomUUID, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { normalizedDiagnosticSignature } from "../core/signature.js";
 import type {
+  AssumptionAlternative,
+  AssumptionRecord,
+  AssumptionStatus,
+  BlastRadius,
   CheckpointRecord,
+  CorrectionRecord,
+  CorrectionScopeExpansion,
   DecisionRecord,
   EventRecord,
   FailureRecord,
@@ -24,7 +31,7 @@ type Row = Record<string, unknown>;
 export class ProjectStore {
   readonly projectRoot: string;
   readonly databasePath: string;
-  private readonly db: DatabaseSync;
+  protected readonly db: DatabaseSync;
 
   constructor(projectRoot: string) {
     this.projectRoot = path.resolve(projectRoot);
@@ -213,6 +220,236 @@ export class ProjectStore {
     return must(this.getProject(), "project completion failed");
   }
 
+
+  recordAssumption(input: { phaseId: string | null; statement: string; confidence: number; alternatives: AssumptionAlternative[] }): string {
+    if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
+      throw new Error("INVALID_CONFIDENCE: confidence must be a finite number in [0, 1]");
+    }
+    if (!Array.isArray(input.alternatives)) throw new Error("INVALID_ALTERNATIVES: alternatives must be an array");
+    if (input.phaseId !== null) must(this.getPhase(input.phaseId), `unknown phase: ${input.phaseId}`);
+    const statement = input.statement.trim();
+    if (!statement) throw new Error("assumption statement is required");
+    const id = randomUUID();
+    const createdAt = new Date().toISOString();
+    this.db.prepare(`
+      INSERT INTO assumptions (id, phase_id, statement, confidence, alternatives_json, status, created_at, resolved_at, resolution_evidence, explicit_linked_at)
+      VALUES (?, ?, ?, ?, ?, 'open', ?, NULL, NULL, NULL)
+    `).run(id, input.phaseId, statement, input.confidence, JSON.stringify(input.alternatives), createdAt);
+    this.upsertGraphNode({
+      id, type: "assumption", label: statement, path: null, symbol: null, contentHash: sha256(statement),
+      metadata: { phaseId: input.phaseId, confidence: input.confidence, alternatives: input.alternatives, status: "open" }
+    });
+    if (input.phaseId) this.upsertGraphEdge({ sourceId: `phase:${input.phaseId}`, targetId: id, type: "implements", metadata: { entity: "assumption" } });
+    this.appendEvent("assumption_recorded", input.phaseId, { id, statement, confidence: input.confidence });
+    return id;
+  }
+
+  getAssumption(id: string): AssumptionRecord | null {
+    const row = this.db.prepare("SELECT * FROM assumptions WHERE id = ?").get(id) as Row | undefined;
+    return row ? assumptionFromRow(row) : null;
+  }
+
+  listAssumptions(phaseId?: string | null, status?: AssumptionStatus): AssumptionRecord[] {
+    const clauses: string[] = [];
+    const values: string[] = [];
+    if (phaseId !== undefined) { clauses.push(phaseId === null ? "phase_id IS NULL" : "phase_id = ?"); if (phaseId !== null) values.push(phaseId); }
+    if (status !== undefined) { clauses.push("status = ?"); values.push(status); }
+    const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+    return (this.db.prepare(`SELECT * FROM assumptions${where} ORDER BY confidence ASC, created_at ASC`).all(...values) as Row[]).map(assumptionFromRow);
+  }
+
+  setAssumptionStatus(id: string, status: AssumptionStatus, evidence = ""): AssumptionRecord {
+    const current = must(this.getAssumption(id), `unknown assumption: ${id}`);
+    if (current.status !== "open") throw new Error(`one-way transition: ${current.status} -> ${status} is not allowed`);
+    if (status === "open") return current;
+    const resolvedAt = new Date().toISOString();
+    this.db.prepare("UPDATE assumptions SET status = ?, resolved_at = ?, resolution_evidence = ? WHERE id = ?")
+      .run(status, resolvedAt, evidence.trim() || null, id);
+    const node = this.getGraphNode(id);
+    if (node) this.upsertGraphNode({ ...node, metadata: { ...node.metadata, status, resolvedAt } });
+    this.appendEvent(status === "confirmed" ? "assumption_confirmed" : "assumption_invalidated", current.phaseId, { id, evidence: evidence.trim() });
+    return must(this.getAssumption(id), "assumption status update failed");
+  }
+
+  confirmAssumption(id: string, evidence: string): AssumptionRecord { return this.setAssumptionStatus(id, "confirmed", evidence); }
+
+  linkAssumption(assumptionId: string, nodeIds: string[], explicit = true): number {
+    const assumption = must(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
+    if (assumption.status !== "open") throw new Error(`assumption ${assumptionId} is ${assumption.status}`);
+    let linked = 0;
+    for (const requested of [...new Set(nodeIds)]) {
+      const nodeId = this.resolveGraphNodeId(requested);
+      if (!nodeId) throw new Error(`unknown graph node: ${requested}`);
+      this.upsertGraphEdge({ sourceId: assumptionId, targetId: nodeId, type: "depends_on_assumption", metadata: { explicit } });
+      linked += 1;
+    }
+    if (explicit) this.db.prepare("UPDATE assumptions SET explicit_linked_at = ? WHERE id = ?").run(new Date().toISOString(), assumptionId);
+    this.appendEvent(explicit ? "assumption_linked" : "assumption_auto_linked", assumption.phaseId, { assumptionId, nodeIds, linked });
+    return linked;
+  }
+
+  autoLinkChangedFiles(phaseId: string, changedFiles: string[]): number {
+    const candidates = this.listAssumptions(phaseId, "open").filter((item) => item.explicitLinkedAt === null);
+    if (candidates.length !== 1 || changedFiles.length === 0) return 0;
+    const nodeIds = changedFiles.map((file) => {
+      const normalized = file.replaceAll("\\", "/").replace(/^\.\//u, "");
+      const id = `file:${normalized}`;
+      if (!this.getGraphNode(id)) this.upsertGraphNode({ id, type: "file", label: normalized, path: normalized, symbol: null, contentHash: null, metadata: { autoLinked: true } });
+      return id;
+    });
+    return this.linkAssumption(candidates[0]!.id, nodeIds, false);
+  }
+
+  getGraphNode(id: string): GraphNode | null {
+    const row = this.db.prepare("SELECT * FROM graph_nodes WHERE id = ? AND active = 1").get(id) as Row | undefined;
+    return row ? graphNodeFromRow(row) : null;
+  }
+
+  getEdgesFrom(sourceId: string, type?: GraphEdge["type"]): GraphEdge[] {
+    const rows = type
+      ? this.db.prepare("SELECT * FROM graph_edges WHERE source_id = ? AND type = ? ORDER BY target_id").all(sourceId, type)
+      : this.db.prepare("SELECT * FROM graph_edges WHERE source_id = ? ORDER BY type, target_id").all(sourceId);
+    return (rows as Row[]).map(graphEdgeFromRow);
+  }
+
+  addEdge(sourceId: string, targetId: string, type: GraphEdge["type"], metadata: Record<string, unknown> = {}): void {
+    this.upsertGraphEdge({ sourceId, targetId, type, metadata });
+  }
+
+  computeBlastRadius(assumptionId: string, options: { maxHops?: number } = {}): BlastRadius {
+    must(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
+    const maxHops = Math.max(0, Math.min(options.maxHops ?? 3, 12));
+    const direct = this.getEdgesFrom(assumptionId, "depends_on_assumption").map((edge) => edge.targetId);
+    if (direct.length === 0) return { nodeIds: [], files: [], decisionIds: [] };
+    const visited = new Set<string>();
+    const queue = direct.map((id) => ({ id, depth: 0 }));
+    while (queue.length > 0 && visited.size < 2_000) {
+      const current = queue.shift()!;
+      if (visited.has(current.id)) continue;
+      visited.add(current.id);
+      if (current.depth >= maxHops) continue;
+      for (const edge of this.getEdgesFrom(current.id)) {
+        if (edge.type === "depends_on_assumption") continue;
+        if (!visited.has(edge.targetId)) queue.push({ id: edge.targetId, depth: current.depth + 1 });
+      }
+    }
+    const nodes = [...visited].map((id) => this.getGraphNode(id)).filter((node): node is GraphNode => node !== null);
+    const files = [...new Set(nodes.map((node) => node.path).filter((value): value is string => Boolean(value)))].sort();
+    const decisionIds = [...new Set(nodes.filter((node) => node.type === "decision").map((node) => node.id.replace(/^decision:/u, "")))].sort();
+    return { nodeIds: [...visited].sort(), files, decisionIds };
+  }
+
+  invalidateAssumption(id: string, rootCause: string, maxHops = 3, tokenStart = 0): CorrectionRecord {
+    const assumption = must(this.getAssumption(id), `unknown assumption: ${id}`);
+    if (assumption.status !== "open") throw new Error(`assumption ${id} is already ${assumption.status}`);
+    const cause = rootCause.trim();
+    if (!cause) throw new Error("root cause is required");
+    const blastRadius = this.computeBlastRadius(id, { maxHops });
+    const correctionId = randomUUID();
+    const appliedAt = new Date().toISOString();
+    this.transaction(() => {
+      this.db.prepare("UPDATE assumptions SET status='invalidated',resolved_at=?,resolution_evidence=? WHERE id=?").run(appliedAt, cause, id);
+      this.db.prepare(`
+        INSERT INTO corrections (id, assumption_id, phase_id, root_cause, blast_radius_json, blast_radius_size, applied_at, outcome, expansions_json, completed_at, token_start, token_end)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, '[]', NULL, ?, NULL)
+      `).run(correctionId, id, assumption.phaseId, cause, JSON.stringify(blastRadius), blastRadius.nodeIds.length, appliedAt, tokenStart);
+      this.appendEvent("assumption_invalidated", assumption.phaseId, { id, rootCause: cause, correctionId });
+      this.appendEvent("correction_recorded", assumption.phaseId, { correctionId, assumptionId: id, blastRadiusSize: blastRadius.nodeIds.length });
+    });
+    return must(this.getCorrection(correctionId), "correction insert failed");
+  }
+
+  getCorrection(id: string): CorrectionRecord | null {
+    const row = this.db.prepare("SELECT * FROM corrections WHERE id = ?").get(id) as Row | undefined;
+    return row ? correctionFromRow(row) : null;
+  }
+
+  listCorrections(phaseId?: string | null): CorrectionRecord[] {
+    if (phaseId === undefined) return (this.db.prepare("SELECT * FROM corrections ORDER BY applied_at").all() as Row[]).map(correctionFromRow);
+    const rows = phaseId === null
+      ? this.db.prepare("SELECT * FROM corrections WHERE phase_id IS NULL ORDER BY applied_at").all()
+      : this.db.prepare("SELECT * FROM corrections WHERE phase_id = ? ORDER BY applied_at").all(phaseId);
+    return (rows as Row[]).map(correctionFromRow);
+  }
+
+  activeCorrection(phaseId: string): CorrectionRecord | null {
+    const row = this.db.prepare("SELECT * FROM corrections WHERE phase_id = ? AND completed_at IS NULL ORDER BY applied_at DESC LIMIT 1").get(phaseId) as Row | undefined;
+    return row ? correctionFromRow(row) : null;
+  }
+
+  expandCorrectionScope(id: string, additionalNodeIds: string[], justification: string): CorrectionRecord {
+    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const reason = justification.trim();
+    if (!reason) throw new Error("justification must be non-empty");
+    const normalized = [...new Set(additionalNodeIds.map((nodeId) => this.resolveGraphNodeId(nodeId) ?? nodeId))];
+    for (const nodeId of normalized) if (!this.getGraphNode(nodeId)) throw new Error(`unknown graph node: ${nodeId}`);
+    const expansion: CorrectionScopeExpansion = { nodeIds: normalized, justification: reason, expandedAt: new Date().toISOString() };
+    const expansions = [...correction.expansions, expansion];
+    this.db.prepare("UPDATE corrections SET expansions_json = ? WHERE id = ?").run(JSON.stringify(expansions), id);
+    this.appendEvent("correction_scope_expanded", correction.phaseId, { correctionId: id, nodeIds: normalized, justification: reason });
+    return must(this.getCorrection(id), "correction expansion failed");
+  }
+
+  assessCorrectionOutcome(id: string, changedFiles: string[], tokenEnd: number, complete: boolean): { correction: CorrectionRecord; unauthorizedFiles: string[] } {
+    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const original = new Set(correction.blastRadius.files);
+    const expandedFiles = new Set(correction.expansions.flatMap((item) => item.nodeIds.map((nodeId) => this.getGraphNode(nodeId)?.path).filter((value): value is string => Boolean(value))));
+    const excess = changedFiles.filter((file) => !original.has(file));
+    const unauthorizedFiles = excess.filter((file) => !expandedFiles.has(file));
+    const outcome = excess.length === 0 ? "contained" : "expanded";
+    const completedAt = complete && unauthorizedFiles.length === 0 ? new Date().toISOString() : null;
+    this.db.prepare("UPDATE corrections SET outcome = ?, completed_at = ?, token_end = ? WHERE id = ?").run(outcome, completedAt, tokenEnd, id);
+    this.appendEvent(unauthorizedFiles.length === 0 ? "correction_outcome_recorded" : "correction_scope_violation", correction.phaseId, {
+      correctionId: id, outcome, changedFiles, unauthorizedFiles, complete: completedAt !== null
+    });
+    return { correction: must(this.getCorrection(id), "correction outcome update failed"), unauthorizedFiles };
+  }
+
+  correctionAllowedFiles(id: string): string[] {
+    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const expanded = correction.expansions.flatMap((item) => item.nodeIds.map((nodeId) => this.getGraphNode(nodeId)?.path).filter((value): value is string => Boolean(value)));
+    return [...new Set([...correction.blastRadius.files, ...expanded])].sort();
+  }
+
+  correctionRecordedSince(sequence: number): boolean {
+    const row = this.db.prepare("SELECT 1 AS found FROM events WHERE sequence > ? AND type IN ('assumption_invalidated','correction_recorded') LIMIT 1").get(sequence) as Row | undefined;
+    return Boolean(row);
+  }
+
+  lastCheckpointEventSequence(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE type IN ('phase_completed','phase_verification_failed')").get() as Row;
+    return Number(row.sequence);
+  }
+
+  recordAntiPatternHits(phaseId: string | null, patternIds: string[]): number {
+    let recorded = 0;
+    for (const patternId of [...new Set(patternIds)]) {
+      const key = `anti_pattern_hit:${phaseId ?? "project"}:${patternId}`;
+      const result = this.db.prepare("INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)").run(key, new Date().toISOString());
+      if (Number(result.changes) === 0) continue;
+      recorded += 1;
+      this.appendEvent("anti_pattern_warning_fired", phaseId, { patternId });
+    }
+    return recorded;
+  }
+
+  countAntiPatternHits(): number {
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'anti_pattern_hit:%'").get() as Row;
+    return Number(row.count);
+  }
+
+  totalRecordedTokens(): number {
+    const row = this.db.prepare("SELECT COALESCE(SUM(tokens),0) AS tokens FROM budget_usage WHERE scope = 'project'").get() as Row | undefined;
+    return Number(row?.tokens ?? 0);
+  }
+
+  private resolveGraphNodeId(requested: string): string | null {
+    if (this.getGraphNode(requested)) return requested;
+    if (this.getGraphNode(`decision:${requested}`)) return `decision:${requested}`;
+    if (this.getGraphNode(`file:${requested.replaceAll("\\", "/").replace(/^\.\//u, "")}`)) return `file:${requested.replaceAll("\\", "/").replace(/^\.\//u, "")}`;
+    return null;
+  }
+
   recordDecision(input: Omit<DecisionRecord, "id" | "status" | "createdAt">): DecisionRecord {
     const id = randomUUID();
     const createdAt = new Date().toISOString();
@@ -238,7 +475,7 @@ export class ProjectStore {
 
   recordFailure(phaseId: string, summary: string, fingerprint?: string): FailureRecord {
     must(this.getPhase(phaseId), `unknown phase: ${phaseId}`);
-    const normalizedFingerprint = fingerprint?.trim() || sha256(normalizeFailure(summary)).slice(0, 24);
+    const normalizedFingerprint = fingerprint?.trim() || normalizedDiagnosticSignature(summary);
     const existing = this.db.prepare("SELECT * FROM failures WHERE phase_id = ? AND fingerprint = ?")
       .get(phaseId, normalizedFingerprint) as Row | undefined;
     const now = new Date().toISOString();
@@ -280,6 +517,8 @@ export class ProjectStore {
       project: must(this.getProject(), "project is not initialized"),
       phases: this.listPhases(),
       decisions: this.listDecisions(),
+      assumptions: this.listAssumptions(),
+      corrections: this.listCorrections(),
       failures: this.listFailures(),
       checkpoints: this.listCheckpoints(),
       recentEvents: this.recentEvents()
@@ -338,7 +577,7 @@ export class ProjectStore {
   }
 
   clearFileGraph(): void {
-    this.db.exec("DELETE FROM graph_edges WHERE source_id LIKE 'file:%' OR target_id LIKE 'file:%' OR source_id LIKE 'symbol:%' OR target_id LIKE 'symbol:%'; DELETE FROM graph_nodes WHERE type IN ('file', 'symbol');");
+    this.db.exec("DELETE FROM graph_edges WHERE type != 'depends_on_assumption' AND (source_id LIKE 'file:%' OR target_id LIKE 'file:%' OR source_id LIKE 'symbol:%' OR target_id LIKE 'symbol:%'); DELETE FROM graph_nodes WHERE type IN ('file', 'symbol');");
   }
 
   searchGraph(terms: string[], limit = 30): GraphNode[] {
@@ -400,6 +639,19 @@ export class ProjectStore {
         id TEXT PRIMARY KEY, phase_id TEXT, title TEXT NOT NULL, rationale TEXT NOT NULL,
         alternatives_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS assumptions (
+        id TEXT PRIMARY KEY, phase_id TEXT, statement TEXT NOT NULL, confidence REAL NOT NULL,
+        alternatives_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT,
+        resolution_evidence TEXT, explicit_linked_at TEXT
+      );
+      CREATE TABLE IF NOT EXISTS corrections (
+        id TEXT PRIMARY KEY, assumption_id TEXT NOT NULL REFERENCES assumptions(id), phase_id TEXT,
+        root_cause TEXT NOT NULL, blast_radius_json TEXT NOT NULL, blast_radius_size INTEGER NOT NULL,
+        applied_at TEXT NOT NULL, outcome TEXT, expansions_json TEXT NOT NULL DEFAULT '[]', completed_at TEXT,
+        token_start INTEGER NOT NULL DEFAULT 0, token_end INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_assumptions_phase ON assumptions(phase_id, status);
+      CREATE INDEX IF NOT EXISTS idx_corrections_assumption ON corrections(assumption_id);
       CREATE TABLE IF NOT EXISTS failures (
         id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, fingerprint TEXT NOT NULL, summary TEXT NOT NULL,
         count INTEGER NOT NULL, last_seen_at TEXT NOT NULL, resolution TEXT,
@@ -433,6 +685,7 @@ function validateContract(contract: ProjectContract): void {
   if (contract.goal.trim().length < 10) throw new Error("contract goal is too short");
   if (contract.deliverables.length === 0) throw new Error("contract requires deliverables");
   if (contract.doneWhen.length === 0) throw new Error("contract requires measurable done-when criteria");
+  if (contract.assumptionConfidenceThreshold !== undefined && (!Number.isFinite(contract.assumptionConfidenceThreshold) || contract.assumptionConfidenceThreshold < 0 || contract.assumptionConfidenceThreshold > 1)) throw new Error("assumptionConfidenceThreshold must be in [0, 1]");
 }
 
 function validatePlan(phases: PhaseDefinition[]): void {
@@ -506,6 +759,28 @@ function failureFromRow(row: Row): FailureRecord {
   };
 }
 
+
+function assumptionFromRow(row: Row): AssumptionRecord {
+  const alternatives = JSON.parse(String(row.alternatives_json)) as unknown;
+  if (!Array.isArray(alternatives)) throw new Error("INVALID_ALTERNATIVES: stored alternatives must be an array");
+  return {
+    id: String(row.id), phaseId: nullable(row.phase_id), statement: String(row.statement), confidence: Number(row.confidence),
+    alternatives: alternatives as AssumptionAlternative[], status: String(row.status) as AssumptionStatus,
+    createdAt: String(row.created_at), resolvedAt: nullable(row.resolved_at), resolutionEvidence: nullable(row.resolution_evidence),
+    explicitLinkedAt: nullable(row.explicit_linked_at)
+  };
+}
+
+function correctionFromRow(row: Row): CorrectionRecord {
+  return {
+    id: String(row.id), assumptionId: String(row.assumption_id), phaseId: nullable(row.phase_id), rootCause: String(row.root_cause),
+    blastRadius: JSON.parse(String(row.blast_radius_json)) as BlastRadius, blastRadiusSize: Number(row.blast_radius_size),
+    appliedAt: String(row.applied_at), outcome: row.outcome ? asText(row.outcome) as "contained" | "expanded" : null,
+    expansions: JSON.parse(asText(row.expansions_json ?? "[]")) as CorrectionScopeExpansion[], completedAt: nullable(row.completed_at),
+    tokenStart: Number(row.token_start ?? 0), tokenEnd: row.token_end === null || row.token_end === undefined ? null : Number(row.token_end)
+  };
+}
+
 function checkpointFromRow(row: Row): CheckpointRecord {
   return {
     id: String(row.id), phaseId: String(row.phase_id), gitSha: String(row.git_sha), summary: String(row.summary),
@@ -519,6 +794,13 @@ function eventFromRow(row: Row): EventRecord {
   return {
     sequence: Number(row.sequence), timestamp: String(row.timestamp), type: String(row.type),
     phaseId: nullable(row.phase_id), payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>
+  };
+}
+
+function graphEdgeFromRow(row: Row): GraphEdge {
+  return {
+    sourceId: String(row.source_id), targetId: String(row.target_id), type: String(row.type) as GraphEdge["type"],
+    metadata: JSON.parse(String(row.metadata_json)) as Record<string, unknown>
   };
 }
 
@@ -543,10 +825,6 @@ function asText(value: unknown): string {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
-}
-
-function normalizeFailure(value: string): string {
-  return value.toLowerCase().replace(/0x[0-9a-f]+/g, "<hex>").replace(/\d+/g, "<n>").replace(/\s+/g, " ").trim();
 }
 
 function must<T>(value: T | null | undefined, message: string): T {

@@ -43,6 +43,7 @@ function snapshot(status: ProjectSnapshot["project"]["status"] = "ACTIVE"): Proj
       startedAt: "now", completedAt: "now", baseSha: "base", headSha: "head", summary: "shipped"
     }],
     decisions: [{ id: "d", phaseId: "phase", title: "Use SQLite", rationale: "Durability", alternatives: [], status: "active", createdAt: "now" }],
+    assumptions: [], corrections: [],
     failures: [], approvals: [], planRevisions: [], worktrees: [], budgetUsage: {},
     checkpoints: [{
       id: "c", phaseId: "phase", gitSha: "abcdef123456", summary: "verified", changedFiles: ["src/a.ts"], createdAt: "now",

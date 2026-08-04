@@ -40,3 +40,11 @@ Keep Coding itself makes no outbound network requests. A tunnel, reverse proxy, 
 ## Reporting
 
 Report vulnerabilities privately to the repository maintainers with reproduction steps, impact, affected version, and a proposed mitigation. Do not include real credentials or proprietary source.
+
+## Assumption and correction trust boundary
+
+Assumption confidence is agent-authored metadata, not a probability guarantee. Values outside `[0,1]` are rejected rather than clamped, but an agent can still report an unjustifiably high value. High-assurance workflows should retain measurable acceptance commands, operator allowlists, and independent critic review; the assumption ledger narrows correction work but does not prove the original interpretation was correct.
+
+`invalidate_assumption` computes only from explicit graph links and bounded dependency edges. Empty seeds return an empty radius. The verifier intersects that radius with the existing phase scope, so an assumption cannot grant broader write authority. `expand_correction_scope` requires a stored non-empty justification and any unexplained excess file remains a normal scope violation. The apology-language hook is advisory only and never grants or removes write authority.
+
+Project databases now also store assumption statements, rejected alternatives, confidence, graph dependencies, root causes, correction scopes, justifications, outcomes, and token counters. Opt-in cross-project playbook memory may store compact correction anti-patterns. These records can expose product requirements or design intent even though source file contents are not stored wholesale; protect `.keep-coding/state.db` and `~/.keep-coding/playbook.db` accordingly.

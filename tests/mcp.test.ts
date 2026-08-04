@@ -53,7 +53,7 @@ describe("MCP protocol", () => {
         "get_file_digest", "start_phase", "prepare_parallel_phases", "checkpoint_parallel_phase",
         "request_approval", "resolve_approval", "record_budget_usage", "restore_phase_baseline",
         "suggest_phases", "remember_phase_template", "list_files", "read_file", "search_code", "get_diff",
-        "apply_patch", "record_decision", "record_failure", "checkpoint_phase", "get_status", "complete_project"
+        "apply_patch", "record_assumption", "link_assumption", "confirm_assumption", "invalidate_assumption", "expand_correction_scope", "record_decision", "record_failure", "checkpoint_phase", "get_status", "complete_project"
       ]);
     } finally { await connection.close(); }
   });

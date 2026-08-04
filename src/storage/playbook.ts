@@ -3,14 +3,15 @@ import { homedir } from "node:os";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { FailureRecord, PhaseDefinition, PlaybookPattern } from "../domain/model.js";
+import type { AssumptionRecord, CorrectionRecord, FailureRecord, PhaseDefinition, PlaybookPattern } from "../domain/model.js";
+import { normalizedDiagnosticSignature } from "../core/signature.js";
 
 type Row = Record<string, unknown>;
 
 export class PlaybookStore {
   private readonly db: DatabaseSync;
 
-  constructor(databasePath = path.join(homedir(), ".keep-coding", "playbook.db")) {
+  constructor(databasePath = process.env.KEEP_CODING_PLAYBOOK_PATH?.trim() || path.join(homedir(), ".keep-coding", "playbook.db")) {
     mkdirSync(path.dirname(databasePath), { recursive: true });
     this.db = new DatabaseSync(databasePath);
     this.db.exec(`
@@ -30,6 +31,8 @@ export class PlaybookStore {
         source_project TEXT NOT NULL, updated_at TEXT NOT NULL
       );
     `);
+    addColumn(this.db, "playbook_patterns", "kind", "TEXT NOT NULL DEFAULT 'phase'");
+    addColumn(this.db, "playbook_patterns", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
     this.migrateLegacyTemplates();
   }
 
@@ -47,8 +50,8 @@ export class PlaybookStore {
     this.db.prepare(`
       INSERT INTO playbook_patterns (
         id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
-        source_projects_json, success_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        source_projects_json, success_count, created_at, updated_at, kind, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'phase', '{}')
       ON CONFLICT(signature) DO UPDATE SET
         pattern = excluded.pattern,
         trigger_conditions_json = excluded.trigger_conditions_json,
@@ -62,6 +65,37 @@ export class PlaybookStore {
       JSON.stringify(tuple.applicabilityScope), JSON.stringify(sources), now, now
     );
     return patternFromRow(required(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature) as Row | undefined), 1);
+  }
+
+  rememberCorrection(sourceProject: string, assumption: AssumptionRecord, correction: CorrectionRecord): PlaybookPattern {
+    const pattern = `Avoid assumption: ${assumption.statement}`;
+    const triggerConditions = normalizeKeywords(`${assumption.statement} ${correction.rootCause}`);
+    const resolution = [`Wrong assumption: ${assumption.statement}`, `Actual case: ${correction.rootCause}`];
+    const applicabilityScope = correction.blastRadius.files.slice(0, 12);
+    const signature = normalizedDiagnosticSignature(`${assumption.statement}\n${correction.rootCause}`, 32);
+    const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature) as Row | undefined;
+    const timestamp = new Date().toISOString();
+    const id = existing ? String(existing.id) : signature;
+    const sources = existing ? [...new Set([...jsonArray(existing.source_projects_json), sourceProject])] : [sourceProject];
+    const metadata = { assumptionId: assumption.id, correctionId: correction.id, wrongAssumption: assumption.statement, actualCase: correction.rootCause, outcome: correction.outcome };
+    this.db.prepare(`
+      INSERT INTO playbook_patterns (
+        id, signature, pattern, trigger_conditions_json, resolution_json, applicability_scope_json,
+        source_projects_json, success_count, created_at, updated_at, kind, metadata_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'anti_pattern', ?)
+      ON CONFLICT(signature) DO UPDATE SET
+        pattern=excluded.pattern,trigger_conditions_json=excluded.trigger_conditions_json,resolution_json=excluded.resolution_json,
+        applicability_scope_json=excluded.applicability_scope_json,source_projects_json=excluded.source_projects_json,
+        success_count=playbook_patterns.success_count+1,updated_at=excluded.updated_at,kind='anti_pattern',metadata_json=excluded.metadata_json
+    `).run(id, signature, pattern, JSON.stringify(triggerConditions), JSON.stringify(resolution), JSON.stringify(applicabilityScope), JSON.stringify(sources), timestamp, timestamp, JSON.stringify(metadata));
+    return patternFromRow(required(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature) as Row | undefined), 1);
+  }
+
+  list(kind?: "phase" | "anti_pattern"): PlaybookPattern[] {
+    const rows = kind
+      ? this.db.prepare("SELECT * FROM playbook_patterns WHERE kind = ? ORDER BY updated_at DESC").all(kind)
+      : this.db.prepare("SELECT * FROM playbook_patterns ORDER BY updated_at DESC").all();
+    return (rows as Row[]).map((row) => patternFromRow(row, 1));
   }
 
   rememberFailure(sourceProject: string, failure: FailureRecord): void {
@@ -87,7 +121,7 @@ export class PlaybookStore {
       const patternTerms = normalizeKeywords(String(row.pattern));
       const searchable = new Set([...triggers, ...patternTerms]);
       const overlap = terms.filter((term) => searchable.has(term)).length;
-      const score = terms.length === 0 ? 0 : overlap / terms.length + Math.min(0.25, Number(row.success_count) / 100);
+      const score = terms.length === 0 || overlap === 0 ? 0 : overlap / terms.length + Math.min(0.25, Number(row.success_count) / 100);
       return patternFromRow(row, score);
     }).filter((suggestion) => suggestion.score > 0)
       .sort((left, right) => right.score - left.score || right.successCount - left.successCount)
@@ -127,11 +161,13 @@ function compactPhase(phase: PhaseDefinition, keywords: string[]): Omit<Playbook
 function patternFromRow(row: Row, score: number): PlaybookPattern {
   return {
     id: String(row.id), pattern: String(row.pattern), score,
+    kind: row.kind === "anti_pattern" ? "anti_pattern" : "phase",
     triggerConditions: jsonArray(row.trigger_conditions_json),
     resolution: jsonArray(row.resolution_json),
     applicabilityScope: jsonArray(row.applicability_scope_json),
     sourceProjects: jsonArray(row.source_projects_json),
-    successCount: Number(row.success_count)
+    successCount: Number(row.success_count),
+    metadata: row.metadata_json ? JSON.parse(scalar(row.metadata_json)) as Record<string, unknown> : {}
   };
 }
 
@@ -152,5 +188,15 @@ function normalizeKeywords(value: string | string[]): string[] {
   return [...new Set(source.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])]
     .filter((term) => !stop.has(term)).slice(0, 40);
 }
-function jsonArray(value: unknown): string[] { return JSON.parse(String(value)) as string[]; }
+function jsonArray(value: unknown): string[] { return JSON.parse(scalar(value)) as string[]; }
+function scalar(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
+  throw new Error("non-scalar playbook value");
+}
 function required<T>(value: T | null | undefined): T { if (value === null || value === undefined) throw new Error("playbook write failed"); return value; }
+
+function addColumn(db: DatabaseSync, table: string, name: string, definition: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+  if (!columns.some((row) => String(row.name) === name)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name} ${definition}`);
+}

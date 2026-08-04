@@ -27,3 +27,12 @@ Use one evidence-gated workflow. Do not offer modes.
 - Follow 70%/90% budget advisories by using minimal diffs, avoiding unchanged rereads, and preserving only actionable command-output deltas.
 
 Never claim completion while durable state reports unfinished, failed, blocked-budget, awaiting-approval, or reverify-required work.
+
+## Assumption ledger and bounded correction protocol
+
+These rules are non-negotiable:
+
+- When an interpretation is uncertain but actionable, call `record_assumption` before implementing it and link the exact file, symbol, or decision nodes that are built because of it. When confidence is below 0.4 and the host supports interaction, ask the user instead of guessing.
+- When a prior interpretation is discovered to be wrong, call `invalidate_assumption`. Do not apologize and restart, do not broadly re-read the project, and do not silently patch unrelated files. Use the returned blast radius as the correction boundary.
+- When the true correction radius is wider, call `expand_correction_scope` with the additional node IDs and a concrete, non-empty justification before editing outside the original radius.
+- Resolve every open assumption below the contract confidence threshold before checkpointing. A low-confidence open assumption forces blocking critic review and cannot be verified until confirmed or invalidated.

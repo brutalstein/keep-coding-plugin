@@ -4,7 +4,7 @@ Keep Coding, uzun süren coding-agent çalışmalarını kalıcı proje hafızas
 
 ## Durum
 
-**Güncel sürüm: v0.2.1.** Bu sürüm, v0.2.0 dağıtım paketinin her çağrıda çökmesine neden olan TypeScript bundling hatasını giderir; derlenmiş artifact'ı CI içinde gerçekten çalıştırır ve gereksiz context/token tekrarlarını azaltır. Adaptive replanning, worktree paralelliği, semantic impact analizi, bütçeler, onaylar, critic, dashboard ve GitHub entegrasyonu korunur.
+**Güncel sürüm: v0.3.0.** Bu sürüm, v0.2.1 kanıt ve token-verimliliği platformuna kalıcı assumption ledger ve sınırlı blast-radius correction protokolü ekler. Yanlış yorumlar artık dosya, sembol ve kararlarla ilişkilendirilen kalıcı graph varlıklarıdır; agent yalnızca hesaplanan veya gerekçeli biçimde genişletilen correction kapsamını düzeltebilir.
 
 ## Sağlanan yetenekler
 
@@ -23,6 +23,10 @@ Keep Coding, uzun süren coding-agent çalışmalarını kalıcı proje hafızas
 - Tekrarlanan failure log diff'i, noise stripping, marker-aware truncation ve failure clustering
 - Gerçek veya tahmini token telemetrisi ve %70/%90 bütçe tavsiyeleri
 - Compact ve deduplicated projeler arası playbook hafızası
+- Dosya, sembol ve kararlara bağlanan kalıcı assumption ledger
+- Cycle-safe, hop-limitli correction blast radius ve contained/expanded outcome kaydı
+- İngilizce/Türkçe ambiguity pre-flight, düşük confidence için zorunlu blocking critic ve non-blocking apology nudge
+- Tekrarlanan yanlış yorumları önceden gösteren correction anti-pattern hafızası
 - Yalnızca loopback üzerinde çalışan salt-okunur dashboard
 - Codex, Claude-benzeri hook ve generic polling adapter'ları
 - CI ve kalıcı kararlardan üretilen PR açıklaması
@@ -36,7 +40,7 @@ npm run check
 
 `npm run check`; lint, strict TypeScript, source coverage, production build, derlenmiş artifact smoke testleri, context payload benchmark'ı, doküman/sürüm kontrolü ve plugin doğrulamasını çalıştırır. Bu nedenle kaynak testleri yeşilken bozuk bir `dist/keep-coding.mjs` paketlenemez.
 
-Doğrulanmış source suite: 51 test, 16 dosya. Build sonrası artifact suite üç compiled-binary senaryo ekler; context benchmark'ı ayrı çalışır.
+Doğrulanmış source suite: 107 test, 26 dosya. Build sonrası artifact suite dört compiled-binary senaryo ekler; context benchmark'ı ayrı çalışır.
 
 ## Temel kural
 
@@ -53,6 +57,10 @@ Temel MCP sırası:
 7. tüm fazlar geçince `complete_project`
 
 Normal reasoning akışında `get_context` çağrısında `include_snapshot` kullanma. Son sequence değerini `since_sequence` olarak geçir; değişiklik yoksa yalnızca compact `{ "unchanged": true, "sequence": ... }` döner. Orientation için tam dosya okumadan önce `get_file_digest`, kesin bağımlılık düğümleri gerektiğinde `expand_graph` kullan.
+
+Belirsiz bir yorumla uygulamaya başlamadan önce `record_assumption`, ardından ilgili file/symbol/decision düğümleri için `link_assumption` çağrılır. Varsayım doğruysa `confirm_assumption`; yanlışsa `invalidate_assumption` kullanılır. Correction checkpoint yalnızca faz kapsamı ile blast radius kesişimindeki dosyalara izin verir. Daha geniş gerçek kapsam gerekiyorsa `expand_correction_scope` boş olmayan bir gerekçeyle çağrılmalıdır. Varsayılan confidence eşiği `0.6` değeridir.
+
+Evaluation raporu; containment rate ve Wilson %95 aralığını, project-scope tokens-per-correction değerini, anti-pattern hit rate değerini ve isteğe bağlı enabled/disabled McNemar karşılaştırmasını içerir.
 
 Paralel fazlar yalnızca `parallelSafe` olarak işaretlenmiş, kapsam kökleri bağımsız ve aynı anda `READY` olan fazlar için `prepare_parallel_phases` ile açılır.
 
