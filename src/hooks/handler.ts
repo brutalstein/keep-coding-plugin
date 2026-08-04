@@ -67,7 +67,7 @@ export async function handleHook(event: string, input: HookInput): Promise<HookO
       ...(lastDelivered !== undefined ? { sinceSequence: lastDelivered } : {})
     }, service);
     if (event === "Stop" && !directive.continue) {
-      service.store.setLastStopProgressSequence(progressSequence);
+      service.store.setLastStopProgressSequence(service.store.latestEventSequence());
       return {
         decision: "block",
         reason: `Keep Coding project is ${project.status}. Resume from durable state:\n\n${directive.blockReason ?? service.context(7_000)}`
