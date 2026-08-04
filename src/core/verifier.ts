@@ -22,6 +22,8 @@ export interface VerificationOptions {
   impactedCompletedPhases?: string[];
   criticRunner?: CriticRunner;
   previousFailures?: CommandFailureRecord[];
+  correctionAllowedFiles?: string[];
+  forceBlockingCritic?: boolean;
 }
 
 export class PhaseVerifier {
@@ -30,7 +32,12 @@ export class PhaseVerifier {
   async verify(git: GitRepository, phase: PhaseRecord, options: VerificationOptions): Promise<VerificationEvidence> {
     const started = performance.now();
     const changedFiles = options.baseline ? await git.changedFilesSince(options.baseline) : await git.changedFiles();
-    const scopeViolations = phase.allowedScope.length === 0 ? [] : changedFiles.filter((file) => !phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false })));
+    const correctionScope = options.correctionAllowedFiles ? new Set(options.correctionAllowedFiles) : null;
+    const scopeViolations = changedFiles.filter((file) => {
+      const phaseAllows = phase.allowedScope.length === 0 || phase.allowedScope.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false }));
+      const correctionAllows = correctionScope === null || correctionScope.has(file);
+      return !phaseAllows || !correctionAllows;
+    });
     const secretScan = await scanChangedFiles(git.root, changedFiles);
     const selectiveCommands: CommandEvidence[] = [];
     const commands: CommandEvidence[] = [];
@@ -40,10 +47,11 @@ export class PhaseVerifier {
       if (selectiveCommands.every((command) => command.passed)) await this.runSequence(phase.acceptanceCommands, git.root, commands, options.previousFailures ?? []);
     }
     const commandGatePassed = selectiveCommands.length === (options.selectiveCommands ?? []).length && selectiveCommands.every((command) => command.passed) && commands.length === phase.acceptanceCommands.length && commands.every((command) => command.passed);
-    const blocking = phase.criticBlocking === true || options.contract.critic?.blocking === true;
-    const critic: CriticEvidence = deterministicPrerequisitesPassed && commandGatePassed
+    const blocking = options.forceBlockingCritic === true || phase.criticBlocking === true || options.contract.critic?.blocking === true;
+    const criticEnabled = options.forceBlockingCritic === true || phase.criticBlocking === true || options.contract.critic?.enabled === true;
+    const critic: CriticEvidence = deterministicPrerequisitesPassed && commandGatePassed && criticEnabled
       ? await (options.criticRunner ?? new CriticRunner()).review({ root: git.root, phase, contract: options.contract, changedFiles, diff: await git.diff() }, blocking)
-      : skippedCritic(blocking);
+      : skippedCritic(blocking, criticEnabled);
     const scopePassed = scopeViolations.length === 0;
     return {
       passed: scopePassed && secretScan.passed && options.budget.passed && commandGatePassed && critic.passed,
@@ -192,6 +200,7 @@ function mergeCompression(left: CommandOutputCompression, right: CommandOutputCo
     previousAttempt: left.previousAttempt ?? right.previousAttempt
   };
 }
-function skippedCritic(blocking: boolean): CriticEvidence {
-  return { configured: false, blocking, passed: !blocking, summary: "Critic did not run because an earlier deterministic gate failed.", findings: [], rawOutput: "" };
+function skippedCritic(blocking: boolean, enabled = true): CriticEvidence {
+  const summary = enabled ? "Critic did not run because an earlier deterministic gate failed." : "Critic review is disabled for this phase.";
+  return { configured: false, blocking, passed: !blocking, summary, findings: [], rawOutput: "" };
 }

@@ -35,7 +35,7 @@ describe("next generation platform", () => {
   it("renders dashboard, adapters and decision-sourced PR copy", async () => {
     const snapshot = {
       project: { id: "p", root: "/r", originalPrompt: "build", status: "ACTIVE", contract: { goal: "Build system", nonGoals: [], constraints: [], deliverables: ["system"], invariants: [], doneWhen: ["done"] }, planVersion: 2, currentPhaseId: null, createdAt: "", updatedAt: "" },
-      phases: [], decisions: [], failures: [], approvals: [], checkpoints: [], planRevisions: [], worktrees: [], budgetUsage: {}, recentEvents: []
+      phases: [], decisions: [], assumptions: [], corrections: [], failures: [], approvals: [], checkpoints: [], planRevisions: [], worktrees: [], budgetUsage: {}, recentEvents: []
     } as ProjectSnapshot;
     expect(renderDashboard(snapshot)).toContain("Phase DAG");
     expect(generatePullRequestDescription(snapshot)).toContain("Build system");

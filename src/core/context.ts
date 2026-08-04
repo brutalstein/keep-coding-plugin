@@ -1,10 +1,11 @@
 import type {
   ContextEnvelope, ContextSection, EventRecord, GraphNode, PlaybookPattern, ProjectSnapshot
 } from "../domain/model.js";
+import { assessAmbiguity } from "./detector.js";
 
 const DEFAULT_MAX_CHARS = 12_000;
 const ALL_SECTIONS: ContextSection[] = [
-  "header", "contract", "active_phase", "approvals", "budget", "decisions", "failures", "checkpoints", "graph", "playbook"
+  "header", "contract", "active_phase", "approvals", "budget", "decisions", "assumptions", "corrections", "failures", "checkpoints", "graph", "playbook"
 ];
 
 export interface ContextStore {
@@ -47,6 +48,8 @@ export function compileContextEnvelope(store: ContextStore, options: ContextComp
     ["approvals", approvalSection(snapshot)],
     ["budget", budgetSection(snapshot)],
     ["decisions", decisionSection(snapshot)],
+    ["assumptions", assumptionSection(snapshot)],
+    ["corrections", correctionSection(snapshot, options.playbook ?? [])],
     ["failures", failureSection(snapshot)],
     ["checkpoints", checkpointSection(snapshot)],
     ["graph", graphSummarySection(related)],
@@ -81,6 +84,8 @@ function changedSectionsFromEvents(events: EventRecord[]): ContextSection[] {
     if (/^approval_/u.test(type)) sections.add("approvals");
     if (/^(budget_|plugin_token_)/u.test(type)) sections.add("budget");
     if (/^decision_/u.test(type)) sections.add("decisions");
+    if (/^assumption_/u.test(type)) sections.add("assumptions");
+    if (/^correction_/u.test(type)) sections.add("corrections");
     if (/^failure_/u.test(type)) sections.add("failures");
     if (/^(phase_completed|phase_verification|project_completion_gate)/u.test(type)) sections.add("checkpoints");
     if (/^(repository_indexed|phase_completed|phase_reverification)/u.test(type)) sections.add("graph");
@@ -116,8 +121,11 @@ function phaseSection(snapshot: ProjectSnapshot): string {
     ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId)
     : null;
   if (!active) return `## Phase status\n${snapshot.phases.map((phase) => `- ${phase.id}: ${phase.status}`).join("\n") || "Plan not saved."}`;
+  const ambiguity = assessAmbiguity(active.goal, snapshot.project.contract?.doneWhen ?? []);
+  const hasAssumptions = snapshot.assumptions.some((assumption) => assumption.phaseId === active.id);
   return [
     "## Active phase", `${active.id} — ${active.title} [${active.status}]`, `Goal: ${active.goal}`,
+    ambiguity.high && !hasAssumptions ? `AMBIGUITY PREFLIGHT: record_assumption before any scoped edit (${ambiguity.reasons.join("; ")}).` : "",
     `Allowed scope:\n${bullets(active.allowedScope)}`,
     `Acceptance commands:\n${bullets(active.acceptanceCommands)}`,
     `Attempts: ${active.attempts}/${active.maxAttempts}`,
@@ -152,6 +160,32 @@ function decisionSection(snapshot: ProjectSnapshot): string {
   return decisions.length === 0 ? "" : `## Active decisions\n${decisions.map((decision) => `- ${decision.title}: ${decision.rationale}`).join("\n")}`;
 }
 
+function assumptionSection(snapshot: ProjectSnapshot): string {
+  const phaseId = snapshot.project.currentPhaseId;
+  const open = snapshot.assumptions
+    .filter((assumption) => assumption.status === "open" && (phaseId === null || assumption.phaseId === phaseId))
+    .sort((left, right) => left.confidence - right.confidence || left.createdAt.localeCompare(right.createdAt));
+  if (open.length === 0) return "";
+  const threshold = snapshot.project.contract?.assumptionConfidenceThreshold ?? 0.6;
+  return `## Open assumptions\n${open.map((assumption) => {
+    const line = `- ${assumption.id} [confidence ${assumption.confidence.toFixed(2)}]: ${assumption.statement}`;
+    return assumption.confidence < threshold
+      ? `${line}\n  Confidence below ${threshold.toFixed(2)} — confirm or invalidate this assumption before checkpointing.`
+      : line;
+  }).join("\n")}`;
+}
+
+function correctionSection(snapshot: ProjectSnapshot, patterns: PlaybookPattern[]): string {
+  const corrections = snapshot.corrections.slice(-8);
+  const antiPatterns = patterns.filter((pattern) => pattern.kind === "anti_pattern").slice(0, 3);
+  if (corrections.length === 0 && antiPatterns.length === 0) return "";
+  const lines = [
+    ...antiPatterns.map((pattern) => `- Relevant past correction: ${pattern.pattern} → ${pattern.resolution.join("; ")}`),
+    ...corrections.map((correction) => `- ${correction.id} [${correction.outcome ?? "pending"}] ${correction.rootCause}; radius=${correction.blastRadiusSize}`)
+  ];
+  return `## Known corrections\n${lines.join("\n")}`;
+}
+
 function failureSection(snapshot: ProjectSnapshot): string {
   const unresolved = snapshot.failures.filter((failure) => failure.resolution === null);
   const failures = [...unresolved].sort((left, right) => right.count - left.count || right.lastSeenAt.localeCompare(left.lastSeenAt)).slice(0, 5);
@@ -180,7 +214,9 @@ function graphSummarySection(nodes: GraphNode[]): string {
 
 function playbookSection(patterns: PlaybookPattern[]): string {
   if (patterns.length === 0) return "";
-  return `## Relevant playbook patterns\n${patterns.slice(0, 3).map((entry) => `- ${entry.pattern}: ${entry.resolution.join("; ")} [scope: ${entry.applicabilityScope.join(", ")}]`).join("\n")}`;
+  const phases = patterns.filter((entry) => entry.kind !== "anti_pattern");
+  if (phases.length === 0) return "";
+  return `## Relevant playbook patterns\n${phases.slice(0, 3).map((entry) => `- ${entry.pattern}: ${entry.resolution.join("; ")} [scope: ${entry.applicabilityScope.join(", ")}]`).join("\n")}`;
 }
 
 function fitSections(sections: string[], maxChars: number): string {

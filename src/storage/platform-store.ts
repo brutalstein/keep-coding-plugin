@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { normalizedDiagnosticSignature } from "../core/signature.js";
 import type {
   ApprovalRecord, BudgetEvidence, BudgetLimits, BudgetUsage, CommandFailureRecord, EventRecord, FailureRecord,
   FileDigest, GraphEdge, GraphNode, ImpactNode, PhaseDefinition, PhaseRecord, PlanAmendment, PlanRevisionRecord,
@@ -80,7 +80,7 @@ export class PlatformStore extends ProjectStore {
   }
 
   override recordFailure(phaseId: string, summary: string, fingerprint?: string): FailureRecord {
-    return super.recordFailure(phaseId, summary, fingerprint?.trim() || failureSignature(summary));
+    return super.recordFailure(phaseId, summary, fingerprint?.trim() || normalizedDiagnosticSignature(summary));
   }
 
   requestApproval(phaseId: string, prompt: string): ApprovalRecord { return requestApproval(this.runtimeHost(), phaseId, prompt); }
@@ -235,15 +235,4 @@ function commandFailureFromRow(row: DbRow): CommandFailureRecord {
     phaseId: text(row.phase_id), command: text(row.command), attempt: Number(row.attempt),
     stdout: text(row.stdout), stderr: text(row.stderr), fingerprint: text(row.fingerprint), createdAt: text(row.created_at)
   };
-}
-function failureSignature(value: string): string {
-  const normalized = value.toLowerCase()
-    .replace(/\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?z\b/giu, "<timestamp>")
-    .replace(/(?:[a-z]:\\|\/)(?:[^\s:]+[\\/])+[^\s:]+/giu, "<path>")
-    .replace(/:\d+(?::\d+)?\b/gu, ":<line>")
-    .replace(/0x[0-9a-f]+/giu, "<hex>")
-    .replace(/\b\d+\b/gu, "<n>")
-    .replace(/\s+/gu, " ").trim();
-  return createHash("sha256").update(normalized).digest("hex").slice(0, 24);
-}
-function required<T>(value: T | null | undefined, message: string): T { if (value === null || value === undefined) throw new Error(message); return value; }
+}function required<T>(value: T | null | undefined, message: string): T { if (value === null || value === undefined) throw new Error(message); return value; }

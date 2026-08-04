@@ -10,6 +10,7 @@ const rootSchema = z.object({
   project_root: z.string().min(1).refine(path.isAbsolute, "project_root must be an absolute path")
     .describe("Absolute path inside the target Git repository on the MCP server")
 });
+const assumptionAlternativeSchema = z.object({ interpretation: z.string().min(1), whyRejected: z.string().min(1) });
 const budgetSchema = z.object({
   maxTokens: z.number().int().positive().optional(),
   maxCostUsd: z.number().positive().optional(),
@@ -40,7 +41,8 @@ const contractSchema = z.object({
   budget: budgetSchema.optional(),
   critic: z.object({ enabled: z.boolean(), blocking: z.boolean() }).optional(),
   selectiveTests: z.object({ commandTemplate: z.string().min(1), fullSuiteCommands: z.array(z.string().min(1)) }).optional(),
-  playbookOptIn: z.boolean().optional()
+  playbookOptIn: z.boolean().optional(),
+  assumptionConfidenceThreshold: z.number().min(0).max(1).optional()
 });
 
 export type AcceptanceCommandValidator = (command: string) => void;
@@ -51,13 +53,14 @@ export interface CreateServerOptions {
 
 export function createServer(options: CreateServerOptions = {}): McpServer {
   const server = new McpServer(
-    { name: "keep-coding", version: "0.2.1" },
+    { name: "keep-coding", version: "0.3.0" },
     {
       instructions: [
         "Use one evidence-gated workflow; amend plans only through amend_plan.",
         "Deterministic commands, secret scanning, budget checks, impact-aware reverification, and pending approvals are authoritative.",
         "Prefer delta get_context, get_file_digest, and Tier-1 expand_graph over redundant broad reads.",
-        "Remote edits remain bounded by the active phase allowedScope."
+        "Record uncertain interpretations before editing; invalidate wrong assumptions into bounded correction radii instead of restarting broadly.",
+        "Remote edits remain bounded by the active phase allowedScope and any active correction radius."
       ].join(" ")
     }
   );
@@ -130,6 +133,22 @@ export function createServer(options: CreateServerOptions = {}): McpServer {
     (service, input) => service.workspace.diff(input.max_chars));
   register(server, options, "apply_patch", "Apply a phase-scoped unified patch.", rootSchema.extend({ phase_id: z.string().min(1), patch: z.string().min(1).max(262_144) }),
     (service, input) => service.workspace.applyPatch(input.phase_id, input.patch));
+  register(server, options, "record_assumption", "Record an uncertain semantic interpretation before implementation.", rootSchema.extend({
+    phase_id: z.string().nullable().default(null), statement: z.string().min(1), confidence: z.number().finite().min(0).max(1),
+    alternatives: z.array(assumptionAlternativeSchema)
+  }), async (service, input) => service.recordAssumption(input.phase_id, input.statement, input.confidence, input.alternatives));
+  register(server, options, "link_assumption", "Link an open assumption to exact file, symbol, or decision graph nodes.", rootSchema.extend({
+    assumption_id: z.string().min(1), node_ids: z.array(z.string().min(1)).min(1)
+  }), async (service, input) => service.linkAssumption(input.assumption_id, input.node_ids));
+  register(server, options, "confirm_assumption", "Confirm an open assumption with evidence.", rootSchema.extend({
+    assumption_id: z.string().min(1), evidence: z.string().min(1)
+  }), async (service, input) => service.confirmAssumption(input.assumption_id, input.evidence));
+  register(server, options, "invalidate_assumption", "Invalidate an assumption and compute its bounded graph blast radius.", rootSchema.extend({
+    assumption_id: z.string().min(1), root_cause: z.string().min(1), max_hops: z.number().int().min(0).max(12).optional()
+  }), async (service, input) => service.invalidateAssumption(input.assumption_id, input.root_cause, input.max_hops));
+  register(server, options, "expand_correction_scope", "Expand a correction radius with an explicit reviewable justification.", rootSchema.extend({
+    correction_id: z.string().min(1), additional_node_ids: z.array(z.string().min(1)).min(1), justification: z.string().trim().min(1)
+  }), async (service, input) => service.expandCorrectionScope(input.correction_id, input.additional_node_ids, input.justification));
   register(server, options, "record_decision", "Persist architectural rationale.", rootSchema.extend({
     phase_id: z.string().nullable().default(null), title: z.string().min(1), rationale: z.string().min(1), alternatives: z.array(z.string()).default([])
   }), async (service, input) => service.store.recordDecision({ phaseId: input.phase_id, title: input.title, rationale: input.rationale, alternatives: input.alternatives }));

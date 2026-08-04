@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { summarizeOutcomes } from "./statistics.js";
+import {
+  summarizeAssumptionLedger, summarizeOutcomes,
+  type AssumptionCorrectionMetricInput, type AssumptionLedgerMetrics, type EvaluationStatistics, type PairedOutcome
+} from "./statistics.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -16,6 +19,13 @@ export interface EvalConfig {
   verifierCommands: string[];
   outputDirectory: string;
   timeoutMs?: number;
+  assumptionLedger?: {
+    enabled: boolean;
+    corrections?: AssumptionCorrectionMetricInput[];
+    antiPatternHits?: number;
+    matchingSituations?: number;
+    pairedOutcomes?: Array<{ disabled: boolean; enabled: boolean }>;
+  };
 }
 
 interface RunResult {
@@ -28,6 +38,11 @@ interface RunResult {
   promptHash: string;
   agentOutput: string;
   verifierResults: Array<{ command: string; passed: boolean; output: string }>;
+}
+
+export interface AssumptionLedgerEvaluation {
+  metrics: AssumptionLedgerMetrics;
+  enabledVsDisabled?: EvaluationStatistics;
 }
 
 export async function runEvaluation(configPath: string): Promise<Record<string, unknown>> {
@@ -53,7 +68,7 @@ export async function runEvaluation(configPath: string): Promise<Record<string, 
         await execFileAsync("git", ["worktree", "add", "--detach", target, "HEAD"], { cwd: repository });
         const started = performance.now();
         const command = (arm === "baseline" ? config.baseline : config.keepCoding).command;
-        const agent = await run(command, target, prompt, config.timeoutMs ?? 1_800_000);
+        const agent = await run(command, target, prompt, config.timeoutMs ?? 1_800_000, config.assumptionLedger?.enabled === true);
         const verifierResults = [];
         for (const verifier of config.verifierCommands) {
           const checked = await runShell(verifier, target, config.timeoutMs ?? 1_800_000);
@@ -75,11 +90,29 @@ export async function runEvaluation(configPath: string): Promise<Record<string, 
     keepCoding: Boolean(results.find((item) => item.pair === index + 1 && item.arm === "keep-coding")?.success)
   }));
   const statistics = summarizeOutcomes(pairs);
+  const assumptionLedger = assumptionLedgerEvaluation(config);
+  const report = {
+    metadata: { startingSha, promptHash, generatedAt: new Date().toISOString() },
+    statistics,
+    ...(assumptionLedger ? { assumptionLedger } : {})
+  };
   await mkdir(outputDirectory, { recursive: true });
   await writeFile(path.join(outputDirectory, "raw.jsonl"), `${results.map((item) => JSON.stringify(item)).join("\n")}\n`);
-  await writeFile(path.join(outputDirectory, "summary.json"), `${JSON.stringify({ metadata: { startingSha, promptHash, generatedAt: new Date().toISOString() }, statistics }, null, 2)}\n`);
-  await writeFile(path.join(outputDirectory, "summary.md"), markdownSummary(statistics));
-  return { statistics, outputDirectory };
+  await writeFile(path.join(outputDirectory, "summary.json"), `${JSON.stringify(report, null, 2)}\n`);
+  await writeFile(path.join(outputDirectory, "summary.md"), markdownSummary(statistics, assumptionLedger));
+  return { statistics, ...(assumptionLedger ? { assumptionLedger } : {}), outputDirectory };
+}
+
+function assumptionLedgerEvaluation(config: EvalConfig): AssumptionLedgerEvaluation | null {
+  const ledger = config.assumptionLedger;
+  if (!ledger?.enabled) return null;
+  const metrics = summarizeAssumptionLedger({
+    corrections: ledger.corrections ?? [],
+    antiPatternHits: ledger.antiPatternHits ?? 0,
+    matchingSituations: ledger.matchingSituations ?? 0
+  });
+  const paired = ledger.pairedOutcomes?.map((item): PairedOutcome => ({ baseline: item.disabled, keepCoding: item.enabled }));
+  return { metrics, ...(paired && paired.length > 0 ? { enabledVsDisabled: summarizeOutcomes(paired) } : {}) };
 }
 
 function validateConfig(config: EvalConfig): void {
@@ -88,12 +121,12 @@ function validateConfig(config: EvalConfig): void {
   if (config.verifierCommands.length === 0) throw new Error("at least one independent verifier command is required");
 }
 
-async function run(command: string[], cwd: string, input: string, timeout: number): Promise<{ code: number | null; output: string }> {
+async function run(command: string[], cwd: string, input: string, timeout: number, assumptionLedgerEnabled: boolean): Promise<{ code: number | null; output: string }> {
   const [executable, ...args] = command;
   if (!executable) throw new Error("empty command");
   return new Promise((resolve) => {
     const child = import("node:child_process").then(({ spawn }) => {
-      const process = spawn(executable, args, { cwd, env: processEnv(), stdio: ["pipe", "pipe", "pipe"], timeout });
+      const process = spawn(executable, args, { cwd, env: processEnv(assumptionLedgerEnabled), stdio: ["pipe", "pipe", "pipe"], timeout });
       let output = "";
       process.stdout.on("data", (chunk) => { output += String(chunk); });
       process.stderr.on("data", (chunk) => { output += String(chunk); });
@@ -115,11 +148,14 @@ async function runShell(command: string, cwd: string, timeout: number): Promise<
   }
 }
 
-function processEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, KEEP_CODING_EVAL: "1" };
+function processEnv(assumptionLedgerEnabled: boolean): NodeJS.ProcessEnv {
+  return { ...process.env, KEEP_CODING_EVAL: "1", KEEP_CODING_ASSUMPTION_LEDGER: assumptionLedgerEnabled ? "1" : "0" };
 }
 
-function markdownSummary(value: ReturnType<typeof summarizeOutcomes>): string {
+function markdownSummary(value: ReturnType<typeof summarizeOutcomes>, ledger: AssumptionLedgerEvaluation | null): string {
   const percent = (input: number): string => `${(input * 100).toFixed(1)}%`;
-  return `# Keep Coding evaluation\n\n| Metric | Baseline | Keep Coding |\n|---|---:|---:|\n| Successful runs | ${value.baselineSuccesses}/${value.runs} | ${value.keepCodingSuccesses}/${value.runs} |\n| Success rate | ${percent(value.baselineRate)} | ${percent(value.keepCodingRate)} |\n| Wilson 95% CI | ${percent(value.baselineWilson95[0])}–${percent(value.baselineWilson95[1])} | ${percent(value.keepCodingWilson95[0])}–${percent(value.keepCodingWilson95[1])} |\n\nAbsolute paired delta: **${percent(value.absoluteDelta)}**  \nExact McNemar p-value: **${value.mcnemarExactP.toFixed(4)}**\n`;
+  const base = `# Keep Coding evaluation\n\n| Metric | Baseline | Keep Coding |\n|---|---:|---:|\n| Successful runs | ${value.baselineSuccesses}/${value.runs} | ${value.keepCodingSuccesses}/${value.runs} |\n| Success rate | ${percent(value.baselineRate)} | ${percent(value.keepCodingRate)} |\n| Wilson 95% CI | ${percent(value.baselineWilson95[0])}–${percent(value.baselineWilson95[1])} | ${percent(value.keepCodingWilson95[0])}–${percent(value.keepCodingWilson95[1])} |\n\nAbsolute paired delta: **${percent(value.absoluteDelta)}**  \nExact McNemar p-value: **${value.mcnemarExactP.toFixed(4)}**\n`;
+  if (!ledger) return base;
+  const metrics = ledger.metrics;
+  return `${base}\n## Assumption ledger\n\n| Metric | Value |\n|---|---:|\n| Contained corrections | ${metrics.containedCorrections}/${metrics.completedCorrections} |\n| Containment rate | ${percent(metrics.containmentRate)} |\n| Containment Wilson 95% CI | ${percent(metrics.containmentWilson95[0])}–${percent(metrics.containmentWilson95[1])} |\n| Tokens per correction | ${metrics.tokensPerCorrection.toFixed(1)} |\n| Anti-pattern hit rate | ${percent(metrics.antiPatternHitRate)} |\n${ledger.enabledVsDisabled ? `\nEnabled-vs-disabled exact McNemar p-value: **${ledger.enabledVsDisabled.mcnemarExactP.toFixed(4)}**\n` : ""}`;
 }

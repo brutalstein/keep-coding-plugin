@@ -73,3 +73,17 @@ The Streamable HTTP adapter retains canonical allowed-root checks, Host and requ
 ## Packaging
 
 `scripts/build.mjs` creates one ESM executable while marking `typescript` external. The parser module has no top-level runtime dependency on the compiler; it performs a cached dynamic import only for TypeScript/JavaScript indexing. The production pipeline builds first, then executes the compiled artifact through version, hook, and full stdio MCP smoke tests. Plugin validation also runs the built CLI, so a module-evaluation crash cannot pass `npm run check`.
+
+## Assumption ledger and bounded correction
+
+An assumption is a first-class durable entity, separate from a technical failure or architectural decision. Each assumption records its phase, statement, self-reported confidence, considered alternatives, terminal status, and resolution evidence. Recording an assumption creates an `assumption` graph node. `link_assumption` adds `depends_on_assumption` edges to exact file, symbol, or decision nodes; a checkpoint auto-links changed files only when exactly one open phase assumption exists and no explicit link was recorded.
+
+Invalidation creates a correction record with a cycle-safe, hop-limited traversal result. The traversal starts only from explicit assumption dependencies; an assumption with no links produces an empty radius rather than an all-project fallback. Correction verification uses the intersection of the original phase globs and the correction's declared files. Scope can grow only through `expand_correction_scope` with a non-empty justification. The next checkpoint records `contained` when all changes stay in the original radius, or `expanded` when justified extra nodes were required; unauthorized extra files use the normal scope-violation path.
+
+Open assumptions and known corrections are normal delta-context sections. `assumption_*`, `correction_*`, and anti-pattern warning events participate in sequence-based change classification, so adding this subsystem does not reintroduce full-context retransmission. Low-confidence assumptions render an imperative directive. High-ambiguity phases must record an assumption before checkpointing, and open low-confidence assumptions force an independent blocking critic invocation before the structural checkpoint rejection.
+
+Contained corrections may be promoted, only with playbook opt-in, into structured `anti_pattern` records. Matching uses the same bounded keyword-overlap approach as phase templates; deduplication reuses the normalized failure-signature utility. A matching warning is counted once per phase/pattern and is injected before a new assumption is formed.
+
+## Assumption evaluation boundary
+
+The evaluation configuration accepts `assumptionLedger.enabled`. When enabled, reports may include correction outcomes and token counters, anti-pattern warning/matching counts, and paired enabled/disabled outcomes. The resulting section reports containment rate with an existing Wilson 95% interval, project-scoped tokens per completed correction, anti-pattern hit rate, and an exact McNemar comparison. When disabled, the runner does not emit a subsystem section or create project ledger persistence.

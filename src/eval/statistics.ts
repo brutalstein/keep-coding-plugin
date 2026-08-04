@@ -59,3 +59,59 @@ function combination(n: number, k: number): number {
   for (let index = 1; index <= smaller; index += 1) result = result * (n - smaller + index) / index;
   return result;
 }
+
+
+export interface AssumptionCorrectionMetricInput {
+  outcome: "contained" | "expanded" | null;
+  tokenStart: number;
+  tokenEnd: number | null;
+}
+
+export interface AssumptionLedgerMetricInput {
+  corrections: AssumptionCorrectionMetricInput[];
+  antiPatternHits: number;
+  matchingSituations: number;
+}
+
+export interface AssumptionLedgerMetrics {
+  completedCorrections: number;
+  containedCorrections: number;
+  expandedCorrections: number;
+  containmentRate: number;
+  containmentWilson95: [number, number];
+  totalCorrectionTokens: number;
+  tokensPerCorrection: number;
+  antiPatternHits: number;
+  matchingSituations: number;
+  antiPatternHitRate: number;
+}
+
+export function summarizeAssumptionLedger(input: AssumptionLedgerMetricInput): AssumptionLedgerMetrics {
+  if (!Number.isInteger(input.antiPatternHits) || input.antiPatternHits < 0) throw new Error("anti-pattern hits must be a non-negative integer");
+  if (!Number.isInteger(input.matchingSituations) || input.matchingSituations < 0 || input.antiPatternHits > input.matchingSituations) {
+    throw new Error("invalid anti-pattern hit counts");
+  }
+  const completed = input.corrections.filter((correction) => correction.outcome !== null && correction.tokenEnd !== null);
+  const containedCorrections = completed.filter((correction) => correction.outcome === "contained").length;
+  const expandedCorrections = completed.filter((correction) => correction.outcome === "expanded").length;
+  const totalCorrectionTokens = completed.reduce((sum, correction) => {
+    const end = correction.tokenEnd ?? correction.tokenStart;
+    if (!Number.isFinite(correction.tokenStart) || !Number.isFinite(end) || correction.tokenStart < 0 || end < correction.tokenStart) {
+      throw new Error("invalid correction token counters");
+    }
+    return sum + (end - correction.tokenStart);
+  }, 0);
+  const completedCorrections = completed.length;
+  return {
+    completedCorrections,
+    containedCorrections,
+    expandedCorrections,
+    containmentRate: completedCorrections === 0 ? 0 : containedCorrections / completedCorrections,
+    containmentWilson95: completedCorrections === 0 ? [0, 0] : wilson95(containedCorrections, completedCorrections),
+    totalCorrectionTokens,
+    tokensPerCorrection: completedCorrections === 0 ? 0 : totalCorrectionTokens / completedCorrections,
+    antiPatternHits: input.antiPatternHits,
+    matchingSituations: input.matchingSituations,
+    antiPatternHitRate: input.matchingSituations === 0 ? 0 : input.antiPatternHits / input.matchingSituations
+  };
+}

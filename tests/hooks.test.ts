@@ -54,3 +54,56 @@ describe("context-injecting hook cursors", () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });
+
+describe("apology-language correction nudge", () => {
+  it("injects a nudge when English apology language has no correction", async () => {
+    const root = repository();
+    try {
+      const service = await KeepCodingService.open(root);
+      await service.initialize("Build a precise feature");
+      service.close();
+      const response = await handleHook("Stop", { cwd: root, runtime: "polling-cli", transcript_tail: "sorry, I misunderstood the requirement" });
+      const output = response.hookSpecificOutput as { additionalContext?: string };
+      expect(output.additionalContext).toContain("invalidate_assumption");
+      expect(response.decision).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("does not inject the nudge after invalidate_assumption was recorded", async () => {
+    const root = repository();
+    try {
+      const service = await KeepCodingService.open(root);
+      await service.initialize("Build a precise feature");
+      const id = service.recordAssumption(null, "README describes CSV", 0.5, []).assumption_id;
+      service.invalidateAssumption(id, "It must describe JSON");
+      service.close();
+      const response = await handleHook("Stop", { cwd: root, runtime: "polling-cli", transcript_tail: "sorry, I misunderstood" });
+      const output = response.hookSpecificOutput as { additionalContext?: string };
+      expect(output.additionalContext).not.toContain("invalidate_assumption");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("recognizes Turkish apology language equivalently", async () => {
+    const root = repository();
+    try {
+      const service = await KeepCodingService.open(root);
+      await service.initialize("Build a precise feature");
+      service.close();
+      const response = await handleHook("Stop", { cwd: root, runtime: "polling-cli", transcript_tail: "özür dilerim, yanlış anlamışım" });
+      const output = response.hookSpecificOutput as { additionalContext?: string };
+      expect(output.additionalContext).toContain("invalidate_assumption");
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it("never changes a continuing Stop directive into a hard block", async () => {
+    const root = repository();
+    try {
+      const service = await KeepCodingService.open(root);
+      await service.initialize("Build a precise feature");
+      service.close();
+      const response = await handleHook("Stop", { cwd: root, runtime: "polling-cli", transcript_tail: "I apologize, wrong interpretation, start over" });
+      expect(response.continue).toBe(true);
+      expect(response.decision).toBeUndefined();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+});

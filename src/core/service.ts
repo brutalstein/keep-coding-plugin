@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto";
 import type {
-  CommandFailureRecord, ContextEnvelope, FailureRecord, FileDigest, PhaseDefinition,
+  AssumptionAlternative, AssumptionRecord, CommandFailureRecord, ContextEnvelope, CorrectionRecord, FailureRecord, FileDigest, PhaseDefinition,
   PlanAmendment, PlaybookPattern, ProjectContract
 } from "../domain/model.js";
 import { PlatformStore } from "../storage/platform-store.js";
 import { PlaybookStore } from "../storage/playbook.js";
 import { lintAcceptanceCommands } from "./command-quality.js";
+import { CriticRunner } from "./critic.js";
+import { assessAmbiguity } from "./detector.js";
 import { compileContextEnvelope, tokenize } from "./context.js";
 import { GitRepository } from "./git.js";
 import { indexRepository } from "./indexer.js";
@@ -82,6 +84,29 @@ export class KeepCodingService {
     return digest;
   }
 
+  recordAssumption(phaseId: string | null, statement: string, confidence: number, alternatives: AssumptionAlternative[]): { assumption_id: string; assumption: AssumptionRecord } {
+    const assumptionId = this.store.recordAssumption({ phaseId, statement, confidence, alternatives });
+    return { assumption_id: assumptionId, assumption: this.store.getAssumption(assumptionId)! };
+  }
+
+  linkAssumption(assumptionId: string, nodeIds: string[]): { linked: number } {
+    return { linked: this.store.linkAssumption(assumptionId, nodeIds) };
+  }
+
+  confirmAssumption(assumptionId: string, evidence: string): { status: "confirmed"; assumption: AssumptionRecord } {
+    return { status: "confirmed", assumption: this.store.confirmAssumption(assumptionId, evidence) };
+  }
+
+  invalidateAssumption(assumptionId: string, rootCause: string, maxHops?: number): { correction_id: string; blast_radius: CorrectionRecord["blastRadius"]; blast_radius_size: number; correction: CorrectionRecord } {
+    const correction = this.store.invalidateAssumption(assumptionId, rootCause, maxHops, this.store.totalRecordedTokens());
+    return { correction_id: correction.id, blast_radius: correction.blastRadius, blast_radius_size: correction.blastRadiusSize, correction };
+  }
+
+  expandCorrectionScope(correctionId: string, additionalNodeIds: string[], justification: string): { expanded: number; correction: CorrectionRecord } {
+    const correction = this.store.expandCorrectionScope(correctionId, additionalNodeIds, justification);
+    return { expanded: additionalNodeIds.length, correction };
+  }
+
   async startPhase(phaseId: string): Promise<Record<string, unknown>> {
     this.store.setPhaseBaseline(phaseId, await this.git.workingTreeSnapshot());
     const phase = this.store.startPhase(phaseId, await this.git.headSha());
@@ -112,11 +137,28 @@ export class KeepCodingService {
     if (!phase) throw new Error(`unknown phase: ${phaseId}`);
     const project = this.store.getProject();
     if (!project?.contract) throw new Error("project contract is missing");
+    const baseline = this.store.getPhaseBaseline(phaseId) ?? undefined;
+    const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
+    this.store.autoLinkChangedFiles(phaseId, changedFiles);
+    const phaseAssumptions = this.store.listAssumptions(phaseId);
+    const ambiguity = assessAmbiguity(phase.goal, project.contract.doneWhen);
+    if (ambiguity.high && phaseAssumptions.length === 0) {
+      throw new Error(`HIGH_AMBIGUITY_WITHOUT_ASSUMPTION: record_assumption before checkpoint: ${ambiguity.reasons.join("; ")}`);
+    }
+    const threshold = project.contract.assumptionConfidenceThreshold ?? 0.6;
+    const unresolved = phaseAssumptions.filter((assumption) => assumption.status === "open" && assumption.confidence < threshold);
+    if (unresolved.length > 0) {
+      const critic = await new CriticRunner().review({ root: this.git.root, phase, contract: project.contract, changedFiles, diff: await this.git.diff() }, true);
+      this.store.appendEvent("assumption_critic_escalated", phaseId, { assumptionIds: unresolved.map((item) => item.id), critic });
+      const detail = unresolved.map((assumption) => `${assumption.id}: ${assumption.statement}`).join("; ");
+      throw new Error(`LOW_CONFIDENCE_ASSUMPTIONS: confirm or invalidate before checkpoint: ${detail}; critic=${critic.summary}`);
+    }
+
+    const correction = this.store.activeCorrection(phaseId);
+    const correctionAllowedFiles = correction ? this.store.correctionAllowedFiles(correction.id) : undefined;
     this.store.markVerifying(phaseId);
     const verifying = this.store.getPhase(phaseId);
     if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
-    const baseline = this.store.getPhaseBaseline(phaseId) ?? undefined;
-    const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
     const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
     const impactedTests = this.store.impactedTests(changedFiles);
     const selectiveCommands = project.contract.selectiveTests && impactedTests.length > 0
@@ -131,12 +173,26 @@ export class KeepCodingService {
       budget: this.store.budgetEvidence(phaseId),
       contract: project.contract,
       impactedCompletedPhases,
-      previousFailures
+      previousFailures,
+      ...(correctionAllowedFiles ? { correctionAllowedFiles } : {})
     });
     this.persistCommandFailures(phaseId, phase.attempts + 1, [...evidence.selectiveCommands, ...evidence.commands]);
     this.recordCommandOutputUsage(phaseId, [...evidence.selectiveCommands, ...evidence.commands]);
+
+    let correctionResult: CorrectionRecord | null = null;
+    if (correction) {
+      const assessed = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), false);
+      correctionResult = assessed.correction;
+      if (assessed.unauthorizedFiles.length > 0) {
+        evidence.passed = false;
+        evidence.scopePassed = false;
+        evidence.scopeViolations = [...new Set([...evidence.scopeViolations, ...assessed.unauthorizedFiles])];
+      }
+    }
+
     if (evidence.passed) {
       evidence.gitSha = await this.git.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
+      if (correction) correctionResult = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), true).correction;
     }
     const updated = this.store.finishVerification(phaseId, summary, evidence);
     let reverificationRequired: string[] = [];
@@ -148,10 +204,12 @@ export class KeepCodingService {
         phaseId
       );
       this.rememberSuccessfulPhase(updated);
+      if (correctionResult?.completedAt) this.rememberCorrection(correctionResult);
     }
     return {
       phase: updated,
       evidence,
+      correction: correctionResult,
       reverificationRequired,
       project: this.store.getProject(),
       nextAction: evidence.passed ? (this.store.currentPhase() ? "start_phase" : "complete_project") : "repair_phase"
@@ -214,8 +272,12 @@ export class KeepCodingService {
     const phase = this.store.currentPhase();
     const query = [project.contract.goal, phase?.title, phase?.goal, ...(phase?.allowedScope ?? [])].filter(Boolean).join(" ");
     const playbook = new PlaybookStore();
-    try { return playbook.suggest(tokenize(query).join(" "), 3); }
-    finally { playbook.close(); }
+    try {
+      const suggestions = playbook.suggest(tokenize(query).join(" "), 3);
+      const antiPatternIds = suggestions.filter((pattern) => pattern.kind === "anti_pattern").map((pattern) => pattern.id);
+      if (antiPatternIds.length > 0) this.store.recordAntiPatternHits(phase?.id ?? null, antiPatternIds);
+      return suggestions;
+    } finally { playbook.close(); }
   }
 
   private recordPluginContextUsage(envelope: ContextEnvelope): void {
@@ -245,6 +307,18 @@ export class KeepCodingService {
       const fingerprint = createHash("sha256").update(`${command.command}\0${command.stdout}\0${command.stderr}`).digest("hex").slice(0, 24);
       this.store.recordCommandFailure({ phaseId, command: command.command, attempt, stdout: command.stdout, stderr: command.stderr, fingerprint, createdAt: new Date().toISOString() });
     }
+  }
+
+  private rememberCorrection(correction: CorrectionRecord): void {
+    const project = this.store.getProject();
+    if (!project?.contract?.playbookOptIn || correction.outcome === null) return;
+    const assumption = this.store.getAssumption(correction.assumptionId);
+    if (!assumption) return;
+    const playbook = new PlaybookStore();
+    try {
+      const pattern = playbook.rememberCorrection(project.root, assumption, correction);
+      this.store.appendEvent("playbook_antipattern_recorded", correction.phaseId, { correctionId: correction.id, patternId: pattern.id });
+    } finally { playbook.close(); }
   }
 
   private rememberSuccessfulPhase(phase: PhaseDefinition): void {
