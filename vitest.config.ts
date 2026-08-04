@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    exclude: ["tests/dist-smoke.test.ts", "tests/context-benchmark.test.ts"],
     testTimeout: 20_000,
     coverage: {
       provider: "v8",
