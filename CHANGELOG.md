@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0 — 2026-08-04
+
+- Replaced regex-first Python and C/C++ graph extraction with pinned, hash-verified `web-tree-sitter` WASM parsers and explicit degraded fallback telemetry.
+- Added adversarial golden corpora, differential precision checks, runtime asset tamper detection, a large-file graph benchmark, and header/source `same_symbol` unification.
+- Raised the enforced branch-coverage floor to 75%, brought MCP transports into coverage, and added targeted plan, budget, critic, scope, auth, and parser failure-path tests.
+- Added a frozen 24-task paired evaluation corpus, detached-worktree runner, external verifier contracts, counterbalanced repetitions, Wilson intervals, exact McNemar analysis, and an honest no-fabrication results document.
+- Added canonical Agent Skills distribution, Claude plugin/MCP/hook manifests, generic MCP installation examples, and sequence-aware polling for hookless hosts.
+- Split project-store migrations, validation, and row mapping into dedicated modules while preserving additive SQLite compatibility.
+- Expanded the source suite to 128 tests across 31 files and the compiled distribution suite to five scenarios.
+
 ## 0.3.0 — 2026-08-04
 
 - Added a durable assumption ledger with validated confidence, alternatives, terminal status transitions, and graph links to files, symbols, and decisions.

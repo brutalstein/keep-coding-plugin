@@ -1,9 +1,17 @@
 import type TypeScript from "typescript";
+import { emptyParsedFile, parseCStyleLegacy, parsePythonLegacy } from "./legacy-regex-fallback.js";
+import { parseCOrCppTreeSitter, parsePythonTreeSitter } from "./treesitter/language-adapters.js";
+import type { TreeSitterOptions } from "./treesitter/engine.js";
+
+export type ParsedImportKind = "module" | "relative" | "local" | "system";
 
 export interface ParsedSymbol {
   name: string;
   kind: string;
   line: number;
+  qualifiedName?: string;
+  arity?: number;
+  declarationOnly?: boolean;
 }
 
 export interface ParsedReference {
@@ -17,25 +25,48 @@ export interface ParsedFile {
   symbols: ParsedSymbol[];
   imports: string[];
   references: ParsedReference[];
+  importKinds?: Record<string, ParsedImportKind>;
+  parser?: string;
+  degraded?: boolean;
+  diagnostics?: string[];
+  parseMs?: number;
+}
+
+export interface SemanticParseOptions extends TreeSitterOptions {
+  legacyOnly?: boolean;
 }
 
 const SCRIPT_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+const C_EXTENSIONS = new Set([".c", ".h"]);
+const CPP_EXTENSIONS = new Set([".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx"]);
+const LEGACY_STRUCTURAL_EXTENSIONS = new Set([".cs", ".go", ".java", ".kt", ".php", ".rb", ".rs", ".swift"]);
 let typescriptPromise: Promise<typeof TypeScript> | null = null;
 
-export async function parseSemanticFile(content: string, extension: string): Promise<ParsedFile> {
+export async function parseSemanticFile(content: string, extension: string, options: SemanticParseOptions = {}): Promise<ParsedFile> {
   if (SCRIPT_EXTENSIONS.has(extension)) return parseTypeScript(content, extension);
-  if (extension === ".py") return parsePython(content);
-  return parseCStyle(content);
+  if (extension === ".py") {
+    if (options.legacyOnly) return parsePythonLegacy(content, "legacy parser explicitly requested");
+    return parsePythonTreeSitter(content, options).catch((error: unknown) => parsePythonLegacy(content, fallbackReason(error)));
+  }
+  if (C_EXTENSIONS.has(extension)) {
+    if (options.legacyOnly) return parseCStyleLegacy(content, "legacy parser explicitly requested");
+    return parseCOrCppTreeSitter(content, "c", options).catch((error: unknown) => parseCStyleLegacy(content, fallbackReason(error)));
+  }
+  if (CPP_EXTENSIONS.has(extension)) {
+    if (options.legacyOnly) return parseCStyleLegacy(content, "legacy parser explicitly requested");
+    return parseCOrCppTreeSitter(content, "cpp", options).catch((error: unknown) => parseCStyleLegacy(content, fallbackReason(error)));
+  }
+  if (LEGACY_STRUCTURAL_EXTENSIONS.has(extension)) return parseCStyleLegacy(content, `no tree-sitter grammar configured for ${extension}`);
+  return emptyParsedFile();
 }
 
 async function loadTypeScript(): Promise<typeof TypeScript> {
-  if (typescriptPromise === null) {
-    typescriptPromise = import("typescript").then((loaded) => loaded.default);
-  }
+  if (typescriptPromise === null) typescriptPromise = import("typescript").then((loaded) => loaded.default);
   return typescriptPromise;
 }
 
 async function parseTypeScript(content: string, extension: string): Promise<ParsedFile> {
+  const started = performance.now();
   const ts = await loadTypeScript();
   const kind = extension === ".tsx" || extension === ".jsx" ? ts.ScriptKind.TSX
     : extension === ".js" || extension === ".mjs" || extension === ".cjs" ? ts.ScriptKind.JS
@@ -52,54 +83,53 @@ async function parseTypeScript(content: string, extension: string): Promise<Pars
     if (ts.isStringLiteral(node) || ts.isNumericLiteral(node)) return node.text;
     return null;
   };
+  const qualified = (name: string): string => [...scope, name].join(".");
 
   const visit = (node: TypeScript.Node): void => {
     let pushed = false;
     if (ts.isClassDeclaration(node) && node.name) {
-      symbols.push({ name: node.name.text, kind: "class", line: line(node) });
-      scope.push(node.name.text);
-      pushed = true;
+      symbols.push({ name: node.name.text, qualifiedName: qualified(node.name.text), kind: "class", line: line(node) });
+      scope.push(node.name.text); pushed = true;
     } else if (ts.isFunctionDeclaration(node) && node.name) {
-      symbols.push({ name: node.name.text, kind: "function", line: line(node) });
-      scope.push(node.name.text);
-      pushed = true;
+      symbols.push({ name: node.name.text, qualifiedName: qualified(node.name.text), kind: "function", line: line(node), arity: node.parameters.length });
+      scope.push(node.name.text); pushed = true;
     } else if (ts.isMethodDeclaration(node) && node.name) {
       const name = nameOf(node.name);
       if (name) {
-        symbols.push({ name, kind: "method", line: line(node) });
-        scope.push(name);
-        pushed = true;
+        symbols.push({ name, qualifiedName: qualified(name), kind: "method", line: line(node), arity: node.parameters.length });
+        scope.push(name); pushed = true;
       }
     } else if (ts.isInterfaceDeclaration(node)) {
-      symbols.push({ name: node.name.text, kind: "interface", line: line(node) });
+      symbols.push({ name: node.name.text, qualifiedName: qualified(node.name.text), kind: "interface", line: line(node) });
     } else if (ts.isTypeAliasDeclaration(node)) {
-      symbols.push({ name: node.name.text, kind: "type", line: line(node) });
+      symbols.push({ name: node.name.text, qualifiedName: qualified(node.name.text), kind: "type", line: line(node) });
     } else if (ts.isEnumDeclaration(node)) {
-      symbols.push({ name: node.name.text, kind: "enum", line: line(node) });
+      symbols.push({ name: node.name.text, qualifiedName: qualified(node.name.text), kind: "enum", line: line(node) });
     } else if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) {
       const initializer = node.initializer;
       const symbolKind = initializer && (ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer)) ? "function" : "variable";
-      symbols.push({ name: node.name.text, kind: symbolKind, line: line(node) });
-      if (symbolKind === "function") {
-        scope.push(node.name.text);
-        pushed = true;
-      }
+      symbols.push({ name: node.name.text, qualifiedName: qualified(node.name.text), kind: symbolKind, line: line(node) });
+      if (symbolKind === "function") { scope.push(node.name.text); pushed = true; }
     }
 
     if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) imports.add(node.moduleSpecifier.text);
     if (ts.isCallExpression(node)) {
       const expression = node.expression;
       const target = ts.isIdentifier(expression) ? expression.text : ts.isPropertyAccessExpression(expression) ? expression.name.text : null;
-      if (target) references.push({ from: scope.at(-1) ?? null, target, kind: "calls", line: line(node) });
+      if (target) references.push({ from: scope.length > 0 ? scope.join(".") : null, target, kind: "calls", line: line(node) });
       if (target === "require" && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) imports.add(node.arguments[0].text);
       if (expression.kind === ts.SyntaxKind.ImportKeyword && node.arguments[0] && ts.isStringLiteral(node.arguments[0])) imports.add(node.arguments[0].text);
     }
-    if (ts.isIdentifier(node) && isReferenceIdentifier(ts, node)) references.push({ from: scope.at(-1) ?? null, target: node.text, kind: "references", line: line(node) });
+    if (ts.isIdentifier(node) && isReferenceIdentifier(ts, node)) references.push({ from: scope.length > 0 ? scope.join(".") : null, target: node.text, kind: "references", line: line(node) });
     ts.forEachChild(node, visit);
     if (pushed) scope.pop();
   };
   visit(source);
-  return { symbols: dedupeSymbols(symbols), imports: [...imports], references: dedupeReferences(references) };
+  return {
+    symbols: dedupeSymbols(symbols), imports: [...imports], references: dedupeReferences(references),
+    importKinds: Object.fromEntries([...imports].map((specifier) => [specifier, specifier.startsWith(".") ? "relative" : "module"])),
+    parser: "typescript-ast", degraded: false, diagnostics: [], parseMs: Number((performance.now() - started).toFixed(3))
+  };
 }
 
 function isReferenceIdentifier(ts: typeof TypeScript, node: TypeScript.Identifier): boolean {
@@ -123,48 +153,12 @@ function isDeclarationIdentifier(ts: typeof TypeScript, node: TypeScript.Identif
   ));
 }
 
-function parsePython(content: string): ParsedFile {
-  const symbols: ParsedSymbol[] = [];
-  const imports = new Set<string>();
-  const references: ParsedReference[] = [];
-  const scopes: Array<{ indent: number; name: string }> = [];
-  const lines = content.split("\n");
-  for (let index = 0; index < lines.length; index += 1) {
-    const text = lines[index] ?? "";
-    const indent = text.match(/^\s*/)?.[0].replace(/\t/g, "    ").length ?? 0;
-    while (scopes.length > 0 && indent <= mustLast(scopes).indent && text.trim()) scopes.pop();
-    const declaration = text.match(/^\s*(?:async\s+)?(class|def)\s+([A-Za-z_]\w*)/);
-    if (declaration?.[1] && declaration[2]) {
-      symbols.push({ name: declaration[2], kind: declaration[1] === "def" ? "function" : "class", line: index + 1 });
-      scopes.push({ indent, name: declaration[2] });
-    }
-    const fromImport = text.match(/^\s*from\s+([\w.]+)\s+import/);
-    const directImport = text.match(/^\s*import\s+([\w.]+)/);
-    if (fromImport?.[1]) imports.add(fromImport[1]);
-    if (directImport?.[1]) imports.add(directImport[1]);
-    for (const call of text.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (call[1] && !["if", "for", "while", "return", "class", "def"].includes(call[1])) references.push({ from: scopes.at(-1)?.name ?? null, target: call[1], kind: "calls", line: index + 1 });
-  }
-  return { symbols: dedupeSymbols(symbols), imports: [...imports], references: dedupeReferences(references) };
+function dedupeSymbols(values: ParsedSymbol[]): ParsedSymbol[] {
+  return [...new Map(values.map((item) => [`${item.kind}:${item.qualifiedName ?? item.name}:${item.line}`, item])).values()].slice(0, 1_000);
 }
-
-function parseCStyle(content: string): ParsedFile {
-  const symbols: ParsedSymbol[] = [];
-  const imports = new Set<string>();
-  const references: ParsedReference[] = [];
-  const lines = content.split("\n");
-  for (let index = 0; index < lines.length; index += 1) {
-    const text = lines[index] ?? "";
-    const declaration = text.match(/^\s*(?:public\s+|private\s+|protected\s+|static\s+|async\s+|fn\s+|func\s+)*(class|struct|interface|enum|fn|func)\s+([A-Za-z_]\w*)/);
-    if (declaration?.[1] && declaration[2]) symbols.push({ name: declaration[2], kind: declaration[1], line: index + 1 });
-    const include = text.match(/^\s*#include\s*[<"]([^>"]+)/);
-    const use = text.match(/^\s*(?:use|import)\s+([\w:./-]+)/);
-    if (include?.[1]) imports.add(include[1]);
-    if (use?.[1]) imports.add(use[1]);
-    for (const call of text.matchAll(/\b([A-Za-z_]\w*)\s*\(/g)) if (call[1] && !["if", "for", "while", "switch", "return", "sizeof"].includes(call[1])) references.push({ from: null, target: call[1], kind: "calls", line: index + 1 });
-  }
-  return { symbols: dedupeSymbols(symbols), imports: [...imports], references: dedupeReferences(references) };
+function dedupeReferences(values: ParsedReference[]): ParsedReference[] {
+  return [...new Map(values.map((item) => [`${item.from}:${item.target}:${item.kind}:${item.line}`, item])).values()].slice(0, 5_000);
 }
-
-function dedupeSymbols(values: ParsedSymbol[]): ParsedSymbol[] { return [...new Map(values.map((item) => [`${item.kind}:${item.name}:${item.line}`, item])).values()].slice(0, 1_000); }
-function dedupeReferences(values: ParsedReference[]): ParsedReference[] { return [...new Map(values.map((item) => [`${item.from}:${item.target}:${item.kind}:${item.line}`, item])).values()].slice(0, 5_000); }
-function mustLast<T>(values: T[]): T { const value = values.at(-1); if (!value) throw new Error("missing scope"); return value; }
+function fallbackReason(error: unknown): string {
+  return `tree-sitter fallback: ${error instanceof Error ? error.message : String(error)}`;
+}

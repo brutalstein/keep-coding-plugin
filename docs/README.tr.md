@@ -1,35 +1,35 @@
 # Keep Coding — Türkçe
 
-Keep Coding, uzun süren coding-agent çalışmalarını kalıcı proje hafızası ve gerçek doğrulama kapılarıyla yöneten tek-akışlı bir platformdur. Kullanıcıya mod seçtirmez; eski v0.1/v0.2 state veritabanlarını additive migration ile açar.
+Keep Coding, uzun süreli coding-agent çalışmalarını kalıcı sözleşme, bağımlılık DAG'ı, kapsamlı uygulama, kanıtlı checkpoint ve full-suite completion gate üzerinden yöneten local-first bir control plane'dir. Eski v0.1-v0.3 SQLite state dosyaları additive migration ile açılır.
 
 ## Durum
 
-**Güncel sürüm: v0.3.0.** Bu sürüm, v0.2.1 kanıt ve token-verimliliği platformuna kalıcı assumption ledger ve sınırlı blast-radius correction protokolü ekler. Yanlış yorumlar artık dosya, sembol ve kararlarla ilişkilendirilen kalıcı graph varlıklarıdır; agent yalnızca hesaplanan veya gerekçeli biçimde genişletilen correction kapsamını düzeltebilir.
+**Güncel sürüm: v0.4.0.** Bu sürüm Python ve C/C++ graph extraction katmanını gerçek syntax tree seviyesine çıkarır; branch coverage için zorunlu `%75` tabanı getirir; tekrar üretilebilir paired evaluation corpus'u, host-agnostic MCP/Agent Skills dağıtımı ve davranış değiştirmeyen storage decomposition ekler.
+
+## Temel garantiler
+
+- Faz; scope, secret, bütçe, selective test, acceptance command, approval, correction radius ve critic kapıları geçmeden `COMPLETED` olmaz.
+- `complete_project`, bütün aktif ve `REVERIFY_REQUIRED` fazları doğrular ve full suite çalıştırır.
+- Plan değişiklikleri versioned ve auditable'dır; tamamlanmış kanıt silinmez.
+- Remote patch'ler canonical root ve aktif faz scope'u dışına çıkamaz.
+- CI yalnızca source testini değil production CLI'ı ve parser sidecar dosyalarını da çalıştırır.
+- Native parser hatası indexlemeyi düşürmez; açıkça işaretlenen legacy fallback'e geçer.
+- Düşük confidence assumption ve yüksek ambiguity checkpoint'i sessizce geçemez.
 
 ## Sağlanan yetenekler
 
-- Çalışma başladıktan sonra kanıtları silmeden sürümlü plan değişikliği
-- Her başarılı faz için atomik Git commit ve kapsamlı baseline geri alma
-- Bağımsız fazların izole Git worktree'lerde paralel yürütülmesi
-- TypeScript/JavaScript için compiler AST, diğer diller için bounded adapter'lar, semantic impact ve seçilmiş testler
-- Önceden tamamlanan fazların değişiklik etkisine göre tekrar doğrulanması
-- Zorunlu secret scan; token, maliyet ve zaman bütçeleri
-- Deterministik ana doğrulama ve isteğe bağlı bağımsız critic
-- Zayıf acceptance komutları için non-blocking kalite uyarıları
-- İnsan onayı gereken kararlar için gerçek bekleme durumu
-- Sequence tabanlı delta context ve session başına değişmeyen hook suppression
-- Varsayılan Tier-0 graph özeti, gerektiğinde `expand_graph` ile Tier-1 ayrıntı
-- Dosyayı tamamen okumadan sembol/import özeti veren `get_file_digest`
-- Tekrarlanan failure log diff'i, noise stripping, marker-aware truncation ve failure clustering
-- Gerçek veya tahmini token telemetrisi ve %70/%90 bütçe tavsiyeleri
-- Compact ve deduplicated projeler arası playbook hafızası
-- Dosya, sembol ve kararlara bağlanan kalıcı assumption ledger
-- Cycle-safe, hop-limitli correction blast radius ve contained/expanded outcome kaydı
-- İngilizce/Türkçe ambiguity pre-flight, düşük confidence için zorunlu blocking critic ve non-blocking apology nudge
-- Tekrarlanan yanlış yorumları önceden gösteren correction anti-pattern hafızası
-- Yalnızca loopback üzerinde çalışan salt-okunur dashboard
-- Codex, Claude-benzeri hook ve generic polling adapter'ları
-- CI ve kalıcı kararlardan üretilen PR açıklaması
+- Adaptive plan amendment, Git-native checkpoint, scoped restore ve parallel worktree
+- TypeScript compiler AST; Python, C ve C++ için WASM tree-sitter parser
+- Python decorator/nested scope; C/C++ namespace/template/function/include analizi
+- Header/source sembollerini `same_symbol` edge'iyle birleştirme
+- Semantic impact, impacted-test seçimi ve reverification
+- Secret scan, token/maliyet/zaman bütçesi, approval ve bağımsız critic
+- Delta context, unchanged-hook suppression, Tier-0/Tier-1 graph ve file digest
+- Command-output compression, repeated-failure diff ve normalized clustering
+- Assumption ledger, bounded correction ve cross-project anti-pattern hafızası
+- Codex/Claude hooks, generic MCP ve hookless `poll` adapter'ı
+- Bütün host paketlerinde byte-identical canonical Agent Skill
+- Detached worktree ve bağımsız verifier kullanan 24 görevlik frozen paired evaluation corpus'u
 
 ## Geliştirme
 
@@ -38,36 +38,20 @@ npm ci
 npm run check
 ```
 
-`npm run check`; lint, strict TypeScript, source coverage, production build, derlenmiş artifact smoke testleri, context payload benchmark'ı, doküman/sürüm kontrolü ve plugin doğrulamasını çalıştırır. Bu nedenle kaynak testleri yeşilken bozuk bir `dist/keep-coding.mjs` paketlenemez.
+`npm run check`; lint, strict TypeScript, coverage ve coverage delta raporu, production build, byte-identical dist kontrolü, compiled artifact testleri, context/graph benchmark'ları, WASM asset integrity, evaluator corpus, distribution, doküman ve executable plugin doğrulamasını çalıştırır.
 
-Doğrulanmış source suite: 107 test, 26 dosya. Build sonrası artifact suite dört compiled-binary senaryo ekler; context benchmark'ı ayrı çalışır.
+Commitlenen dağıtım yalnızca `keep-coding.mjs` değildir; `plugins/keep-coding/dist/` altındaki executable, hash-manifestli WASM grammar'lar ve query dosyalarının tamamıdır.
 
-## Temel kural
+Doğrulanmış source suite: 128 test, 31 dosya. Build sonrası artifact suite beş compiled-distribution senaryosu ekler; context ve graph benchmark'ları ayrı çalışır.
 
-Bir faz; dosya kapsamı, secret taraması, bütçe, seçilmiş testler, acceptance komutları ve yapılandırılmış critic kapıları geçmeden `COMPLETED` olmaz. Token verimliliği yalnızca tekrarlı payload'ı azaltır; doğrulama rigor'unu azaltmaz. Proje tamamlanırken yapılandırılmış full test suite tekrar çalışır. Plan değişiklikleri yalnızca `amend_plan` ile yapılır ve event geçmişine yazılır.
+## Kullanım ve dağıtım
 
-Temel MCP sırası:
+Generic MCP kurulumu için [INSTALL_MCP.md](INSTALL_MCP.md) kullanılır. Aynı canonical backend Codex plugin, Claude plugin, Agent Skills, stdio/HTTP MCP ve hook sistemi olmayan hostlar için `poll` üzerinden sunulur. Host başına ayrı ürün mantığı fork edilmez.
 
-1. `initialize_project`
-2. `save_plan`
-3. `start_phase`
-4. kapsam içi uygulama ve karar kaydı
-5. `checkpoint_phase`
-6. gerekiyorsa `amend_plan`, `resolve_approval` veya tekrar doğrulama
-7. tüm fazlar geçince `complete_project`
+## Semantic graph sınırı
 
-Normal reasoning akışında `get_context` çağrısında `include_snapshot` kullanma. Son sequence değerini `since_sequence` olarak geçir; değişiklik yoksa yalnızca compact `{ "unchanged": true, "sequence": ... }` döner. Orientation için tam dosya okumadan önce `get_file_digest`, kesin bağımlılık düğümleri gerektiğinde `expand_graph` kullan.
+TypeScript/JavaScript gerçek compiler AST kullanır. Python, C ve C++; pinned sürümlü ve SHA-256 doğrulamalı tree-sitter WASM grammar'ları kullanır. Bu katman doğru local syntax ve lexical scope sağlar; Pyright/clangd seviyesinde cross-module type resolution, macro expansion, conditional preprocessing ve template instantiation sağlamaz. Tier-2 enrichment, gerçek corpus kanıtı oluşmadan spekülatif biçimde etkinleştirilmeyecektir.
 
-Belirsiz bir yorumla uygulamaya başlamadan önce `record_assumption`, ardından ilgili file/symbol/decision düğümleri için `link_assumption` çağrılır. Varsayım doğruysa `confirm_assumption`; yanlışsa `invalidate_assumption` kullanılır. Correction checkpoint yalnızca faz kapsamı ile blast radius kesişimindeki dosyalara izin verir. Daha geniş gerçek kapsam gerekiyorsa `expand_correction_scope` boş olmayan bir gerekçeyle çağrılmalıdır. Varsayılan confidence eşiği `0.6` değeridir.
+## Evaluation dürüstlüğü
 
-Evaluation raporu; containment rate ve Wilson %95 aralığını, project-scope tokens-per-correction değerini, anti-pattern hit rate değerini ve isteğe bağlı enabled/disabled McNemar karşılaştırmasını içerir.
-
-Paralel fazlar yalnızca `parallelSafe` olarak işaretlenmiş, kapsam kökleri bağımsız ve aynı anda `READY` olan fazlar için `prepare_parallel_phases` ile açılır.
-
-Dashboard:
-
-```bash
-keep-coding dashboard /proje/yolu
-```
-
-Varsayılan adres yalnızca `127.0.0.1` üzerindedir. Normal ChatGPT için bounded HTTP MCP kurulumu [CHATGPT_APP.md](CHATGPT_APP.md), mimari ayrıntılar [ARCHITECTURE.md](ARCHITECTURE.md) dosyasındadır.
+Repository 24 görevlik frozen corpus ve paired runner içerir; ancak provider credential veya agent executable olmadan efficacy yüzdesi uydurmaz. Mevcut kanıt durumu ve çalıştırma sözleşmesi [EVALUATION_RESULTS.md](EVALUATION_RESULTS.md) içinde yayınlanır.

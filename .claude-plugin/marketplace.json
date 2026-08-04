@@ -1,0 +1,23 @@
+{
+  "name": "keep-coding-marketplace",
+  "owner": {
+    "name": "Keep Coding contributors"
+  },
+  "description": "Evidence-gated coding-agent workflow plugins.",
+  "version": "0.4.0",
+  "plugins": [
+    {
+      "name": "keep-coding",
+      "displayName": "Keep Coding",
+      "source": "./plugins/keep-coding",
+      "description": "Durable plans, semantic impact, bounded correction, and evidence-gated completion.",
+      "version": "0.4.0",
+      "author": {
+        "name": "Keep Coding contributors"
+      },
+      "license": "MIT",
+      "category": "productivity",
+      "tags": ["coding-agent", "mcp", "verification", "project-memory"]
+    }
+  ]
+}

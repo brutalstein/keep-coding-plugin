@@ -22,5 +22,5 @@ jobs:
         if: success()
         with:
           name: keep-coding-dist
-          path: plugins/keep-coding/dist/keep-coding.mjs
+          path: plugins/keep-coding/dist
           if-no-files-found: error

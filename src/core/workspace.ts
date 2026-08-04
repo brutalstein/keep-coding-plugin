@@ -12,11 +12,9 @@ const MAX_DIFF_CHARS = 100_000;
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
 
 export class WorkspaceTools {
-  private readonly canonicalRoot: Promise<string>;
+  private canonicalRoot: Promise<string> | null = null;
 
-  constructor(private readonly git: GitRepository, private readonly store: ProjectStore) {
-    this.canonicalRoot = realpath(git.root);
-  }
+  constructor(private readonly git: GitRepository, private readonly store: ProjectStore) {}
 
   async listFiles(maxFiles = 500): Promise<{ files: string[]; truncated: boolean }> {
     const files = await this.git.allFiles();
@@ -99,7 +97,7 @@ export class WorkspaceTools {
 
   private async resolveExistingFile(relativePath: string): Promise<string> {
     const repositoryPath = normalizeRepositoryPath(relativePath);
-    const root = await this.canonicalRoot;
+    const root = await this.getCanonicalRoot();
     const candidate = path.resolve(root, ...repositoryPath.split("/"));
     const canonical = await realpath(candidate);
     const relative = path.relative(root, canonical);
@@ -108,6 +106,14 @@ export class WorkspaceTools {
     }
     return canonical;
   }
+  private getCanonicalRoot(): Promise<string> {
+    this.canonicalRoot ??= realpath(this.git.root).catch((error: unknown) => {
+      this.canonicalRoot = null;
+      throw error;
+    });
+    return this.canonicalRoot;
+  }
+
 }
 
 export function extractPatchPaths(patchText: string): string[] {

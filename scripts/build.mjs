@@ -1,8 +1,9 @@
-import { chmod, mkdir, stat } from "node:fs/promises";
+import { chmod, cp, mkdir, stat } from "node:fs/promises";
 import { build } from "esbuild";
 
 const outfile = "plugins/keep-coding/dist/keep-coding.mjs";
-await mkdir("plugins/keep-coding/dist", { recursive: true });
+const grammarDir = "plugins/keep-coding/dist/grammars";
+await mkdir(grammarDir, { recursive: true });
 await build({
   entryPoints: ["src/entry.ts"],
   outfile,
@@ -14,6 +15,7 @@ await build({
   banner: { js: "#!/usr/bin/env node" },
   external: ["node:sqlite", "typescript"]
 });
+await cp("assets/tree-sitter", grammarDir, { recursive: true, force: true });
 await chmod(outfile, 0o755);
 const output = await stat(outfile);
-console.log(`Built ${outfile} (${output.size} bytes; TypeScript compiler external).`);
+console.log(`Built ${outfile} (${output.size} bytes) with verified sidecar grammars.`);

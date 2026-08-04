@@ -25,8 +25,13 @@ import type {
   ProjectStatus,
   VerificationEvidence
 } from "../domain/model.js";
+import { migrateProjectDatabase } from "./migrations.js";
+import {
+  assumptionFromRow, checkpointFromRow, correctionFromRow, decisionFromRow, eventFromRow, failureFromRow,
+  graphEdgeFromRow, graphNodeFromRow, phaseFromRow, projectFromRow, text, type DatabaseRow
+} from "./row-mappers.js";
+import { validateContract, validatePlan } from "./validation.js";
 
-type Row = Record<string, unknown>;
 
 export class ProjectStore {
   readonly projectRoot: string;
@@ -60,7 +65,7 @@ export class ProjectStore {
   }
 
   getProject(): ProjectRecord | null {
-    const row = this.db.prepare("SELECT * FROM project LIMIT 1").get() as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM project LIMIT 1").get() as DatabaseRow | undefined;
     return row ? projectFromRow(row) : null;
   }
 
@@ -124,11 +129,11 @@ export class ProjectStore {
   }
 
   listPhases(): PhaseRecord[] {
-    return (this.db.prepare("SELECT * FROM phases ORDER BY ordinal").all() as Row[]).map(phaseFromRow);
+    return (this.db.prepare("SELECT * FROM phases ORDER BY ordinal").all() as DatabaseRow[]).map(phaseFromRow);
   }
 
   getPhase(id: string): PhaseRecord | null {
-    const row = this.db.prepare("SELECT * FROM phases WHERE id = ?").get(id) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM phases WHERE id = ?").get(id) as DatabaseRow | undefined;
     return row ? phaseFromRow(row) : null;
   }
 
@@ -245,7 +250,7 @@ export class ProjectStore {
   }
 
   getAssumption(id: string): AssumptionRecord | null {
-    const row = this.db.prepare("SELECT * FROM assumptions WHERE id = ?").get(id) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM assumptions WHERE id = ?").get(id) as DatabaseRow | undefined;
     return row ? assumptionFromRow(row) : null;
   }
 
@@ -255,7 +260,7 @@ export class ProjectStore {
     if (phaseId !== undefined) { clauses.push(phaseId === null ? "phase_id IS NULL" : "phase_id = ?"); if (phaseId !== null) values.push(phaseId); }
     if (status !== undefined) { clauses.push("status = ?"); values.push(status); }
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
-    return (this.db.prepare(`SELECT * FROM assumptions${where} ORDER BY confidence ASC, created_at ASC`).all(...values) as Row[]).map(assumptionFromRow);
+    return (this.db.prepare(`SELECT * FROM assumptions${where} ORDER BY confidence ASC, created_at ASC`).all(...values) as DatabaseRow[]).map(assumptionFromRow);
   }
 
   setAssumptionStatus(id: string, status: AssumptionStatus, evidence = ""): AssumptionRecord {
@@ -301,7 +306,7 @@ export class ProjectStore {
   }
 
   getGraphNode(id: string): GraphNode | null {
-    const row = this.db.prepare("SELECT * FROM graph_nodes WHERE id = ? AND active = 1").get(id) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM graph_nodes WHERE id = ? AND active = 1").get(id) as DatabaseRow | undefined;
     return row ? graphNodeFromRow(row) : null;
   }
 
@@ -309,7 +314,7 @@ export class ProjectStore {
     const rows = type
       ? this.db.prepare("SELECT * FROM graph_edges WHERE source_id = ? AND type = ? ORDER BY target_id").all(sourceId, type)
       : this.db.prepare("SELECT * FROM graph_edges WHERE source_id = ? ORDER BY type, target_id").all(sourceId);
-    return (rows as Row[]).map(graphEdgeFromRow);
+    return (rows as DatabaseRow[]).map(graphEdgeFromRow);
   }
 
   addEdge(sourceId: string, targetId: string, type: GraphEdge["type"], metadata: Record<string, unknown> = {}): void {
@@ -360,20 +365,20 @@ export class ProjectStore {
   }
 
   getCorrection(id: string): CorrectionRecord | null {
-    const row = this.db.prepare("SELECT * FROM corrections WHERE id = ?").get(id) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM corrections WHERE id = ?").get(id) as DatabaseRow | undefined;
     return row ? correctionFromRow(row) : null;
   }
 
   listCorrections(phaseId?: string | null): CorrectionRecord[] {
-    if (phaseId === undefined) return (this.db.prepare("SELECT * FROM corrections ORDER BY applied_at").all() as Row[]).map(correctionFromRow);
+    if (phaseId === undefined) return (this.db.prepare("SELECT * FROM corrections ORDER BY applied_at").all() as DatabaseRow[]).map(correctionFromRow);
     const rows = phaseId === null
       ? this.db.prepare("SELECT * FROM corrections WHERE phase_id IS NULL ORDER BY applied_at").all()
       : this.db.prepare("SELECT * FROM corrections WHERE phase_id = ? ORDER BY applied_at").all(phaseId);
-    return (rows as Row[]).map(correctionFromRow);
+    return (rows as DatabaseRow[]).map(correctionFromRow);
   }
 
   activeCorrection(phaseId: string): CorrectionRecord | null {
-    const row = this.db.prepare("SELECT * FROM corrections WHERE phase_id = ? AND completed_at IS NULL ORDER BY applied_at DESC LIMIT 1").get(phaseId) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM corrections WHERE phase_id = ? AND completed_at IS NULL ORDER BY applied_at DESC LIMIT 1").get(phaseId) as DatabaseRow | undefined;
     return row ? correctionFromRow(row) : null;
   }
 
@@ -412,12 +417,12 @@ export class ProjectStore {
   }
 
   correctionRecordedSince(sequence: number): boolean {
-    const row = this.db.prepare("SELECT 1 AS found FROM events WHERE sequence > ? AND type IN ('assumption_invalidated','correction_recorded') LIMIT 1").get(sequence) as Row | undefined;
+    const row = this.db.prepare("SELECT 1 AS found FROM events WHERE sequence > ? AND type IN ('assumption_invalidated','correction_recorded') LIMIT 1").get(sequence) as DatabaseRow | undefined;
     return Boolean(row);
   }
 
   lastCheckpointEventSequence(): number {
-    const row = this.db.prepare("SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE type IN ('phase_completed','phase_verification_failed')").get() as Row;
+    const row = this.db.prepare("SELECT COALESCE(MAX(sequence),0) AS sequence FROM events WHERE type IN ('phase_completed','phase_verification_failed')").get() as DatabaseRow;
     return Number(row.sequence);
   }
 
@@ -434,12 +439,12 @@ export class ProjectStore {
   }
 
   countAntiPatternHits(): number {
-    const row = this.db.prepare("SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'anti_pattern_hit:%'").get() as Row;
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM metadata WHERE key LIKE 'anti_pattern_hit:%'").get() as DatabaseRow;
     return Number(row.count);
   }
 
   totalRecordedTokens(): number {
-    const row = this.db.prepare("SELECT COALESCE(SUM(tokens),0) AS tokens FROM budget_usage WHERE scope = 'project'").get() as Row | undefined;
+    const row = this.db.prepare("SELECT COALESCE(SUM(tokens),0) AS tokens FROM budget_usage WHERE scope = 'project'").get() as DatabaseRow | undefined;
     return Number(row?.tokens ?? 0);
   }
 
@@ -477,7 +482,7 @@ export class ProjectStore {
     must(this.getPhase(phaseId), `unknown phase: ${phaseId}`);
     const normalizedFingerprint = fingerprint?.trim() || normalizedDiagnosticSignature(summary);
     const existing = this.db.prepare("SELECT * FROM failures WHERE phase_id = ? AND fingerprint = ?")
-      .get(phaseId, normalizedFingerprint) as Row | undefined;
+      .get(phaseId, normalizedFingerprint) as DatabaseRow | undefined;
     const now = new Date().toISOString();
     if (existing) {
       this.db.prepare("UPDATE failures SET count = count + 1, summary = ?, last_seen_at = ? WHERE id = ?")
@@ -495,19 +500,19 @@ export class ProjectStore {
   }
 
   listDecisions(): DecisionRecord[] {
-    return (this.db.prepare("SELECT * FROM decisions ORDER BY created_at").all() as Row[]).map(decisionFromRow);
+    return (this.db.prepare("SELECT * FROM decisions ORDER BY created_at").all() as DatabaseRow[]).map(decisionFromRow);
   }
 
   listFailures(): FailureRecord[] {
-    return (this.db.prepare("SELECT * FROM failures ORDER BY last_seen_at").all() as Row[]).map(failureFromRow);
+    return (this.db.prepare("SELECT * FROM failures ORDER BY last_seen_at").all() as DatabaseRow[]).map(failureFromRow);
   }
 
   listCheckpoints(): CheckpointRecord[] {
-    return (this.db.prepare("SELECT * FROM checkpoints ORDER BY created_at").all() as Row[]).map(checkpointFromRow);
+    return (this.db.prepare("SELECT * FROM checkpoints ORDER BY created_at").all() as DatabaseRow[]).map(checkpointFromRow);
   }
 
   recentEvents(limit = 30): EventRecord[] {
-    return (this.db.prepare("SELECT * FROM events ORDER BY sequence DESC LIMIT ?").all(limit) as Row[])
+    return (this.db.prepare("SELECT * FROM events ORDER BY sequence DESC LIMIT ?").all(limit) as DatabaseRow[])
       .map(eventFromRow)
       .reverse();
   }
@@ -532,12 +537,12 @@ export class ProjectStore {
   }
 
   latestEventSequence(): number {
-    const row = this.db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events").get() as Row;
+    const row = this.db.prepare("SELECT COALESCE(MAX(sequence), 0) AS sequence FROM events").get() as DatabaseRow;
     return Number(row.sequence);
   }
 
   lastStopProgressSequence(): number {
-    const row = this.db.prepare("SELECT value FROM metadata WHERE key = 'last_stop_progress_sequence'").get() as Row | undefined;
+    const row = this.db.prepare("SELECT value FROM metadata WHERE key = 'last_stop_progress_sequence'").get() as DatabaseRow | undefined;
     return row ? Number(row.value) : 0;
   }
 
@@ -549,8 +554,8 @@ export class ProjectStore {
   }
 
   getPhaseBaseline(phaseId: string): Record<string, string> | null {
-    const row = this.db.prepare("SELECT value FROM metadata WHERE key = ?").get(`phase_baseline:${phaseId}`) as Row | undefined;
-    return row ? JSON.parse(asText(row.value)) as Record<string, string> : null;
+    const row = this.db.prepare("SELECT value FROM metadata WHERE key = ?").get(`phase_baseline:${phaseId}`) as DatabaseRow | undefined;
+    return row ? JSON.parse(text(row.value)) as Record<string, string> : null;
   }
 
   setPhaseBaseline(phaseId: string, baseline: Record<string, string>): void {
@@ -585,16 +590,16 @@ export class ProjectStore {
     const clauses = terms.slice(0, 8).map(() => "(LOWER(label) LIKE ? OR LOWER(COALESCE(path, '')) LIKE ?)").join(" OR ");
     const values = terms.slice(0, 8).flatMap((term) => [`%${term.toLowerCase()}%`, `%${term.toLowerCase()}%`]);
     return (this.db.prepare(`SELECT * FROM graph_nodes WHERE active = 1 AND (${clauses}) ORDER BY type, label LIMIT ?`)
-      .all(...values, limit) as Row[]).map(graphNodeFromRow);
+      .all(...values, limit) as DatabaseRow[]).map(graphNodeFromRow);
   }
 
   private getDecision(id: string): DecisionRecord | null {
-    const row = this.db.prepare("SELECT * FROM decisions WHERE id = ?").get(id) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM decisions WHERE id = ?").get(id) as DatabaseRow | undefined;
     return row ? decisionFromRow(row) : null;
   }
 
   private getFailure(id: string): FailureRecord | null {
-    const row = this.db.prepare("SELECT * FROM failures WHERE id = ?").get(id) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM failures WHERE id = ?").get(id) as DatabaseRow | undefined;
     return row ? failureFromRow(row) : null;
   }
 
@@ -620,207 +625,8 @@ export class ProjectStore {
   }
 
   private migrate(): void {
-    this.db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA foreign_keys = ON;
-      PRAGMA busy_timeout = 5000;
-      CREATE TABLE IF NOT EXISTS project (
-        id TEXT PRIMARY KEY, root TEXT NOT NULL, original_prompt TEXT NOT NULL, status TEXT NOT NULL,
-        contract_json TEXT, plan_version INTEGER NOT NULL, current_phase_id TEXT,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS phases (
-        id TEXT PRIMARY KEY, ordinal INTEGER NOT NULL, title TEXT NOT NULL, goal TEXT NOT NULL,
-        status TEXT NOT NULL, dependencies_json TEXT NOT NULL, allowed_scope_json TEXT NOT NULL,
-        acceptance_commands_json TEXT NOT NULL, max_attempts INTEGER NOT NULL, attempts INTEGER NOT NULL,
-        started_at TEXT, completed_at TEXT, base_sha TEXT, head_sha TEXT, summary TEXT
-      );
-      CREATE TABLE IF NOT EXISTS decisions (
-        id TEXT PRIMARY KEY, phase_id TEXT, title TEXT NOT NULL, rationale TEXT NOT NULL,
-        alternatives_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS assumptions (
-        id TEXT PRIMARY KEY, phase_id TEXT, statement TEXT NOT NULL, confidence REAL NOT NULL,
-        alternatives_json TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL, resolved_at TEXT,
-        resolution_evidence TEXT, explicit_linked_at TEXT
-      );
-      CREATE TABLE IF NOT EXISTS corrections (
-        id TEXT PRIMARY KEY, assumption_id TEXT NOT NULL REFERENCES assumptions(id), phase_id TEXT,
-        root_cause TEXT NOT NULL, blast_radius_json TEXT NOT NULL, blast_radius_size INTEGER NOT NULL,
-        applied_at TEXT NOT NULL, outcome TEXT, expansions_json TEXT NOT NULL DEFAULT '[]', completed_at TEXT,
-        token_start INTEGER NOT NULL DEFAULT 0, token_end INTEGER
-      );
-      CREATE INDEX IF NOT EXISTS idx_assumptions_phase ON assumptions(phase_id, status);
-      CREATE INDEX IF NOT EXISTS idx_corrections_assumption ON corrections(assumption_id);
-      CREATE TABLE IF NOT EXISTS failures (
-        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, fingerprint TEXT NOT NULL, summary TEXT NOT NULL,
-        count INTEGER NOT NULL, last_seen_at TEXT NOT NULL, resolution TEXT,
-        UNIQUE(phase_id, fingerprint)
-      );
-      CREATE TABLE IF NOT EXISTS checkpoints (
-        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, git_sha TEXT NOT NULL, summary TEXT NOT NULL,
-        changed_files_json TEXT NOT NULL, verification_json TEXT NOT NULL, created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS events (
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, type TEXT NOT NULL,
-        phase_id TEXT, payload_json TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS graph_nodes (
-        id TEXT PRIMARY KEY, type TEXT NOT NULL, label TEXT NOT NULL, path TEXT, symbol TEXT,
-        content_hash TEXT, metadata_json TEXT NOT NULL, updated_at TEXT NOT NULL, active INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS graph_edges (
-        source_id TEXT NOT NULL, target_id TEXT NOT NULL, type TEXT NOT NULL,
-        metadata_json TEXT NOT NULL, updated_at TEXT NOT NULL,
-        PRIMARY KEY (source_id, target_id, type)
-      );
-      CREATE INDEX IF NOT EXISTS idx_events_phase ON events(phase_id, sequence);
-      CREATE INDEX IF NOT EXISTS idx_graph_nodes_path ON graph_nodes(path);
-    `);
+    migrateProjectDatabase(this.db);
   }
-}
-
-function validateContract(contract: ProjectContract): void {
-  if (contract.goal.trim().length < 10) throw new Error("contract goal is too short");
-  if (contract.deliverables.length === 0) throw new Error("contract requires deliverables");
-  if (contract.doneWhen.length === 0) throw new Error("contract requires measurable done-when criteria");
-  if (contract.assumptionConfidenceThreshold !== undefined && (!Number.isFinite(contract.assumptionConfidenceThreshold) || contract.assumptionConfidenceThreshold < 0 || contract.assumptionConfidenceThreshold > 1)) throw new Error("assumptionConfidenceThreshold must be in [0, 1]");
-}
-
-function validatePlan(phases: PhaseDefinition[]): void {
-  if (phases.length === 0) throw new Error("plan requires at least one phase");
-  const ids = new Set<string>();
-  for (const phase of phases) {
-    if (!/^[a-z0-9][a-z0-9-]{1,63}$/.test(phase.id)) throw new Error(`invalid phase id: ${phase.id}`);
-    if (ids.has(phase.id)) throw new Error(`duplicate phase id: ${phase.id}`);
-    if (phase.acceptanceCommands.length === 0) throw new Error(`phase ${phase.id} requires verification commands`);
-    if (phase.acceptanceCommands.some((command) => /^(?:true|echo\b|exit\s+0)$/i.test(command.trim()))) {
-      throw new Error(`phase ${phase.id} contains a no-op verification command`);
-    }
-    if (phase.maxAttempts < 1 || phase.maxAttempts > 10) throw new Error(`phase ${phase.id} maxAttempts must be 1..10`);
-    ids.add(phase.id);
-  }
-  for (const phase of phases) {
-    for (const dependency of phase.dependencies) {
-      if (!ids.has(dependency)) throw new Error(`phase ${phase.id} has unknown dependency ${dependency}`);
-      if (dependency === phase.id) throw new Error(`phase ${phase.id} cannot depend on itself`);
-    }
-  }
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const byId = new Map(phases.map((phase) => [phase.id, phase]));
-  const visit = (id: string): void => {
-    if (visiting.has(id)) throw new Error("phase dependency graph contains a cycle");
-    if (visited.has(id)) return;
-    visiting.add(id);
-    for (const dependency of must(byId.get(id), `missing phase ${id}`).dependencies) visit(dependency);
-    visiting.delete(id);
-    visited.add(id);
-  };
-  phases.forEach((phase) => visit(phase.id));
-}
-
-function projectFromRow(row: Row): ProjectRecord {
-  return {
-    id: String(row.id), root: String(row.root), originalPrompt: String(row.original_prompt),
-    status: String(row.status) as ProjectStatus,
-    contract: row.contract_json ? JSON.parse(asText(row.contract_json)) as ProjectContract : null,
-    planVersion: Number(row.plan_version), currentPhaseId: row.current_phase_id ? asText(row.current_phase_id) : null,
-    createdAt: String(row.created_at), updatedAt: String(row.updated_at)
-  };
-}
-
-function phaseFromRow(row: Row): PhaseRecord {
-  return {
-    id: String(row.id), ordinal: Number(row.ordinal), title: String(row.title), goal: String(row.goal),
-    status: String(row.status) as PhaseStatus,
-    dependencies: JSON.parse(String(row.dependencies_json)) as string[],
-    allowedScope: JSON.parse(String(row.allowed_scope_json)) as string[],
-    acceptanceCommands: JSON.parse(String(row.acceptance_commands_json)) as string[],
-    maxAttempts: Number(row.max_attempts), attempts: Number(row.attempts),
-    startedAt: nullable(row.started_at), completedAt: nullable(row.completed_at), baseSha: nullable(row.base_sha),
-    headSha: nullable(row.head_sha), summary: nullable(row.summary)
-  };
-}
-
-function decisionFromRow(row: Row): DecisionRecord {
-  return {
-    id: String(row.id), phaseId: nullable(row.phase_id), title: String(row.title), rationale: String(row.rationale),
-    alternatives: JSON.parse(String(row.alternatives_json)) as string[], status: String(row.status) as "active" | "superseded",
-    createdAt: String(row.created_at)
-  };
-}
-
-function failureFromRow(row: Row): FailureRecord {
-  return {
-    id: String(row.id), phaseId: String(row.phase_id), fingerprint: String(row.fingerprint), summary: String(row.summary),
-    count: Number(row.count), lastSeenAt: String(row.last_seen_at), resolution: nullable(row.resolution)
-  };
-}
-
-
-function assumptionFromRow(row: Row): AssumptionRecord {
-  const alternatives = JSON.parse(String(row.alternatives_json)) as unknown;
-  if (!Array.isArray(alternatives)) throw new Error("INVALID_ALTERNATIVES: stored alternatives must be an array");
-  return {
-    id: String(row.id), phaseId: nullable(row.phase_id), statement: String(row.statement), confidence: Number(row.confidence),
-    alternatives: alternatives as AssumptionAlternative[], status: String(row.status) as AssumptionStatus,
-    createdAt: String(row.created_at), resolvedAt: nullable(row.resolved_at), resolutionEvidence: nullable(row.resolution_evidence),
-    explicitLinkedAt: nullable(row.explicit_linked_at)
-  };
-}
-
-function correctionFromRow(row: Row): CorrectionRecord {
-  return {
-    id: String(row.id), assumptionId: String(row.assumption_id), phaseId: nullable(row.phase_id), rootCause: String(row.root_cause),
-    blastRadius: JSON.parse(String(row.blast_radius_json)) as BlastRadius, blastRadiusSize: Number(row.blast_radius_size),
-    appliedAt: String(row.applied_at), outcome: row.outcome ? asText(row.outcome) as "contained" | "expanded" : null,
-    expansions: JSON.parse(asText(row.expansions_json ?? "[]")) as CorrectionScopeExpansion[], completedAt: nullable(row.completed_at),
-    tokenStart: Number(row.token_start ?? 0), tokenEnd: row.token_end === null || row.token_end === undefined ? null : Number(row.token_end)
-  };
-}
-
-function checkpointFromRow(row: Row): CheckpointRecord {
-  return {
-    id: String(row.id), phaseId: String(row.phase_id), gitSha: String(row.git_sha), summary: String(row.summary),
-    changedFiles: JSON.parse(String(row.changed_files_json)) as string[],
-    verification: JSON.parse(String(row.verification_json)) as VerificationEvidence,
-    createdAt: String(row.created_at)
-  };
-}
-
-function eventFromRow(row: Row): EventRecord {
-  return {
-    sequence: Number(row.sequence), timestamp: String(row.timestamp), type: String(row.type),
-    phaseId: nullable(row.phase_id), payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>
-  };
-}
-
-function graphEdgeFromRow(row: Row): GraphEdge {
-  return {
-    sourceId: String(row.source_id), targetId: String(row.target_id), type: String(row.type) as GraphEdge["type"],
-    metadata: JSON.parse(String(row.metadata_json)) as Record<string, unknown>
-  };
-}
-
-function graphNodeFromRow(row: Row): GraphNode {
-  return {
-    id: String(row.id), type: String(row.type) as GraphNode["type"], label: String(row.label), path: nullable(row.path),
-    symbol: nullable(row.symbol), contentHash: nullable(row.content_hash),
-    metadata: JSON.parse(String(row.metadata_json)) as Record<string, unknown>
-  };
-}
-
-function nullable(value: unknown): string | null {
-  return value === null || value === undefined ? null : asText(value);
-}
-
-function asText(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return `${value}`;
-  if (Buffer.isBuffer(value)) return value.toString("utf8");
-  throw new Error("database returned a non-scalar value");
 }
 
 function sha256(value: string): string {

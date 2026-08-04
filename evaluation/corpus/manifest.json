@@ -1,0 +1,790 @@
+{
+  "schemaVersion": 1,
+  "repetitions": 3,
+  "tasks": [
+    {
+      "id": "greenfield-slugify",
+      "title": "Unicode-aware slug utility",
+      "category": "greenfield",
+      "language": "javascript",
+      "prompt": "Build a dependency-free ESM slug utility in src/slugify.mjs. Normalize Unicode, remove combining marks, collapse punctuation and whitespace to single hyphens, trim edges, support an optional maxLength without leaving a trailing hyphen, and export slugify. Add concise usage documentation.",
+      "initialFiles": {
+        "README.md": "# Slug utility\n",
+        "package.json": "{\"type\":\"module\"}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/slugify.mjs",
+            "contains": [
+              "export",
+              "slugify"
+            ]
+          },
+          {
+            "path": "README.md",
+            "contains": [
+              "slug"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/slugify.mjs').then(({slugify})=>{const a=slugify('  Café Déjà Vu!  '); const b=slugify('alpha beta gamma',{maxLength:10}); if(a!=='cafe-deja-vu'||b!=='alpha-beta') process.exit(1)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "greenfield-ttl-cache",
+      "title": "Deterministic TTL cache",
+      "category": "greenfield",
+      "language": "javascript",
+      "prompt": "Implement src/ttl-cache.mjs as a small dependency-free cache with get, set, has, delete, clear, and size. Inject the clock through the constructor for deterministic tests, expire entries lazily on reads, and ensure setting an existing key replaces its expiry. Reject negative TTL values.",
+      "initialFiles": {
+        "README.md": "# TTL cache\n",
+        "package.json": "{\"type\":\"module\"}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/ttl-cache.mjs",
+            "contains": [
+              "class",
+              "TTL"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/ttl-cache.mjs').then(m=>{let now=0;const C=m.TTLCache??m.default;const c=new C(()=>now);c.set('x',1,5);now=4;if(c.get('x')!==1)process.exit(1);now=5;if(c.has('x')||c.size!==0)process.exit(2);let threw=false;try{c.set('y',2,-1)}catch{threw=true}if(!threw)process.exit(3)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "greenfield-csv-summary",
+      "title": "Streaming CSV summary",
+      "category": "greenfield",
+      "language": "javascript",
+      "prompt": "Create src/csv-summary.mjs exporting summarizeCsv(text). Parse a header row and quoted comma fields, reject ragged rows, and return rowCount plus per-column counts of non-empty values. Keep the implementation dependency-free and preserve escaped double quotes inside quoted fields.",
+      "initialFiles": {
+        "README.md": "# CSV summary\n",
+        "package.json": "{\"type\":\"module\"}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/csv-summary.mjs",
+            "contains": [
+              "summarizeCsv"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/csv-summary.mjs').then(({summarizeCsv})=>{const r=summarizeCsv('name,note\\nAda,\"x,y\"\\nBob,\\n');if(r.rowCount!==2||r.columns.name.nonEmpty!==2||r.columns.note.nonEmpty!==1)process.exit(1);let ok=false;try{summarizeCsv('a,b\\n1')}catch{ok=true}if(!ok)process.exit(2)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "greenfield-rate-limiter",
+      "title": "Token bucket rate limiter",
+      "category": "greenfield",
+      "language": "javascript",
+      "prompt": "Implement a deterministic token-bucket limiter in src/token-bucket.mjs. Constructor options are capacity, refillPerSecond, and an injected clock returning milliseconds. consume(count) must refill proportionally, never exceed capacity, reject non-positive counts, and return a boolean without sleeping.",
+      "initialFiles": {
+        "README.md": "# Token bucket\n",
+        "package.json": "{\"type\":\"module\"}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/token-bucket.mjs",
+            "contains": [
+              "consume",
+              "refill"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/token-bucket.mjs').then(m=>{let n=0;const B=m.TokenBucket??m.default;const b=new B({capacity:2,refillPerSecond:1,clock:()=>n});if(!b.consume(2)||b.consume(1))process.exit(1);n=1000;if(!b.consume(1)||b.consume(2))process.exit(2)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "greenfield-event-bus",
+      "title": "Re-entrant event bus",
+      "category": "greenfield",
+      "language": "javascript",
+      "prompt": "Build src/event-bus.mjs with on, once, off, and emit. Listener removal or addition during emit must not corrupt the current delivery order, once listeners must run exactly once even under re-entrant emit, and one failing listener must not prevent later listeners; return collected errors.",
+      "initialFiles": {
+        "README.md": "# Event bus\n",
+        "package.json": "{\"type\":\"module\"}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/event-bus.mjs",
+            "contains": [
+              "once",
+              "emit"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/event-bus.mjs').then(m=>{const E=m.EventBus??m.default;const e=new E();let n=0;e.once('x',()=>{n++;e.emit('x')});e.on('x',()=>n++);const r=e.emit('x');if(n!==3||!Array.isArray(r.errors))process.exit(1)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "greenfield-config-schema",
+      "title": "Strict configuration validator",
+      "category": "greenfield",
+      "language": "javascript",
+      "prompt": "Create src/config.mjs exporting validateConfig(value). Validate a nested service configuration with name, positive integer port, mode enum development|production, optional string tags, and retry settings with maxAttempts and backoffMs. Return a deeply frozen normalized object and throw path-specific errors for unknown keys or invalid values.",
+      "initialFiles": {
+        "README.md": "# Configuration validator\n",
+        "package.json": "{\"type\":\"module\"}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/config.mjs",
+            "contains": [
+              "validateConfig",
+              "Object.freeze"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/config.mjs').then(({validateConfig})=>{const c=validateConfig({name:'api',port:8080,mode:'production',retry:{maxAttempts:3,backoffMs:20}});if(!Object.isFrozen(c)||!Object.isFrozen(c.retry))process.exit(1);let ok=false;try{validateConfig({name:'x',port:0,mode:'bad',retry:{maxAttempts:0,backoffMs:-1}})}catch(e){ok=String(e).includes('port')||String(e).includes('mode')}if(!ok)process.exit(2)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "refactor-callback-pipeline",
+      "title": "Callback pipeline to Promise API",
+      "category": "refactor",
+      "language": "javascript",
+      "prompt": "Refactor src/pipeline.mjs from callback-only composition to an async runPipeline(input, steps) API while retaining the existing callback export as a compatibility wrapper. Preserve step order, stop on the first error, reject non-functions, and do not invoke the final callback more than once.",
+      "initialFiles": {
+        "package.json": "{\"type\":\"module\"}\n",
+        "src/pipeline.mjs": "export function pipeline(input, steps, done){let i=0;function next(err,value){if(err)return done(err);const step=steps[i++];if(!step)return done(null,value);step(value,next)}next(null,input)}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/pipeline.mjs",
+            "contains": [
+              "runPipeline",
+              "pipeline"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/pipeline.mjs').then(async m=>{const out=await m.runPipeline(2,[async x=>x+1,async x=>x*3]);if(out!==9)process.exit(1);await new Promise((res,rej)=>m.pipeline(1,[(x,n)=>n(null,x+1)],(e,v)=>e?rej(e):(v===2?res():rej(new Error('bad')))))})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "refactor-retry-policy",
+      "title": "Extract bounded retry policy",
+      "category": "refactor",
+      "language": "javascript",
+      "prompt": "Refactor src/client.mjs so retry behavior is isolated in src/retry.mjs and injectable. Preserve public fetchJson(url, options), retry only explicitly retryable status codes or network errors, honor maxAttempts exactly, support deterministic sleep injection, and never retry AbortError.",
+      "initialFiles": {
+        "package.json": "{\"type\":\"module\"}\n",
+        "src/client.mjs": "export async function fetchJson(url){const r=await fetch(url);if(!r.ok)throw new Error(String(r.status));return r.json()}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/retry.mjs",
+            "contains": [
+              "maxAttempts"
+            ]
+          },
+          {
+            "path": "src/client.mjs",
+            "contains": [
+              "fetchJson"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/retry.mjs').then(async m=>{let n=0;const out=await m.withRetry(async()=>{n++;if(n<3)throw Object.assign(new Error('x'),{retryable:true});return 7},{maxAttempts:3,sleep:async()=>{}});if(out!==7||n!==3)process.exit(1)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "refactor-lru-bug",
+      "title": "Repair LRU eviction semantics",
+      "category": "refactor",
+      "language": "javascript",
+      "prompt": "Fix src/lru.mjs without changing its public API. get must promote a key, set must replace existing values without growing size, capacity zero must be rejected, and eviction must remove the least recently used key rather than insertion order after reads.",
+      "initialFiles": {
+        "package.json": "{\"type\":\"module\"}\n",
+        "src/lru.mjs": "export class LRU{constructor(capacity){this.capacity=capacity;this.map=new Map()}get(k){return this.map.get(k)}set(k,v){this.map.set(k,v);if(this.map.size>this.capacity)this.map.delete(this.map.keys().next().value)}}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/lru.mjs",
+            "contains": [
+              "class LRU"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/lru.mjs').then(({LRU})=>{const c=new LRU(2);c.set('a',1);c.set('b',2);if(c.get('a')!==1)process.exit(1);c.set('c',3);if(c.get('b')!==undefined||c.get('a')!==1)process.exit(2);let ok=false;try{new LRU(0)}catch{ok=true}if(!ok)process.exit(3)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "refactor-immutable-reducer",
+      "title": "Make reducer structurally immutable",
+      "category": "refactor",
+      "language": "javascript",
+      "prompt": "Refactor src/reducer.mjs so every supported action returns immutable state without mutating the prior object or nested items. Preserve object identity for true no-op actions, reject malformed actions, and support add, update, and remove by id.",
+      "initialFiles": {
+        "package.json": "{\"type\":\"module\"}\n",
+        "src/reducer.mjs": "export function reducer(state,action){if(action.type==='add'){state.items.push(action.item)}return state}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/reducer.mjs",
+            "contains": [
+              "reducer"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/reducer.mjs').then(({reducer})=>{const s={items:[{id:1,name:'a'}]};const n=reducer(s,{type:'update',id:1,patch:{name:'b'}});if(s.items[0].name!=='a'||n===s||n.items===s.items||n.items[0].name!=='b')process.exit(1);if(reducer(n,{type:'update',id:9,patch:{name:'x'}})!==n)process.exit(2)})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "refactor-safe-path",
+      "title": "Harden root-confined path resolution",
+      "category": "refactor",
+      "language": "javascript",
+      "prompt": "Refactor src/safe-path.mjs to export resolveInside(root, candidate). Canonicalize existing ancestors, reject absolute candidates, traversal, NUL bytes, and symlink escapes, while allowing a not-yet-created final file beneath a real in-root parent. Return an absolute path.",
+      "initialFiles": {
+        "package.json": "{\"type\":\"module\"}\n",
+        "src/safe-path.mjs": "import path from 'node:path';export function resolveInside(root,candidate){return path.join(root,candidate)}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/safe-path.mjs",
+            "contains": [
+              "realpath",
+              "resolveInside"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import fs from 'node:fs';import os from 'node:os';import path from 'node:path';import('{repo}/src/safe-path.mjs').then(({resolveInside})=>{const r=fs.mkdtempSync(path.join(os.tmpdir(),'safe-'));fs.mkdirSync(path.join(r,'sub'));const p=resolveInside(r,'sub/new.txt');if(!p.startsWith(r))process.exit(1);for(const x of ['../x','/tmp/x','a\\0b']){let ok=false;try{resolveInside(r,x)}catch{ok=true}if(!ok)process.exit(2)}})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "refactor-batch-queue",
+      "title": "Correct asynchronous batch queue",
+      "category": "refactor",
+      "language": "javascript",
+      "prompt": "Repair src/batch-queue.mjs. Multiple enqueue calls within the interval must share one flush, maxBatchSize must trigger immediate flush, a failed handler must reject only the affected batch promises, and the queue must remain usable afterward. Add close() that deterministically flushes pending work.",
+      "initialFiles": {
+        "package.json": "{\"type\":\"module\"}\n",
+        "src/batch-queue.mjs": "export class BatchQueue{constructor(handler){this.handler=handler;this.items=[]}enqueue(x){this.items.push(x);return Promise.resolve()}async flush(){const b=this.items;this.items=[];await this.handler(b)}}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/batch-queue.mjs",
+            "contains": [
+              "close",
+              "maxBatchSize"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "node",
+            "--input-type=module",
+            "-e",
+            "import('{repo}/src/batch-queue.mjs').then(async m=>{const batches=[];const Q=m.BatchQueue;const q=new Q(async b=>batches.push(b),{intervalMs:10000,maxBatchSize:2});const a=q.enqueue(1),b=q.enqueue(2);await Promise.all([a,b]);if(JSON.stringify(batches)!=='[[1,2]]')process.exit(1);await q.close()})"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "python-decorated-registry",
+      "title": "Decorator-aware command registry",
+      "category": "python",
+      "language": "python",
+      "prompt": "Implement package registry with a @command(name) decorator, duplicate-name rejection, async and sync invocation through invoke(name, *args), and metadata preservation via functools.wraps. Nested helper functions and docstrings containing fake definitions must not be registered.",
+      "initialFiles": {
+        "registry/__init__.py": "",
+        "registry/core.py": "# implement registry here\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "registry/core.py",
+            "contains": [
+              "def command",
+              "def invoke"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "python3",
+            "-c",
+            "import sys,asyncio;sys.path.insert(0,'{repo}');from registry.core import command,invoke;\n@command('add')\ndef add(a,b): return a+b\nassert asyncio.run(invoke('add',2,3))==5\ntry:\n @command('add')\n def x(): pass\nexcept ValueError: pass\nelse: raise SystemExit(2)"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "python-dataclass-inventory",
+      "title": "Immutable inventory domain model",
+      "category": "python",
+      "language": "python",
+      "prompt": "Create inventory/model.py with frozen dataclasses Product and StockItem plus an Inventory service. Quantities and prices must be validated, stock adjustments must be atomic and reject negative resulting stock, total_value must use Decimal, and snapshots must not expose mutable internal state.",
+      "initialFiles": {
+        "inventory/__init__.py": "",
+        "inventory/model.py": "from dataclasses import dataclass\n# implement\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "inventory/model.py",
+            "contains": [
+              "@dataclass",
+              "Decimal",
+              "total_value"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "python3",
+            "-c",
+            "import sys;from decimal import Decimal;sys.path.insert(0,'{repo}');from inventory.model import Product,Inventory;p=Product('p','Pen',Decimal('1.25'));i=Inventory();i.add(p,2);assert i.total_value()==Decimal('2.50');\ntry:i.adjust('p',-3)\nexcept ValueError:pass\nelse:raise SystemExit(2)\nassert i.quantity('p')==2"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "python-async-retry",
+      "title": "Cancellation-safe async retry",
+      "category": "python",
+      "language": "python",
+      "prompt": "Implement retry.py with async retry(operation, policy, sleep=asyncio.sleep). Validate policy, apply bounded exponential backoff with a cap, support a predicate deciding retryability, preserve the final exception as-is, and never catch or retry asyncio.CancelledError.",
+      "initialFiles": {
+        "retry.py": "import asyncio\n# implement retry\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "retry.py",
+            "contains": [
+              "async def retry",
+              "CancelledError"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "python3",
+            "-c",
+            "import sys,asyncio;sys.path.insert(0,'{repo}');from retry import retry,RetryPolicy\nasync def main():\n n=0;delays=[]\n async def op():\n  nonlocal n;n+=1\n  if n<3: raise ValueError('x')\n  return 9\n out=await retry(op,RetryPolicy(max_attempts=3,initial_delay=1,multiplier=2,max_delay=3),sleep=lambda d: delays.append(d) or asyncio.sleep(0))\n assert out==9 and delays==[1,2]\nasyncio.run(main())"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "python-relative-service",
+      "title": "Relative-import service package",
+      "category": "python",
+      "language": "python",
+      "prompt": "Refactor the app package so service.py uses explicit relative imports, exposes build_report(records), validates record shape, and returns a stable sorted report. Preserve the public import from app.__init__, avoid import-time side effects, and add type annotations throughout.",
+      "initialFiles": {
+        "app/__init__.py": "from .service import build_report\n",
+        "app/service.py": "from util import normalize\ndef build_report(records): return [normalize(x) for x in records]\n",
+        "app/util.py": "def normalize(x): return x\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "app/service.py",
+            "contains": [
+              "from .",
+              "build_report"
+            ]
+          },
+          {
+            "path": "app/__init__.py",
+            "contains": [
+              "build_report"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "python3",
+            "-c",
+            "import sys;sys.path.insert(0,'{repo}');from app import build_report;assert build_report([{'name':' b '},{'name':'A'}])==[{'name':'A'},{'name':'b'}]"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "python-doc-extractor",
+      "title": "AST-based API documentation extractor",
+      "category": "python",
+      "language": "python",
+      "prompt": "Implement doc_extract.py exporting extract_api(source). Use Python ast rather than regex, return top-level public classes and functions with name, kind, line, async flag, and docstring, include decorated definitions, and ignore nested/private definitions and code-looking text inside strings.",
+      "initialFiles": {
+        "doc_extract.py": "# implement with ast\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "doc_extract.py",
+            "contains": [
+              "ast.parse",
+              "extract_api"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "python3",
+            "-c",
+            "import sys;sys.path.insert(0,'{repo}');from doc_extract import extract_api;s='''\"\"\"def fake(): pass\"\"\"\n@staticmethod\ndef visible():\n \"\"\"ok\"\"\"\n def nested(): pass\nasync def later(): pass\ndef _private(): pass\n''';r=extract_api(s);assert [x['name'] for x in r]==['visible','later'];assert r[1]['async'] is True"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "python-transaction-context",
+      "title": "Nested transaction context manager",
+      "category": "python",
+      "language": "python",
+      "prompt": "Implement transaction.py with a TransactionManager context manager supporting nested savepoints. Commit only the outermost successful transaction, roll back the correct level on exceptions, never suppress exceptions, and expose a deterministic event log for testing without requiring a database.",
+      "initialFiles": {
+        "transaction.py": "# implement transaction manager\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "transaction.py",
+            "contains": [
+              "__enter__",
+              "__exit__",
+              "savepoint"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "python3",
+            "-c",
+            "import sys;sys.path.insert(0,'{repo}');from transaction import TransactionManager;m=TransactionManager();\nwith m.transaction():\n with m.transaction(): pass\nassert m.events==['begin','savepoint:1','release:1','commit'];\ntry:\n with m.transaction(): raise RuntimeError('x')\nexcept RuntimeError: pass\nassert m.events[-2:]==['begin','rollback']"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cpp-ring-buffer",
+      "title": "Bounded generic ring buffer",
+      "category": "cpp",
+      "language": "cpp",
+      "prompt": "Implement include/ring_buffer.hpp as a C++20 fixed-capacity generic ring buffer. Reject zero capacity, provide push with overwrite=false behavior, pop, front, back, size, empty, full, and preserve object lifetime correctly for non-trivial move-only types.",
+      "initialFiles": {
+        "include/ring_buffer.hpp": "#pragma once\n// implement\n",
+        "main.cpp": "#include \"include/ring_buffer.hpp\"\n#include <memory>\nint main(){RingBuffer<std::unique_ptr<int>> r(2);r.push(std::make_unique<int>(1));r.push(std::make_unique<int>(2));if(**r.front()!=1)return 1;auto x=r.pop();if(*x!=1)return 2;return 0;}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "include/ring_buffer.hpp",
+            "contains": [
+              "template",
+              "RingBuffer"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "c++",
+            "-std=c++20",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "{repo}/main.cpp",
+            "-o",
+            "{repo}/.eval-bin"
+          ],
+          [
+            "{repo}/.eval-bin"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cpp-tokenizer",
+      "title": "Location-aware expression tokenizer",
+      "category": "cpp",
+      "language": "cpp",
+      "prompt": "Implement include/tokenizer.hpp and src/tokenizer.cpp for identifiers, integers, + - * / parentheses, and end-of-input. Track one-based line and column, skip whitespace, reject unknown characters with a descriptive exception, and avoid reading past the input buffer.",
+      "initialFiles": {
+        "include/tokenizer.hpp": "#pragma once\n#include <string>\n// implement\n",
+        "src/tokenizer.cpp": "#include \"../include/tokenizer.hpp\"\n",
+        "main.cpp": "#include \"include/tokenizer.hpp\"\nint main(){Tokenizer t(\"a + 12\\n* b\");auto x=t.all();return x.size()==6 && x[3].line==2 ? 0:1;}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/tokenizer.cpp",
+            "contains": [
+              "Tokenizer"
+            ]
+          },
+          {
+            "path": "include/tokenizer.hpp",
+            "contains": [
+              "line",
+              "column"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "c++",
+            "-std=c++20",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "{repo}/main.cpp",
+            "{repo}/src/tokenizer.cpp",
+            "-o",
+            "{repo}/.eval-bin"
+          ],
+          [
+            "{repo}/.eval-bin"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cpp-raii-file",
+      "title": "Move-only RAII file handle",
+      "category": "cpp",
+      "language": "cpp",
+      "prompt": "Create include/file_handle.hpp implementing a move-only RAII wrapper around std::FILE*. Support open, close, read, write, validity checks, move construction and move assignment, reject operations on a closed handle, and guarantee exactly-once close without throwing from the destructor.",
+      "initialFiles": {
+        "include/file_handle.hpp": "#pragma once\n#include <cstdio>\n// implement\n",
+        "main.cpp": "#include \"include/file_handle.hpp\"\n#include <string>\nint main(){auto f=FileHandle::open(\".eval-file\",\"w+\");f.write(\"abc\");FileHandle g=std::move(f);if(f.valid()||!g.valid())return 1;g.close();return 0;}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "include/file_handle.hpp",
+            "contains": [
+              "FileHandle",
+              "FileHandle&&",
+              "~FileHandle"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "c++",
+            "-std=c++20",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "{repo}/main.cpp",
+            "-o",
+            "{repo}/.eval-bin"
+          ],
+          [
+            "{repo}/.eval-bin"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cpp-vector-namespace",
+      "title": "Constexpr vector mathematics",
+      "category": "cpp",
+      "language": "cpp",
+      "prompt": "Implement include/math/vector2.hpp in namespace kc::math. Provide constexpr arithmetic, dot, squared_length, equality, scalar multiplication in both orders, and safe normalized() returning std::optional for the zero vector. Keep the type trivially copyable.",
+      "initialFiles": {
+        "include/math/vector2.hpp": "#pragma once\n#include <optional>\n// implement\n",
+        "main.cpp": "#include \"include/math/vector2.hpp\"\n#include <type_traits>\nint main(){using kc::math::Vector2;constexpr Vector2 a{3,4};static_assert(a.squared_length()==25);static_assert(std::is_trivially_copyable_v<Vector2>);auto n=a.normalized();return n && Vector2{0,0}.normalized()==std::nullopt ? 0:1;}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "include/math/vector2.hpp",
+            "contains": [
+              "namespace kc",
+              "normalized",
+              "constexpr"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "c++",
+            "-std=c++20",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "{repo}/main.cpp",
+            "-o",
+            "{repo}/.eval-bin"
+          ],
+          [
+            "{repo}/.eval-bin"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cpp-stats-header-source",
+      "title": "Header/source statistics accumulator",
+      "category": "cpp",
+      "language": "cpp",
+      "prompt": "Complete include/stats.hpp and src/stats.cpp with a numerically stable streaming accumulator. Track count, mean, population variance, min, and max; define behavior for empty input using std::optional; keep declarations in the header and non-template definitions in the source.",
+      "initialFiles": {
+        "include/stats.hpp": "#pragma once\n#include <cstddef>\n#include <optional>\nclass Stats { public: void add(double); std::size_t count() const; std::optional<double> mean() const; std::optional<double> variance() const; std::optional<double> min() const; std::optional<double> max() const; private: /* add state */ };\n",
+        "src/stats.cpp": "#include \"../include/stats.hpp\"\n",
+        "main.cpp": "#include \"include/stats.hpp\"\n#include <cmath>\nint main(){Stats s;s.add(1);s.add(2);s.add(3);return s.count()==3 && std::abs(*s.mean()-2)<1e-12 && std::abs(*s.variance()-2.0/3)<1e-12 ? 0:1;}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "src/stats.cpp",
+            "contains": [
+              "Stats::add",
+              "Stats::variance"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "c++",
+            "-std=c++20",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "{repo}/main.cpp",
+            "{repo}/src/stats.cpp",
+            "-o",
+            "{repo}/.eval-bin"
+          ],
+          [
+            "{repo}/.eval-bin"
+          ]
+        ]
+      }
+    },
+    {
+      "id": "cpp-thread-safe-counter",
+      "title": "Thread-safe snapshot counter",
+      "category": "cpp",
+      "language": "cpp",
+      "prompt": "Implement include/counter.hpp with a C++20 thread-safe named counter. increment(name, delta), value(name), and snapshot() must be race-free; negative deltas are allowed but integer overflow must be rejected. snapshot must return a stable copy without exposing locks or mutable internals.",
+      "initialFiles": {
+        "include/counter.hpp": "#pragma once\n#include <map>\n#include <string>\n// implement\n",
+        "main.cpp": "#include \"include/counter.hpp\"\n#include <thread>\n#include <vector>\nint main(){Counter c;std::vector<std::thread> ts;for(int i=0;i<4;i++)ts.emplace_back([&]{for(int j=0;j<1000;j++)c.increment(\"x\",1);});for(auto& t:ts)t.join();auto s=c.snapshot();return s.at(\"x\")==4000?0:1;}\n"
+      },
+      "verifier": {
+        "assertions": [
+          {
+            "path": "include/counter.hpp",
+            "contains": [
+              "mutex",
+              "snapshot",
+              "overflow"
+            ]
+          }
+        ],
+        "commands": [
+          [
+            "c++",
+            "-std=c++20",
+            "-pthread",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "{repo}/main.cpp",
+            "-o",
+            "{repo}/.eval-bin"
+          ],
+          [
+            "{repo}/.eval-bin"
+          ]
+        ]
+      }
+    }
+  ]
+}

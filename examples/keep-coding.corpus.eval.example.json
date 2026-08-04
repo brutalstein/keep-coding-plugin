@@ -1,0 +1,12 @@
+{
+  "corpusFile": "../evaluation/corpus/manifest.json",
+  "baseline": {
+    "command": ["codex", "exec", "--json", "-"]
+  },
+  "keepCoding": {
+    "command": ["codex", "exec", "--json", "-"]
+  },
+  "outputDirectory": "../evaluation/results/latest",
+  "repetitions": 3,
+  "timeoutMs": 1800000
+}

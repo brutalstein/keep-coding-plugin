@@ -23,6 +23,7 @@
     "vitest.config.ts",
     "vitest.dist.config.ts",
     "vitest.benchmark.config.ts",
+    "vitest.graph-benchmark.config.ts",
     "eslint.config.js"
   ]
 }
