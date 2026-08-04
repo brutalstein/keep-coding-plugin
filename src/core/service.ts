@@ -51,7 +51,7 @@ export class KeepCodingService {
     const playbook = this.relevantPlaybook();
     const context = compileContextEnvelope(this.store, { ...(maxChars !== undefined ? { maxChars } : {}), playbook });
     this.recordPluginContextUsage(context);
-    return context.context ?? "";
+    return context.unchanged ? "" : context.context;
   }
 
   contextEnvelope(sinceSequence?: number, maxChars?: number): ContextEnvelope {
@@ -219,7 +219,8 @@ export class KeepCodingService {
   }
 
   private recordPluginContextUsage(envelope: ContextEnvelope): void {
-    if (envelope.unchanged || !envelope.context || envelope.estimatedTokens <= 0) return;
+    if (envelope.unchanged) return;
+    if (envelope.estimatedTokens <= 0) return;
     const project = this.store.getProject();
     if (!project) return;
     const delta = { tokens: envelope.estimatedTokens, estimatedTokens: envelope.estimatedTokens };
