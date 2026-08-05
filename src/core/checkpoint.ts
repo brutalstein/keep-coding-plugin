@@ -131,14 +131,15 @@ export class CheckpointPipeline {
   async run(options: CheckpointRunOptions): Promise<CheckpointRunResult> {
     const phase = required(this.store.getPhase(options.phaseId), `unknown phase: ${options.phaseId}`);
     const project = this.store.getProject();
-    if (!project?.contract) throw new Error("project contract is missing");
+    const contract = project?.contract;
+    if (!project || !contract) throw new Error("project contract is missing");
 
     const baseline = this.store.getPhaseBaseline(options.phaseId) ?? undefined;
     const changedFiles = baseline
       ? await options.workspaceGit.changedFilesSince(baseline)
       : await options.workspaceGit.changedFiles();
     this.store.autoLinkChangedFiles(options.phaseId, changedFiles);
-    await this.enforceAssumptionPolicy(options.workspaceGit, phase, project.contract, changedFiles);
+    await this.enforceAssumptionPolicy(options.workspaceGit, phase, contract, changedFiles);
 
     const executionMode = options.executionMode ?? "serial";
     const owner = leaseOwner();
@@ -155,7 +156,7 @@ export class CheckpointPipeline {
     try {
       return await this.withLeaseHeartbeat(run.id, owner, async () => {
         await this.fault("after_run_started", run.id);
-        const evidence = await this.verifyRun(run, options, phase, project, baseline);
+        const evidence = await this.verifyRun(run, options, phase, contract, baseline);
         await this.fault("after_verification", run.id);
 
         this.persistCommandFailures(
@@ -245,7 +246,7 @@ export class CheckpointPipeline {
     run: CheckpointRunRecord,
     options: CheckpointRunOptions,
     phase: PhaseRecord,
-    project: ProjectRecord & { contract: NonNullable<ProjectRecord["contract"]> },
+    contract: NonNullable<ProjectRecord["contract"]>,
     baseline: Record<string, string> | undefined
   ): Promise<VerificationEvidence> {
     const correction = this.store.activeCorrection(options.phaseId);
@@ -255,8 +256,8 @@ export class CheckpointPipeline {
       : await options.workspaceGit.changedFiles();
     const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, options.phaseId);
     const impactedTests = this.store.impactedTests(changedFiles);
-    const selectiveCommands = project.contract.selectiveTests && impactedTests.length > 0
-      ? [project.contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests.map(shellQuote).join(" "))]
+    const selectiveCommands = contract.selectiveTests && impactedTests.length > 0
+      ? [contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests.map(shellQuote).join(" "))]
       : [];
     const previousFailures = [...new Set([...selectiveCommands, ...phase.acceptanceCommands])]
       .map((command) => this.store.latestCommandFailure(options.phaseId, command))
@@ -267,7 +268,7 @@ export class CheckpointPipeline {
       ...(baseline ? { baseline } : {}),
       selectiveCommands,
       budget: this.store.budgetEvidence(options.phaseId),
-      contract: project.contract,
+      contract,
       impactedCompletedPhases,
       previousFailures,
       ...(correctionAllowedFiles ? { correctionAllowedFiles } : {})

@@ -21,7 +21,7 @@ export class KeepCodingService {
     const store = new PlatformStore(git.root);
     const recovery = await CheckpointPipeline.recover(git, store);
     if ([...recovery.recovered, ...recovery.reset, ...recovery.blocked, ...recovery.deferred].length > 0) {
-      store.appendEvent("checkpoint_recovery_scanned", null, recovery);
+      store.appendEvent("checkpoint_recovery_scanned", null, { ...recovery });
     }
     return new KeepCodingService(git, store, new WorkspaceTools(git, store));
   }
