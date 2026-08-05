@@ -5,7 +5,6 @@ import type {
   CheckpointRunRecord,
   CommandFailureRecord,
   CorrectionRecord,
-  PhaseDefinition,
   PhaseRecord,
   ProjectRecord,
   VerificationEvidence
@@ -341,7 +340,7 @@ export class CheckpointPipeline {
     if (merged) return merged;
     const record = this.store.getWorktree(run.phaseId);
     if (!record) throw new CheckpointRecoveryBlockedError(`CHECKPOINT_WORKTREE_MISSING: ${run.phaseId}`);
-    let phaseCommit = await git.checkpointCommit(run.id, record.branch);
+    const phaseCommit = await git.checkpointCommit(run.id, record.branch);
     if (!phaseCommit) {
       let isolated: GitRepository;
       try {
@@ -355,7 +354,7 @@ export class CheckpointPipeline {
         );
       }
       await this.assertDiffBinding(isolated, run);
-      phaseCommit = await isolated.commitFilesForRun(
+      await isolated.commitFilesForRun(
         run.changedFiles,
         generateCommitMessage(run.phaseId, run.summary),
         run.id
