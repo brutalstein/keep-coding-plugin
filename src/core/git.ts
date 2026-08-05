@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { access, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -36,7 +36,15 @@ export class GitRepository {
   async diffHash(): Promise<string> {
     const hash = createHash("sha256");
     hash.update(await this.diff(64 * 1024 * 1024));
-    for (const file of await this.changedFiles()) hash.update(`\0${file}`);
+    for (const file of await this.changedFiles()) {
+      hash.update(`\0path:${file}\0`);
+      const content = await readFile(path.join(this.root, file)).catch(() => null);
+      if (content === null) hash.update("<missing>");
+      else {
+        hash.update(`size:${content.byteLength}\0`);
+        hash.update(content);
+      }
+    }
     return hash.digest("hex");
   }
 
@@ -76,6 +84,34 @@ export class GitRepository {
     return this.headSha();
   }
 
+  async commitFilesForRun(files: string[], message: string, runId: string): Promise<string> {
+    const existing = await this.checkpointCommit(runId, "HEAD");
+    if (existing) return existing;
+    const detached = await this.checkpointCommit(runId, "--all");
+    if (detached) {
+      if (await this.isAncestor(detached, "HEAD")) return detached;
+      throw new Error(`CHECKPOINT_COMMIT_DIVERGED: ${runId} exists at ${detached} outside HEAD`);
+    }
+    return this.commitFiles(files, `${message}\n\nKeep-Coding-Commit: ${runId}`);
+  }
+
+  async checkpointCommit(runId: string, ref = "HEAD"): Promise<string | null> {
+    return this.findTrailer("Keep-Coding-Commit", runId, ref);
+  }
+
+  async checkpointMerge(runId: string, ref = "HEAD"): Promise<string | null> {
+    return this.findTrailer("Keep-Coding-Merge", runId, ref);
+  }
+
+  async isAncestor(ancestor: string, descendant = "HEAD"): Promise<boolean> {
+    return execFileAsync("git", ["merge-base", "--is-ancestor", ancestor, descendant], { cwd: this.root, timeout: 15_000 })
+      .then(() => true)
+      .catch((error: unknown) => {
+        if ((error as { code?: number }).code === 1) return false;
+        throw error;
+      });
+  }
+
   async restoreFiles(baseSha: string, files: string[]): Promise<void> {
     if (files.length === 0) return;
     await execFileAsync("git", ["restore", "--source", baseSha, "--staged", "--worktree", "--", ...files], { cwd: this.root, timeout: 30_000 }).catch(async () => {
@@ -111,10 +147,54 @@ export class GitRepository {
     return this.headSha();
   }
 
+  async mergeWorktreeForRun(branch: string, runId: string): Promise<string> {
+    const existing = await this.checkpointMerge(runId, "HEAD");
+    if (existing) return existing;
+    const phaseCommit = await this.checkpointCommit(runId, branch);
+    if (!phaseCommit) throw new Error(`CHECKPOINT_PHASE_COMMIT_MISSING: ${runId}/${branch}`);
+    if (await this.isAncestor(phaseCommit, "HEAD")) {
+      throw new Error(`CHECKPOINT_MERGE_TRAILER_MISSING: ${runId} is integrated without durable merge evidence`);
+    }
+    const dirty = await this.changedFiles();
+    if (dirty.length > 0) throw new Error("main worktree must be clean before merging a parallel phase");
+    try {
+      await execFileAsync(
+        "git",
+        ["merge", "--no-ff", "-m", `Merge checkpoint ${runId}\n\nKeep-Coding-Merge: ${runId}`, branch],
+        { cwd: this.root, timeout: 120_000, maxBuffer: 32 * 1024 * 1024 }
+      );
+    } catch (error) {
+      await execFileAsync("git", ["merge", "--abort"], { cwd: this.root, timeout: 15_000 }).catch(() => undefined);
+      throw error;
+    }
+    return this.headSha();
+  }
+
   async removeWorktree(worktreePath: string, branch: string): Promise<void> {
     await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd: this.root, timeout: 60_000 }).catch(() => undefined);
+    await rm(worktreePath, { recursive: true, force: true });
+    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 30_000 });
     await execFileAsync("git", ["branch", "-D", branch], { cwd: this.root, timeout: 30_000 }).catch(() => undefined);
-    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 30_000 }).catch(() => undefined);
+    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 30_000 });
+
+    const registered = await this.runText(["worktree", "list", "--porcelain"])
+      .then((output) => output.split("\n").some((line) => line === `worktree ${path.resolve(worktreePath)}`));
+    const branchExists = await execFileAsync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: this.root, timeout: 10_000 })
+      .then(() => true)
+      .catch((error: unknown) => {
+        if ((error as { code?: number }).code === 1) return false;
+        throw error;
+      });
+    const directoryExists = await access(worktreePath).then(() => true).catch(() => false);
+    if (registered || branchExists || directoryExists) {
+      throw new Error(`WORKTREE_CLEANUP_INCOMPLETE: ${worktreePath} (${branch})`);
+    }
+  }
+
+  private async findTrailer(label: string, runId: string, ref: string): Promise<string | null> {
+    const args = ["log", ref, "--format=%H", "--fixed-strings", `--grep=${label}: ${runId}`, "-n", "1"];
+    const value = await this.runText(args).catch(() => "");
+    return value || null;
   }
 
   private async runText(args: string[]): Promise<string> {
