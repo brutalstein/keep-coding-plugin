@@ -12,6 +12,7 @@ Keep Coding is a single-workflow, local-first continuity platform with an option
 | Store | Migration-safe SQLite source of truth for plan versions, phases, evidence, approvals, budgets, graph, worktrees, command failures, cursors, and events. |
 | Semantic graph | TypeScript compiler AST plus hash-verified WASM tree-sitter adapters for Python, C, and C++; emits symbols, imports, calls, references, tests, symbol equivalence, and blast radius. |
 | Verifier | Scope → secret scan → budget → selective tests → acceptance commands → optional critic, with compressed command evidence. |
+| Execution policy kernel | Parse shell-free argv, resolve operator authority, select an execution backend, bound subprocesses, audit writes, and emit execution attestation. |
 | Orchestrator | Isolated worktrees and merge-after-evidence for independent parallel-safe phases. |
 | Dashboard | Loopback-only read-only HTML and JSON projection of durable state. |
 
@@ -21,7 +22,7 @@ Old v0.1/v0.2 databases are upgraded additively. New phase states include `AWAIT
 
 ## Adaptive planning
 
-`amend_plan` can add phases and supersede inactive phases after implementation starts. It rejects in-progress supersession, duplicate IDs, invalid dependencies, cycles, exact no-op acceptance commands, and invalid budgets. It also returns non-blocking command-quality warnings when code-phase evidence lacks a recognizable verification category or unrelated phases reuse the same command.
+`amend_plan` can add phases and supersede inactive phases after implementation starts. It rejects in-progress supersession, duplicate IDs, invalid dependencies, cycles, exact no-op acceptance commands, shell-bearing or malformed command specifications, and invalid budgets. The effective patched contract is command-validated before durable persistence. Planning also returns non-blocking command-quality warnings when code-phase evidence lacks a recognizable verification category or unrelated phases reuse the same command.
 
 ## Context delivery
 
@@ -46,11 +47,31 @@ TypeScript/JavaScript files use the TypeScript compiler AST, loaded lazily only 
 
 Default context contains only a fixed-size Tier-0 graph summary. `expand_graph` returns Tier-1 node detail on explicit demand. `get_file_digest` projects an indexed file's content hash, line count, symbols, imports, and last modifying phase without sending the complete source file. `get_impact` returns distance and edge provenance. Changed files determine impacted tests, and completed phases move to `REVERIFY_REQUIRED` when later work touches their verified ownership.
 
+## Execution policy kernel
+
+Acceptance, selective-test, full-suite, and configured critic commands all enter one mandatory kernel. Persisted string commands remain a compatibility format only; the kernel parses them into canonical `CommandSpec` values containing an executable and argv. No shell interprets agent-authored content. Unquoted shell operators, substitutions, redirections, control characters, inline environment assignments, malformed quoting, and shell-dependent Windows shims are rejected.
+
+Authority is operator-owned. `KEEP_CODING_EXECUTION_POLICY_PATH` may point to a versioned JSON policy outside the target repository. Canonical-path, owner, and POSIX write-permission checks prevent repository content from replacing its own authority. A policy can constrain executable names or absolute paths, exact command-spec hashes, inherited environment-variable names, fixed environment values, project write behavior, operator write scopes, timeout and output limits, network access, repository-resolved executables, and required backend capabilities.
+
+Effective write authority is the intersection of:
+
+1. operator write policy and globs;
+2. phase `allowedScope`;
+3. any active correction radius.
+
+The portable process backend uses `spawn` with `shell: false`, a sanitized environment, an isolated temporary home, bounded output, wall-clock timeout, POSIX process-group termination, executable hashing, and pre/post repository snapshots. It advertises audit capabilities only; it does not claim filesystem or network confinement.
+
+The Linux Bubblewrap backend may additionally advertise `filesystem-confined`, `network-denied`, and `process-isolated`. It creates namespaces, drops capabilities, mounts toolchain paths read-only, mounts the repository read-only first, and rebinds only effective static scope roots writable. Exact glob semantics remain post-audited. Capability requirements are fail-closed: a policy requiring unavailable isolation does not silently select the process backend.
+
+Each command produces an `ExecutionAttestation` containing the canonical command hash, policy hash/source, backend and capabilities, resolved executable path and SHA-256, inherited environment key names, network and write policies, operator and phase scopes, produced files, input tree hash, output digest, timestamps, and timeout/output-limit state. The attestation is embedded in ordinary verification evidence and therefore inherits durable checkpoint journaling, crash recovery, and Git binding.
+
 ## Verification, command evidence, and safety
 
-Secret scanning is unconditional and stores only redacted previews and non-reversible fingerprints. Budgets merge project and phase limits using the stricter value. Deterministic commands remain authoritative. The critic is independent and optional; advisory output never blocks unless the contract explicitly makes it blocking. A blocking critic without a configured command fails closed.
+Secret scanning is unconditional and stores only redacted previews and non-reversible fingerprints. Budgets merge project and phase limits using the stricter value. Deterministic commands remain authoritative. The critic is independent and optional; advisory output never blocks unless the contract explicitly makes it blocking. A blocking critic without a configured command fails closed. A configured critic uses the same execution policy kernel and receives its input through stdin rather than shell interpolation.
 
-Command output is normalized before storage or transmission: ANSI escapes, duplicate blank lines, duplicate adjacent lines, and Node internal frames are stripped; repeated failures are reduced to changed line windows; marker-aware truncation preserves context around `Error`, `FAIL`, `Exception`, `fatal`, `panic`, and assertion markers. Compression metadata records original/emitted size and unchanged-line counts.
+Verifier prerequisites inspect scope, secrets, and budget before command execution. Repository state is inspected again after every command and after the deterministic sequence. A command that exits successfully but creates a secret, writes beyond phase/correction/operator scope, exceeds output bounds, times out, or lacks a required backend capability cannot pass the checkpoint.
+
+Command output is normalized before storage or transmission: ANSI escapes, duplicate blank lines, duplicate adjacent lines, and Node internal frames are stripped; repeated failures are reduced to changed line windows; marker-aware truncation preserves context around `Error`, `FAIL`, `Exception`, `fatal`, `panic`, and assertion markers. Compression metadata records original/emitted size and unchanged-line counts. Output hashes in attestation are computed before evidence compression.
 
 ## Token telemetry and regulation
 
@@ -66,7 +87,7 @@ With `playbookOptIn`, successful work is stored as a compact tuple of pattern, t
 
 ## Remote transport and workspace safety
 
-The Streamable HTTP adapter retains canonical allowed-root checks, Host and request-size validation, authentication boundaries, and exact acceptance-command allowlisting. Workspace writes are limited to phase-scoped unified patches and reject protected metadata paths and symbolic links. No generic remote shell tool is exposed.
+The Streamable HTTP adapter retains canonical allowed-root checks, Host and request-size validation, authentication boundaries, and exact acceptance-command allowlisting. Exact HTTP commands are shell-free parsed during startup, before an MCP request can persist them. Workspace writes are limited to phase-scoped unified patches and reject protected metadata paths and symbolic links. No generic remote shell tool is exposed.
 
 ## Observability and integrations
 
@@ -80,7 +101,7 @@ The Streamable HTTP adapter retains canonical allowed-root checks, Host and requ
 
 An assumption is a first-class durable entity, separate from a technical failure or architectural decision. Each assumption records its phase, statement, self-reported confidence, considered alternatives, terminal status, and resolution evidence. Recording an assumption creates an `assumption` graph node. `link_assumption` adds `depends_on_assumption` edges to exact file, symbol, or decision nodes; a checkpoint auto-links changed files only when exactly one open phase assumption exists and no explicit link was recorded.
 
-Invalidation creates a correction record with a cycle-safe, hop-limited traversal result. The traversal starts only from explicit assumption dependencies; an assumption with no links produces an empty radius rather than an all-project fallback. Correction verification uses the intersection of the original phase globs and the correction's declared files. Scope can grow only through `expand_correction_scope` with a non-empty justification. The next checkpoint records `contained` when all changes stay in the original radius, or `expanded` when justified extra nodes were required; unauthorized extra files use the normal scope-violation path.
+Invalidation creates a correction record with a cycle-safe, hop-limited traversal result. The traversal starts only from explicit assumption dependencies; an assumption with no links produces an empty radius rather than an all-project fallback. Correction verification uses the intersection of the original phase globs and the correction's declared files. Execution verification additionally intersects operator write policy. Scope can grow only through `expand_correction_scope` with a non-empty justification, and a correction can never expand operator authority. The next checkpoint records `contained` when all changes stay in the original radius, or `expanded` when justified extra nodes were required; unauthorized extra files use the normal scope-violation path.
 
 Open assumptions and known corrections are normal delta-context sections. `assumption_*`, `correction_*`, and anti-pattern warning events participate in sequence-based change classification, so adding this subsystem does not reintroduce full-context retransmission. Low-confidence assumptions render an imperative directive. High-ambiguity phases must record an assumption before checkpointing, and open low-confidence assumptions force an independent blocking critic invocation before the structural checkpoint rejection.
 
@@ -89,7 +110,6 @@ Contained corrections may be promoted, only with playbook opt-in, into structure
 ## Assumption evaluation boundary
 
 The evaluation configuration accepts `assumptionLedger.enabled`. When enabled, reports may include correction outcomes and token counters, anti-pattern warning/matching counts, and paired enabled/disabled outcomes. The resulting section reports containment rate with an existing Wilson 95% interval, project-scoped tokens per completed correction, anti-pattern hit rate, and an exact McNemar comparison. When disabled, the runner does not emit a subsystem section or create project ledger persistence.
-
 
 ## Storage decomposition
 
@@ -105,4 +125,4 @@ The corpus runner accepts exactly 20-30 frozen tasks, materializes each seed as 
 
 ## Tier-2 semantic enrichment boundary
 
-Pyright and clangd remain deferred. Tree-sitter establishes correct local syntax and lexical scope without requiring a project build configuration. Cross-module type binding, macro expansion, conditional preprocessing, template instantiation, and overload resolution require compiler/LSP processes. Those subprocesses will only be introduced as explicit opt-ins after the frozen corpus produces real Python/C++ evidence and after their timeout, binary-discovery, cache, and security boundaries are specified.
+Pyright and clangd remain deferred. Tree-sitter establishes correct local syntax and lexical scope without requiring a project build configuration. Cross-module type binding, macro expansion, conditional preprocessing, template instantiation, and overload resolution require compiler/LSP processes. Those subprocesses will only be introduced as explicit opt-ins after the frozen corpus produces real Python/C++ evidence and after their timeout, binary-discovery, cache, execution-policy, and security boundaries are specified. Any future implementation must use the execution policy kernel rather than introducing a second subprocess path.
