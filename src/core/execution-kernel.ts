@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { access, mkdtemp, realpath, rm, stat } from "node:fs/promises";
+import { access, lstat, mkdtemp, realpath, rm, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -14,6 +14,7 @@ import {
 } from "./command-spec.js";
 import {
   buildExecutionEnvironment,
+  commandAllowed,
   executableAllowed,
   loadExecutionPolicy,
   missingCapabilities,
@@ -35,6 +36,8 @@ export interface ExecutionAttestation {
   network: "inherit" | "deny";
   projectWrites: "phase" | "deny";
   writeScopes: string[];
+  operatorWriteScopes: string[];
+  producedFiles: string[];
   inputTreeHash: string | null;
   outputSha256: string;
   startedAt: string;
@@ -125,8 +128,11 @@ export class ExecutionKernel {
     }
 
     const policyViolations: string[] = [];
-    if (!executableAllowed(this.policy, spec.executable, executablePath)) {
+    if (!executableAllowed(this.policy, spec.executable, executablePath, this.projectRoot)) {
       policyViolations.push(`EXECUTION_EXECUTABLE_DENIED: ${spec.executable}`);
+    }
+    if (!commandAllowed(this.policy, spec)) {
+      policyViolations.push("EXECUTION_COMMAND_DENIED: command is not present in the operator policy");
     }
     if (process.platform === "win32" && /\.(?:cmd|bat)$/iu.test(executablePath)) {
       policyViolations.push("EXECUTION_WINDOWS_SHELL_SHIM_DENIED: .cmd and .bat executables require a shell");
@@ -147,19 +153,49 @@ export class ExecutionKernel {
       policyViolations.push("EXECUTION_NETWORK_ISOLATION_UNAVAILABLE: network deny requires bubblewrap on Linux");
     }
     if (policyViolations.length > 0) {
-      return deniedEvidence(request, spec, this.policy, started, startedAt, policyViolations, executablePath, capabilities);
+      return deniedEvidence(
+        request,
+        spec,
+        this.policy,
+        started,
+        startedAt,
+        policyViolations,
+        executablePath,
+        capabilities
+      );
     }
 
     const temporaryHome = await mkdtemp(path.join(tmpdir(), "keep-coding-exec-"));
     try {
-      const environment = buildExecutionEnvironment(this.policy, temporaryHome, this.sourceEnvironment);
-      const timeoutMs = Math.min(request.timeoutMs ?? this.policy.maxTimeoutMs, this.policy.maxTimeoutMs);
+      const sandboxHome = useBubblewrap ? "/tmp/keep-coding-home" : temporaryHome;
+      const environment = buildExecutionEnvironment(this.policy, sandboxHome, this.sourceEnvironment);
+      const timeoutMs = Math.max(
+        1,
+        Math.min(request.timeoutMs ?? this.policy.maxTimeoutMs, this.policy.maxTimeoutMs)
+      );
       const executableSha256 = await hashFile(executablePath);
       const result = useBubblewrap
         ? await this.runBubblewrap(executablePath, spec.argv, request, environment, timeoutMs)
-        : await runProcess(executablePath, spec.argv, request.cwd, environment, request.stdin, timeoutMs, this.policy.maxOutputBytes);
+        : await runProcess(
+            executablePath,
+            spec.argv,
+            request.cwd,
+            environment,
+            request.stdin,
+            timeoutMs,
+            this.policy.maxOutputBytes
+          );
+      if (result.outputLimitExceeded) {
+        result.stderr = result.stderr
+          ? `${result.stderr}\nEXECUTION_OUTPUT_LIMIT_EXCEEDED`
+          : "EXECUTION_OUTPUT_LIMIT_EXCEEDED";
+      }
       const finishedAt = new Date().toISOString();
-      const outputSha256 = createHash("sha256").update(result.stdout).update("\0").update(result.stderr).digest("hex");
+      const outputSha256 = createHash("sha256")
+        .update(result.stdout)
+        .update("\0")
+        .update(result.stderr)
+        .digest("hex");
       return {
         command: request.command,
         exitCode: result.exitCode,
@@ -184,6 +220,8 @@ export class ExecutionKernel {
           network: this.policy.network,
           projectWrites: this.policy.projectWrites,
           writeScopes: [...request.writeScopes].sort(),
+          operatorWriteScopes: [...this.policy.allowedWriteScopes].sort(),
+          producedFiles: [],
           inputTreeHash: request.inputTreeHash ?? null,
           outputSha256,
           startedAt,
@@ -202,7 +240,9 @@ export class ExecutionKernel {
     if (this.policy.sandbox === "bubblewrap") return true;
     return this.policy.network === "deny"
       || this.policy.requiredCapabilities.some((capability) =>
-        capability === "filesystem-confined" || capability === "network-denied" || capability === "process-isolated");
+        capability === "filesystem-confined"
+        || capability === "network-denied"
+        || capability === "process-isolated");
   }
 
   private async runBubblewrap(
@@ -217,19 +257,37 @@ export class ExecutionKernel {
     const arguments_: string[] = [
       "--die-with-parent",
       "--new-session",
+      "--unshare-user",
       "--unshare-pid",
       "--unshare-uts",
       "--unshare-ipc",
+      "--unshare-cgroup",
+      "--uid", "0",
+      "--gid", "0",
+      "--cap-drop", "ALL",
+      "--hostname", "keep-coding",
       "--proc", "/proc",
       "--dev", "/dev",
-      "--tmpfs", "/tmp"
+      "--tmpfs", "/tmp",
+      "--dir", "/tmp/keep-coding-home"
     ];
     if (this.policy.network === "deny") arguments_.push("--unshare-net");
 
     for (const systemPath of await existingSystemPaths()) {
+      addDestinationParents(arguments_, systemPath);
       arguments_.push("--ro-bind", systemPath, systemPath);
     }
-    arguments_.push("--bind", this.projectRoot, this.projectRoot);
+    addDestinationParents(arguments_, this.projectRoot);
+    arguments_.push("--ro-bind", this.projectRoot, this.projectRoot);
+    if (this.policy.projectWrites === "phase") {
+      for (const writablePath of await writableBindings(
+        this.projectRoot,
+        request.writeScopes,
+        this.policy.allowedWriteScopes
+      )) {
+        arguments_.push("--bind", writablePath, writablePath);
+      }
+    }
     arguments_.push("--chdir", request.cwd);
     arguments_.push("--clearenv");
     for (const [name, value] of Object.entries(environment)) {
@@ -342,7 +400,9 @@ function deniedEvidence(
       purpose: request.purpose,
       backend: "denied",
       capabilities,
-      commandSpecHash: spec ? commandSpecHash(spec) : createHash("sha256").update(request.command).digest("hex"),
+      commandSpecHash: spec
+        ? commandSpecHash(spec)
+        : createHash("sha256").update(request.command).digest("hex"),
       policyHash: policy.hash,
       policySource: policy.source,
       executablePath,
@@ -351,6 +411,8 @@ function deniedEvidence(
       network: policy.network,
       projectWrites: policy.projectWrites,
       writeScopes: [...request.writeScopes].sort(),
+      operatorWriteScopes: [...policy.allowedWriteScopes].sort(),
+      producedFiles: [],
       inputTreeHash: request.inputTreeHash ?? null,
       outputSha256: createHash("sha256").update("\0").update(stderr).digest("hex"),
       startedAt,
@@ -378,7 +440,10 @@ async function resolveExecutable(
     : [""];
   for (const directory of pathValue.split(path.delimiter).filter(Boolean)) {
     for (const extension of extensions) {
-      const candidate = path.join(directory, process.platform === "win32" ? `${executable}${extension}` : executable);
+      const candidate = path.join(
+        directory,
+        process.platform === "win32" ? `${executable}${extension}` : executable
+      );
       try {
         await access(candidate, constants.X_OK);
         return await realpath(candidate);
@@ -400,6 +465,70 @@ async function hashFile(filePath: string): Promise<string> {
     stream.on("error", reject);
     stream.on("end", () => resolve(hash.digest("hex")));
   });
+}
+
+async function writableBindings(
+  projectRoot: string,
+  phaseScopes: string[],
+  operatorScopes: string[]
+): Promise<string[]> {
+  const prefixes = intersectScopePrefixes(phaseScopes, operatorScopes);
+  const bindings: string[] = [];
+  for (const prefix of prefixes) {
+    const candidate = prefix === "" ? projectRoot : path.resolve(projectRoot, prefix);
+    if (!isInside(projectRoot, candidate)) continue;
+    try {
+      const metadata = await lstat(candidate);
+      if (metadata.isSymbolicLink()) {
+        const canonical = await realpath(candidate);
+        if (!isInside(projectRoot, canonical)) {
+          throw new Error(`EXECUTION_WRITE_SCOPE_SYMLINK_ESCAPE: ${prefix}`);
+        }
+      }
+      bindings.push(await realpath(candidate));
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("EXECUTION_WRITE_SCOPE_SYMLINK_ESCAPE")) throw error;
+      throw new Error(`EXECUTION_WRITE_SCOPE_UNAVAILABLE: ${prefix || "."}`, { cause: error });
+    }
+  }
+  return [...new Set(bindings)].sort();
+}
+
+function intersectScopePrefixes(left: string[], right: string[]): string[] {
+  const leftPrefixes = left.map(scopePrefix);
+  const rightPrefixes = right.map(scopePrefix);
+  const intersections: string[] = [];
+  for (const first of leftPrefixes) {
+    for (const second of rightPrefixes) {
+      if (first === "") intersections.push(second);
+      else if (second === "") intersections.push(first);
+      else if (first === second || first.startsWith(`${second}/`)) intersections.push(first);
+      else if (second.startsWith(`${first}/`)) intersections.push(second);
+    }
+  }
+  return [...new Set(intersections)];
+}
+
+function scopePrefix(pattern: string): string {
+  const normalized = pattern.replace(/^!/u, "").replaceAll("\\", "/").replace(/^\.\//u, "");
+  const wildcard = normalized.search(/[*?{[]/u);
+  const prefix = wildcard >= 0 ? normalized.slice(0, wildcard) : normalized;
+  return prefix.replace(/\/+$/u, "");
+}
+
+function addDestinationParents(arguments_: string[], destination: string): void {
+  const parents: string[] = [];
+  let current = path.dirname(destination);
+  while (current !== path.dirname(current) && current !== "/") {
+    parents.push(current);
+    current = path.dirname(current);
+  }
+  for (const parent of parents.reverse()) arguments_.push("--dir", parent);
+}
+
+function isInside(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
 async function existingSystemPaths(): Promise<string[]> {
