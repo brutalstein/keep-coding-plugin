@@ -1,5 +1,6 @@
-import { spawn } from "node:child_process";
 import type { CriticEvidence, PhaseRecord, ProjectContract } from "../domain/model.js";
+import { ExecutionKernel, type ExecutionAttestation } from "./execution-kernel.js";
+import { GitRepository } from "./git.js";
 
 const MAX_OUTPUT = 32_000;
 
@@ -11,13 +12,18 @@ export interface CriticInput {
   diff: string;
 }
 
+export interface AttestedCriticEvidence extends CriticEvidence {
+  execution?: ExecutionAttestation | undefined;
+  policyViolations?: string[] | undefined;
+}
+
 export class CriticRunner {
   constructor(
     private readonly command = process.env.KEEP_CODING_CRITIC_COMMAND?.trim() ?? "",
     private readonly timeoutMs = 120_000
   ) {}
 
-  async review(input: CriticInput, blocking: boolean): Promise<CriticEvidence> {
+  async review(input: CriticInput, blocking: boolean): Promise<AttestedCriticEvidence> {
     if (!this.command) {
       return {
         configured: false,
@@ -26,32 +32,84 @@ export class CriticRunner {
         summary: blocking
           ? "Blocking critic review was requested, but KEEP_CODING_CRITIC_COMMAND is not configured."
           : "Advisory critic is not configured; deterministic gates remain authoritative.",
-        findings: blocking ? [{ severity: "error", rule: "critic-not-configured", message: "Configure an independent critic command or make the critic advisory." }] : [],
+        findings: blocking
+          ? [{
+              severity: "error",
+              rule: "critic-not-configured",
+              message: "Configure an independent critic command or make the critic advisory."
+            }]
+          : [],
         rawOutput: ""
       };
     }
-    const result = await runCommand(this.command, input.root, JSON.stringify({ contract: input.contract, phase: input.phase, changedFiles: input.changedFiles, diff: input.diff }), this.timeoutMs);
-    if (result.code !== 0) {
+
+    const [kernel, git] = await Promise.all([
+      ExecutionKernel.open(input.root),
+      GitRepository.open(input.root)
+    ]);
+    const before = await git.workingTreeSnapshot();
+    const result = await kernel.execute({
+      command: this.command,
+      cwd: input.root,
+      purpose: "critic",
+      writeScopes: [],
+      stdin: JSON.stringify({
+        contract: input.contract,
+        phase: input.phase,
+        changedFiles: input.changedFiles,
+        diff: input.diff
+      }),
+      timeoutMs: this.timeoutMs
+    });
+    const producedFiles = await git.changedFilesSince(before);
+    result.attestation.producedFiles = producedFiles;
+    if (producedFiles.length > 0) {
+      const violation = `EXECUTION_CRITIC_WRITE_DENIED: ${producedFiles.join(", ")}`;
+      result.policyViolations.push(violation);
+      result.stderr = result.stderr ? `${result.stderr}\n${violation}` : violation;
+      result.passed = false;
+    }
+
+    const output = `${result.stdout}${result.stderr}`.slice(-MAX_OUTPUT);
+    if (!result.passed) {
+      const policyDenied = result.policyViolations.length > 0;
       return {
         configured: true,
         blocking,
-        passed: !blocking,
-        summary: `Critic command failed with exit code ${result.code ?? "unknown"}.`,
-        findings: [{ severity: blocking ? "error" : "warning", rule: "critic-command-failed", message: result.output.slice(-2_000) }],
-        rawOutput: result.output.slice(-MAX_OUTPUT)
+        passed: policyDenied ? false : !blocking,
+        summary: policyDenied
+          ? "Critic execution was denied by the operator execution policy."
+          : `Critic command failed with exit code ${result.exitCode ?? "unknown"}.`,
+        findings: [{
+          severity: policyDenied || blocking ? "error" : "warning",
+          rule: policyDenied ? "critic-policy-denied" : "critic-command-failed",
+          message: output.slice(-2_000)
+        }],
+        rawOutput: output,
+        execution: result.attestation,
+        policyViolations: result.policyViolations
       };
     }
+
     try {
-      const parsed = JSON.parse(result.output) as { passed?: unknown; summary?: unknown; findings?: unknown };
+      const parsed = JSON.parse(result.stdout) as { passed?: unknown; summary?: unknown; findings?: unknown };
       const passed = parsed.passed === true;
-      const findings = Array.isArray(parsed.findings) ? parsed.findings.flatMap((finding) => normalizeFinding(finding)) : [];
+      const findings = Array.isArray(parsed.findings)
+        ? parsed.findings.flatMap((finding) => normalizeFinding(finding))
+        : [];
       return {
         configured: true,
         blocking,
         passed: blocking ? passed : true,
-        summary: typeof parsed.summary === "string" ? parsed.summary : passed ? "Critic accepted the change." : "Critic raised advisory findings.",
+        summary: typeof parsed.summary === "string"
+          ? parsed.summary
+          : passed
+            ? "Critic accepted the change."
+            : "Critic raised advisory findings.",
         findings,
-        rawOutput: result.output.slice(-MAX_OUTPUT)
+        rawOutput: result.stdout.slice(-MAX_OUTPUT),
+        execution: result.attestation,
+        policyViolations: result.policyViolations
       };
     } catch {
       return {
@@ -59,8 +117,14 @@ export class CriticRunner {
         blocking,
         passed: !blocking,
         summary: "Critic output was not valid JSON.",
-        findings: [{ severity: blocking ? "error" : "warning", rule: "critic-invalid-output", message: result.output.slice(-2_000) }],
-        rawOutput: result.output.slice(-MAX_OUTPUT)
+        findings: [{
+          severity: blocking ? "error" : "warning",
+          rule: "critic-invalid-output",
+          message: output.slice(-2_000)
+        }],
+        rawOutput: output,
+        execution: result.attestation,
+        policyViolations: result.policyViolations
       };
     }
   }
@@ -69,29 +133,14 @@ export class CriticRunner {
 function normalizeFinding(value: unknown): CriticEvidence["findings"] {
   if (typeof value !== "object" || value === null) return [];
   const item = value as Record<string, unknown>;
-  const severity = item.severity === "error" || item.severity === "warning" || item.severity === "info" ? item.severity : "warning";
+  const severity = item.severity === "error" || item.severity === "warning" || item.severity === "info"
+    ? item.severity
+    : "warning";
   if (typeof item.message !== "string") return [];
-  return [{ severity, rule: typeof item.rule === "string" ? item.rule : "critic", message: item.message, ...(typeof item.file === "string" ? { file: item.file } : {}) }];
-}
-
-async function runCommand(command: string, cwd: string, input: string, timeoutMs: number): Promise<{ code: number | null; output: string }> {
-  const shell = process.platform === "win32" ? "cmd.exe" : "/bin/sh";
-  const args = process.platform === "win32" ? ["/d", "/s", "/c", command] : ["-c", command];
-  return new Promise((resolve) => {
-    const child = spawn(shell, args, { cwd, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
-    let output = "";
-    let settled = false;
-    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
-    const finish = (code: number | null): void => { if (settled) return; settled = true; clearTimeout(timer); resolve({ code, output }); };
-    child.stdout.on("data", (chunk) => { output = appendBounded(output, String(chunk)); });
-    child.stderr.on("data", (chunk) => { output = appendBounded(output, String(chunk)); });
-    child.on("error", (error) => { output = appendBounded(output, error.message); finish(null); });
-    child.on("close", finish);
-    child.stdin.end(input);
-  });
-}
-
-function appendBounded(current: string, chunk: string): string {
-  const combined = current + chunk;
-  return combined.length <= MAX_OUTPUT ? combined : combined.slice(-MAX_OUTPUT);
+  return [{
+    severity,
+    rule: typeof item.rule === "string" ? item.rule : "critic",
+    message: item.message,
+    ...(typeof item.file === "string" ? { file: item.file } : {})
+  }];
 }

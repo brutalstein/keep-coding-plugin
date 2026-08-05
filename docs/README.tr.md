@@ -16,6 +16,7 @@ Keep Coding, uzun süreli coding-agent çalışmalarını kalıcı sözleşme, b
 - Native parser hatası indexlemeyi düşürmez; açıkça işaretlenen legacy fallback'e geçer.
 - Düşük confidence assumption ve yüksek ambiguity checkpoint'i sessizce geçemez.
 - Yarıda kalan seri veya paralel checkpoint; lease/CAS kontrollü kalıcı journal üzerinden yeniden oynatılır, belirsiz Git ayrışmalarında fail-closed bloklanır.
+- Acceptance, selective-test, full-suite ve critic komutları shell kullanmayan operator-owned execution policy kernel üzerinden çalışır; gerekli izolasyon sağlanamazsa fail-closed davranılır.
 
 ## Sağlanan yetenekler
 
@@ -25,6 +26,7 @@ Keep Coding, uzun süreli coding-agent çalışmalarını kalıcı sözleşme, b
 - Header/source sembollerini `same_symbol` edge'iyle birleştirme
 - Semantic impact, impacted-test seçimi ve reverification
 - Secret scan, token/maliyet/zaman bütçesi, approval ve bağımsız critic
+- Exact executable/argv authority, sanitize environment, timeout/output sınırı, write audit, execution attestation ve Linux Bubblewrap confinement
 - Delta context, unchanged-hook suppression, Tier-0/Tier-1 graph ve file digest
 - Command-output compression, repeated-failure diff ve normalized clustering
 - Assumption ledger, bounded correction ve cross-project anti-pattern hafızası
@@ -43,11 +45,11 @@ npm run check
 
 Commitlenen dağıtım yalnızca `keep-coding.mjs` değildir; `plugins/keep-coding/dist/` altındaki executable, hash-manifestli WASM grammar'lar ve query dosyalarının tamamıdır.
 
-Doğrulanmış source suite: 149 test, 38 dosya. Build sonrası artifact suite beş compiled-distribution senaryosu ekler; context ve graph benchmark'ları ayrı çalışır.
+Doğrulanmış source suite: 205 test, 45 dosya. Build sonrası artifact suite beş compiled-distribution senaryosu ekler; context ve graph benchmark'ları ayrı çalışır.
 
 ## Kullanım ve dağıtım
 
-Generic MCP kurulumu için [INSTALL_MCP.md](INSTALL_MCP.md) kullanılır. Aynı canonical backend Codex plugin, Claude plugin, Agent Skills, stdio/HTTP MCP ve hook sistemi olmayan hostlar için `poll` üzerinden sunulur. Host başına ayrı ürün mantığı fork edilmez.
+Generic MCP kurulumu için [INSTALL_MCP.md](INSTALL_MCP.md) kullanılır. Execution policy ve güven düzeyleri için [EXECUTION_POLICY.md](EXECUTION_POLICY.md) kullanılır. Aynı canonical backend Codex plugin, Claude plugin, Agent Skills, stdio/HTTP MCP ve hook sistemi olmayan hostlar için `poll` üzerinden sunulur. Host başına ayrı ürün mantığı fork edilmez.
 
 ## Semantic graph sınırı
 
