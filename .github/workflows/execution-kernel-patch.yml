@@ -1,0 +1,82 @@
+name: Execution kernel branch hardening
+
+on:
+  push:
+    branches:
+      - agent/execution-policy-kernel
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/execution-policy-kernel
+      - name: Apply exact transport and amendment hardening
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          http = Path('src/mcp/http.ts')
+          text = http.read_text(encoding='utf-8')
+          import_marker = 'import { createAllowedRootResolver, parseAllowedRoots } from "./root-policy.js";'
+          import_replacement = import_marker + '\nimport { parseCommandSpec } from "../core/command-spec.js";'
+          if 'import { parseCommandSpec } from "../core/command-spec.js";' not in text:
+              if import_marker not in text:
+                  raise SystemExit('HTTP import marker missing')
+              text = text.replace(import_marker, import_replacement, 1)
+          old_return = '''  return [...new Set(parsed)];
+}'''
+          new_return = '''  for (const command of parsed) {
+    try {
+      parseCommandSpec(command);
+    } catch (error) {
+      throw new Error(
+        `KEEP_CODING_ALLOWED_COMMANDS_JSON contains an unsafe command: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
+    }
+  }
+  return [...new Set(parsed)];
+}'''
+          if new_return not in text:
+              if old_return not in text:
+                  raise SystemExit('HTTP command return marker missing')
+              text = text.replace(old_return, new_return, 1)
+          http.write_text(text, encoding='utf-8')
+
+          service = Path('src/core/service.ts')
+          source = service.read_text(encoding='utf-8')
+          old_amend = '''  amendPlan(amendment: PlanAmendment): Record<string, unknown> {
+    const contract = this.store.getProject()?.contract ?? null;
+    const warnings = lintAcceptanceCommands(amendment.addPhases, contract);
+    return { snapshot: this.store.amendPlan(amendment), commandQualityWarnings: warnings, nextAction: "get_context" };
+  }'''
+          new_amend = '''  amendPlan(amendment: PlanAmendment): Record<string, unknown> {
+    const contract = this.store.getProject()?.contract ?? null;
+    const effectiveContract = contract && amendment.contractPatch
+      ? { ...contract, ...amendment.contractPatch }
+      : contract;
+    const warnings = lintAcceptanceCommands(amendment.addPhases, effectiveContract);
+    return { snapshot: this.store.amendPlan(amendment), commandQualityWarnings: warnings, nextAction: "get_context" };
+  }'''
+          if new_amend not in source:
+              if old_amend not in source:
+                  raise SystemExit('Service amendment marker missing')
+              source = source.replace(old_amend, new_amend, 1)
+          service.write_text(source, encoding='utf-8')
+          PY
+      - name: Commit branch hardening
+        run: |
+          if git diff --quiet -- src/mcp/http.ts src/core/service.ts; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mcp/http.ts src/core/service.ts
+          git commit -m "Harden execution policy entry points"
+          git push origin HEAD:agent/execution-policy-kernel
