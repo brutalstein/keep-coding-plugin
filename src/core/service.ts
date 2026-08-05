@@ -4,6 +4,7 @@ import type {
 } from "../domain/model.js";
 import { PlatformStore } from "../storage/platform-store.js";
 import { PlaybookStore } from "../storage/playbook.js";
+import type { CheckpointRunResult } from "./checkpoint.js";
 import { CheckpointPipeline, recordCommandOutputUsage } from "./checkpoint.js";
 import { lintAcceptanceCommands } from "./command-quality.js";
 import { compileContextEnvelope, tokenize } from "./context.js";
@@ -130,7 +131,7 @@ export class KeepCodingService {
     if (project.currentPhaseId) this.store.recordBudgetUsage("phase", project.currentPhaseId, { tokens: Math.ceil(tokens) }, "budget_host_tokens_recorded");
   }
 
-  async checkpoint(phaseId: string, summary: string): Promise<Record<string, unknown>> {
+  async checkpoint(phaseId: string, summary: string): Promise<CheckpointRunResult> {
     return new CheckpointPipeline(this.store).run({
       phaseId,
       summary,
