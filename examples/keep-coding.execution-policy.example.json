@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "allowedExecutables": [
+    "node",
+    "npm",
+    "python3",
+    "pytest",
+    "cargo",
+    "cmake",
+    "ctest"
+  ],
+  "allowedCommands": [
+    "npm run lint",
+    "npm run typecheck",
+    "npm test",
+    "npm run build"
+  ],
+  "allowedEnvironment": [
+    "PATH",
+    "CI",
+    "NODE_ENV",
+    "LANG",
+    "LC_ALL"
+  ],
+  "fixedEnvironment": {
+    "CI": "true",
+    "KEEP_CODING_EXECUTION": "1"
+  },
+  "sandbox": "bubblewrap",
+  "network": "deny",
+  "projectWrites": "phase",
+  "allowedWriteScopes": [
+    "src/**",
+    "tests/**",
+    "dist/**",
+    "coverage/**"
+  ],
+  "allowProjectExecutables": false,
+  "requiredCapabilities": [
+    "shell-free",
+    "environment-sanitized",
+    "timeout-enforced",
+    "output-bounded",
+    "write-audited",
+    "filesystem-confined",
+    "network-denied",
+    "process-isolated"
+  ],
+  "maxTimeoutMs": 180000,
+  "maxOutputBytes": 8388608
+}
