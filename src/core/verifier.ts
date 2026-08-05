@@ -3,7 +3,8 @@ import type {
   BudgetEvidence, CommandEvidence, CommandFailureRecord, CommandOutputCompression, CriticEvidence,
   PhaseRecord, ProjectContract, VerificationEvidence
 } from "../domain/model.js";
-import { ExecutionKernel, type ExecutionAttestation, type KernelCommandEvidence } from "./execution-kernel.js";
+import { ExecutionKernel, type KernelCommandEvidence } from "./execution-kernel.js";
+import { operatorAllowsWrite } from "./execution-policy.js";
 import type { GitRepository } from "./git.js";
 import { scanChangedFiles } from "./secret-scan.js";
 import { CriticRunner } from "./critic.js";
@@ -170,10 +171,10 @@ export class PhaseVerifier {
       inputTreeHash: await git.diffHash()
     });
     const producedFiles = await git.changedFilesSince(before);
-    (raw.attestation as ExecutionAttestation & { producedFiles: string[] }).producedFiles = producedFiles;
-    const writeViolations = kernel.policy.projectWrites === "deny"
-      ? producedFiles
-      : scopeViolations(producedFiles, allowedScope, correctionScope);
+    raw.attestation.producedFiles = producedFiles;
+    const phaseViolations = scopeViolations(producedFiles, allowedScope, correctionScope);
+    const operatorViolations = producedFiles.filter((file) => !operatorAllowsWrite(kernel.policy, file));
+    const writeViolations = [...new Set([...phaseViolations, ...operatorViolations])].sort();
     if (writeViolations.length > 0) {
       const message = `EXECUTION_WRITE_SCOPE_VIOLATION: ${writeViolations.join(", ")}`;
       raw.policyViolations.push(message);
