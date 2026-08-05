@@ -1,0 +1,297 @@
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  CheckpointCrashError,
+  CheckpointPipeline,
+  type CheckpointFaultPoint
+} from "../src/core/checkpoint.js";
+import { KeepCodingService } from "../src/core/service.js";
+import { PlaybookStore } from "../src/storage/playbook.js";
+
+const roots: string[] = [];
+const previousPlaybookPath = process.env.KEEP_CODING_PLAYBOOK_PATH;
+
+afterEach(() => {
+  if (previousPlaybookPath === undefined) delete process.env.KEEP_CODING_PLAYBOOK_PATH;
+  else process.env.KEEP_CODING_PLAYBOOK_PATH = previousPlaybookPath;
+  while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true });
+});
+
+function repository(parallel = false): string {
+  const root = mkdtempSync(path.join(tmpdir(), "keep-coding-recovery-"));
+  roots.push(root);
+  if (parallel) {
+    mkdirSync(path.join(root, "src", "alpha"), { recursive: true });
+    mkdirSync(path.join(root, "src", "beta"), { recursive: true });
+    writeFileSync(path.join(root, "src", "alpha", "main.js"), "export const alpha = false;\n");
+    writeFileSync(path.join(root, "src", "beta", "main.js"), "export const beta = false;\n");
+  } else {
+    mkdirSync(path.join(root, "src"), { recursive: true });
+    writeFileSync(path.join(root, "src", "main.js"), "export const ready = false;\n");
+  }
+  execFileSync("git", ["init", "-q"], { cwd: root });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: root });
+  execFileSync("git", ["config", "user.name", "Test"], { cwd: root });
+  execFileSync("git", ["add", "."], { cwd: root });
+  execFileSync("git", ["commit", "-qm", "initial"], { cwd: root });
+  return root;
+}
+
+async function activeSerial(root: string, playbookOptIn = false): Promise<KeepCodingService> {
+  const service = await KeepCodingService.open(root);
+  await service.initialize("Set the ready export to true and verify JavaScript syntax");
+  service.savePlan(
+    {
+      goal: "Set the ready export to true",
+      nonGoals: [],
+      constraints: [],
+      deliverables: ["updated module"],
+      invariants: [],
+      doneWhen: ["src/main.js exports ready as true and parses as JavaScript"],
+      playbookOptIn
+    },
+    [{
+      id: "implementation",
+      title: "Enable module",
+      goal: "Set the ready export to true",
+      dependencies: [],
+      allowedScope: ["src/main.js"],
+      acceptanceCommands: ["node --check src/main.js"],
+      maxAttempts: 3
+    }]
+  );
+  await service.startPhase("implementation");
+  writeFileSync(path.join(root, "src", "main.js"), "export const ready = true;\n");
+  return service;
+}
+
+function crashingPipeline(service: KeepCodingService, point: CheckpointFaultPoint): CheckpointPipeline {
+  return new CheckpointPipeline(service.store, {
+    faultInjector(current, runId) {
+      if (current === point) throw new CheckpointCrashError(current, runId);
+    }
+  });
+}
+
+async function runSerialPipeline(service: KeepCodingService, pipeline: CheckpointPipeline): Promise<void> {
+  await pipeline.run({
+    phaseId: "implementation",
+    summary: "enabled the module",
+    executionMode: "serial",
+    workspaceGit: service.git,
+    indexGit: service.git,
+    reverificationReason: (files) => `Recovery test changed: ${files.join(", ")}`
+  });
+}
+
+function trailerCount(root: string, trailer: string): number {
+  const output = execFileSync("git", ["log", "--format=%B%x00"], { cwd: root, encoding: "utf8" });
+  return output.split("\0").filter((message) => message.includes(trailer)).length;
+}
+
+describe("crash-safe checkpoint saga", () => {
+  it("resets a pre-evidence crash to an implementable phase", async () => {
+    const root = repository();
+    let service = await activeSerial(root);
+    await expect(runSerialPipeline(service, crashingPipeline(service, "after_run_started")))
+      .rejects.toBeInstanceOf(CheckpointCrashError);
+    service.close();
+
+    service = await KeepCodingService.open(root);
+    try {
+      expect(service.store.getPhase("implementation")?.status).toBe("IN_PROGRESS");
+      expect(service.store.listCheckpointRuns()).toHaveLength(1);
+      expect(service.store.listCheckpointRuns()[0]).toMatchObject({ status: "DONE", evidence: null });
+      expect(service.store.listCheckpoints()).toHaveLength(0);
+
+      const result = await service.checkpoint("implementation", "completed after recovery reset");
+      expect(result.evidence.passed).toBe(true);
+      expect(service.store.getPhase("implementation")?.status).toBe("COMPLETED");
+    } finally {
+      service.close();
+    }
+  });
+
+  it("reconciles a Git commit created before durable phase state and never duplicates it", async () => {
+    const root = repository();
+    let service = await activeSerial(root);
+    let runId = "";
+    const pipeline = new CheckpointPipeline(service.store, {
+      faultInjector(point, currentRunId) {
+        if (point === "after_git_committed") {
+          runId = currentRunId;
+          throw new CheckpointCrashError(point, currentRunId);
+        }
+      }
+    });
+    await expect(runSerialPipeline(service, pipeline)).rejects.toBeInstanceOf(CheckpointCrashError);
+    expect(trailerCount(root, `Keep-Coding-Commit: ${runId}`)).toBe(1);
+    service.close();
+
+    service = await KeepCodingService.open(root);
+    expect(service.store.getPhase("implementation")?.status).toBe("COMPLETED");
+    expect(service.store.listCheckpoints()).toHaveLength(1);
+    expect(service.store.getCheckpointRun(runId)).toMatchObject({ status: "DONE" });
+    expect(trailerCount(root, `Keep-Coding-Commit: ${runId}`)).toBe(1);
+    service.close();
+
+    service = await KeepCodingService.open(root);
+    try {
+      expect(service.store.listCheckpoints()).toHaveLength(1);
+      expect(trailerCount(root, `Keep-Coding-Commit: ${runId}`)).toBe(1);
+    } finally {
+      service.close();
+    }
+  });
+
+  it("rejects a workspace mutation after verification instead of committing stale evidence", async () => {
+    const root = repository();
+    const service = await activeSerial(root);
+    const pipeline = new CheckpointPipeline(service.store, {
+      faultInjector(point) {
+        if (point === "after_evidence_persisted") {
+          writeFileSync(path.join(root, "src", "main.js"), "export const ready = 'mutated-after-verification';\n");
+        }
+      }
+    });
+    try {
+      await expect(runSerialPipeline(service, pipeline)).rejects.toThrow(/WORKTREE_CHANGED_AFTER_VERIFICATION/u);
+      expect(service.store.getPhase("implementation")?.status).toBe("IN_PROGRESS");
+      expect(service.store.listCheckpoints()).toHaveLength(0);
+      expect(trailerCount(root, "Keep-Coding-Commit:")).toBe(0);
+      expect(service.store.listCheckpointRuns()[0]).toMatchObject({ status: "DONE" });
+    } finally {
+      service.close();
+    }
+  });
+
+  it("applies playbook memory exactly once across the external-database crash window", async () => {
+    const root = repository();
+    const playbookPath = path.join(root, "playbook", "patterns.db");
+    process.env.KEEP_CODING_PLAYBOOK_PATH = playbookPath;
+    let service = await activeSerial(root, true);
+    await expect(runSerialPipeline(service, crashingPipeline(service, "after_memory_write")))
+      .rejects.toBeInstanceOf(CheckpointCrashError);
+    service.close();
+
+    service = await KeepCodingService.open(root);
+    service.close();
+    service = await KeepCodingService.open(root);
+    service.close();
+
+    const playbook = new PlaybookStore(playbookPath);
+    try {
+      const patterns = playbook.list("phase");
+      expect(patterns).toHaveLength(1);
+      expect(patterns[0]?.successCount).toBe(1);
+    } finally {
+      playbook.close();
+    }
+  });
+
+  it("finishes post-processing and cleans a merged parallel worktree after restart", async () => {
+    const root = repository(true);
+    let service = await KeepCodingService.open(root);
+    await service.initialize("Enable two independent modules in parallel");
+    service.savePlan(
+      {
+        goal: "Enable alpha and beta independently",
+        nonGoals: [],
+        constraints: [],
+        deliverables: ["alpha", "beta"],
+        invariants: [],
+        doneWhen: ["Both modules parse and export true"]
+      },
+      [
+        {
+          id: "alpha",
+          title: "Enable alpha",
+          goal: "Set alpha to true",
+          dependencies: [],
+          allowedScope: ["src/alpha/**"],
+          acceptanceCommands: ["node --check src/alpha/main.js"],
+          maxAttempts: 3,
+          parallelSafe: true
+        },
+        {
+          id: "beta",
+          title: "Enable beta",
+          goal: "Set beta to true",
+          dependencies: [],
+          allowedScope: ["src/beta/**"],
+          acceptanceCommands: ["node --check src/beta/main.js"],
+          maxAttempts: 3,
+          parallelSafe: true
+        }
+      ]
+    );
+    const prepared = await service.parallel().prepare(["alpha", "beta"]) as {
+      worktrees: Array<{ phaseId: string; path: string; branch: string }>;
+    };
+    const alpha = prepared.worktrees.find((item) => item.phaseId === "alpha")!;
+    roots.push(...prepared.worktrees.map((item) => item.path));
+    writeFileSync(path.join(alpha.path, "src", "alpha", "main.js"), "export const alpha = true;\n");
+
+    const isolated = await service.git.constructor.open?.(alpha.path);
+    // The constructor is private at type level; use the public service path through a fresh repository handle.
+    const alphaGit = isolated ?? await (await import("../src/core/git.js")).GitRepository.open(alpha.path);
+    const pipeline = crashingPipeline(service, "after_state_committed");
+    await expect(pipeline.run({
+      phaseId: "alpha",
+      summary: "enabled alpha",
+      executionMode: "parallel",
+      workspaceGit: alphaGit,
+      indexGit: service.git,
+      reverificationReason: (files) => `Parallel recovery changed: ${files.join(", ")}`
+    })).rejects.toBeInstanceOf(CheckpointCrashError);
+    const runId = service.store.listCheckpointRuns()[0]!.id;
+    expect(service.store.getWorktree("alpha")?.status).toBe("merged");
+    expect(existsSync(alpha.path)).toBe(true);
+    service.close();
+
+    service = await KeepCodingService.open(root);
+    try {
+      expect(service.store.getPhase("alpha")?.status).toBe("COMPLETED");
+      expect(service.store.getCheckpointRun(runId)?.status).toBe("DONE");
+      expect(service.store.getWorktree("alpha")?.status).toBe("cleaned");
+      expect(existsSync(alpha.path)).toBe(false);
+      expect(() => execFileSync("git", ["show-ref", "--verify", `refs/heads/${alpha.branch}`], { cwd: root }))
+        .toThrow();
+      expect(trailerCount(root, `Keep-Coding-Merge: ${runId}`)).toBe(1);
+    } finally {
+      service.close();
+    }
+  });
+
+  it("serializes competing checkpoint attempts with a phase CAS and active-run uniqueness", async () => {
+    const root = repository();
+    const service = await activeSerial(root);
+    const owner = "test-owner";
+    const run = service.store.beginCheckpointRun({
+      phaseId: "implementation",
+      executionMode: "serial",
+      summary: "first claimant",
+      workspaceBaselineSha: await service.git.headSha(),
+      targetBaselineSha: await service.git.headSha(),
+      leaseOwner: owner,
+      leaseDurationMs: 60_000
+    });
+    try {
+      expect(() => service.store.beginCheckpointRun({
+        phaseId: "implementation",
+        executionMode: "serial",
+        summary: "second claimant",
+        workspaceBaselineSha: run.workspaceBaselineSha,
+        targetBaselineSha: run.targetBaselineSha,
+        leaseOwner: "second-owner",
+        leaseDurationMs: 60_000
+      })).toThrow(/CHECKPOINT_ALREADY_ACTIVE|CHECKPOINT_PHASE_CAS_FAILED/u);
+    } finally {
+      service.store.resetCheckpointRun(run.id, owner, "test cleanup");
+      service.close();
+    }
+  });
+});
