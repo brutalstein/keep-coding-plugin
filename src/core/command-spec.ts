@@ -9,7 +9,6 @@ export interface CommandSpec {
   display: string;
 }
 
-const FORBIDDEN_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u;
 const FORBIDDEN_SHELL_SEQUENCE = /(?:&&|\|\||[;|<>`]|\$\(|\$\{|\r|\n)/u;
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/u;
 
@@ -22,7 +21,7 @@ export function parseCommandSpec(command: string): CommandSpec {
   if (command !== command.trim() || command.length === 0) {
     throw new Error("COMMAND_SPEC_INVALID: command must be non-empty and trimmed");
   }
-  if (FORBIDDEN_CONTROL.test(command) || FORBIDDEN_SHELL_SEQUENCE.test(command)) {
+  if (hasForbiddenControl(command) || FORBIDDEN_SHELL_SEQUENCE.test(command)) {
     throw new Error("COMMAND_SPEC_SHELL_SYNTAX: shell operators, substitutions, redirections, and newlines are forbidden");
   }
 
@@ -90,4 +89,12 @@ export function formatCommandSpec(executable: string, argv: string[]): string {
 function quoteArgument(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/u.test(value)) return value;
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function hasForbiddenControl(value: string): boolean {
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127) return true;
+  }
+  return false;
 }
