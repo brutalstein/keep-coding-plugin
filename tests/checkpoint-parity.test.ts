@@ -11,6 +11,7 @@ interface PreparedWorktree {
   branch: string;
 }
 
+const ALPHA_VERIFIER = "node -e \"const fs=require('node:fs'); const text=fs.readFileSync('src/a/main.js','utf8'); if(text.includes('INVALID_ALPHA')) { console.error('INVALID_ALPHA detected'); process.exit(7); }\"";
 const roots: string[] = [];
 afterEach(() => { while (roots.length > 0) rmSync(roots.pop()!, { recursive: true, force: true }); });
 
@@ -40,7 +41,7 @@ async function active(root: string): Promise<{ service: KeepCodingService; workt
       constraints: [],
       deliverables: ["alpha module", "beta module"],
       invariants: [],
-      doneWhen: ["The declared node syntax checks complete successfully"]
+      doneWhen: ["The declared verification commands complete successfully"]
     },
     [
       {
@@ -49,7 +50,7 @@ async function active(root: string): Promise<{ service: KeepCodingService; workt
         goal: "Set the alpha export format to JSON",
         dependencies: [],
         allowedScope: ["src/a/**"],
-        acceptanceCommands: ["node --check src/a/main.js && node --check src/a/extra.js"],
+        acceptanceCommands: [ALPHA_VERIFIER],
         maxAttempts: 3,
         parallelSafe: true
       },
@@ -138,16 +139,15 @@ describe("serial and parallel checkpoint policy parity", () => {
     try {
       writeFileSync(
         path.join(worktree(worktrees, "alpha"), "src", "a", "main.js"),
-        "export const format = ;\n"
+        "export const marker = 'INVALID_ALPHA';\n"
       );
 
-      await expect(service.parallel().checkpoint("alpha", "introduced invalid syntax"))
+      await expect(service.parallel().checkpoint("alpha", "triggered deterministic verifier failure"))
         .rejects.toThrow(/failed verification/);
-      const command = "node --check src/a/main.js && node --check src/a/extra.js";
-      const failure = service.store.latestCommandFailure("alpha", command);
+      const failure = service.store.latestCommandFailure("alpha", ALPHA_VERIFIER);
       expect(failure).not.toBeNull();
       expect(failure?.fingerprint).toHaveLength(24);
-      expect(failure?.stderr).toMatch(/syntaxerror|unexpected token/iu);
+      expect(failure?.stderr).toMatch(/INVALID_ALPHA detected/u);
       expect(service.store.listBudgetUsage()["phase:alpha"]?.estimatedTokens).toBeGreaterThan(0);
     } finally {
       service.close();
