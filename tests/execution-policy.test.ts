@@ -1,13 +1,16 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { parseCommandSpec } from "../src/core/command-spec.js";
 import {
   buildExecutionEnvironment,
+  commandAllowed,
   defaultExecutionPolicy,
   executableAllowed,
   loadExecutionPolicy,
-  missingCapabilities
+  missingCapabilities,
+  type ExecutionCapability
 } from "../src/core/execution-policy.js";
 
 const roots: string[] = [];
@@ -47,6 +50,7 @@ describe("operator-owned execution policy", () => {
     writeFileSync(policyPath, JSON.stringify({
       version: 1,
       allowedExecutables: ["node"],
+      allowedCommands: ["node --version"],
       allowedEnvironment: ["PATH"],
       fixedEnvironment: { CI: "true" },
       sandbox: "process",
@@ -65,6 +69,8 @@ describe("operator-owned execution policy", () => {
     expect(first).toEqual(second);
     expect(first.source).toBe(policyPath);
     expect(first.projectWrites).toBe("deny");
+    expect(commandAllowed(first, parseCommandSpec("node --version"))).toBe(true);
+    expect(commandAllowed(first, parseCommandSpec('node -p "1 + 1"'))).toBe(false);
   });
 
   it("rejects repository-controlled or malformed policy documents", async () => {
@@ -88,11 +94,22 @@ describe("operator-owned execution policy", () => {
     })).rejects.toThrow(/unknown required capability/u);
   });
 
+  it.runIf(process.platform !== "win32")("rejects policy files writable by another principal", async () => {
+    const projectRoot = directory("keep-coding-policy-permission-project-");
+    const policyRoot = directory("keep-coding-policy-permission-owner-");
+    const policyPath = path.join(policyRoot, "policy.json");
+    writeFileSync(policyPath, JSON.stringify({ version: 1, allowedExecutables: ["node"] }));
+    chmodSync(policyPath, 0o666);
+    await expect(loadExecutionPolicy(projectRoot, {
+      KEEP_CODING_EXECUTION_POLICY_PATH: policyPath
+    })).rejects.toThrow(/EXECUTION_POLICY_PERMISSIONS_INVALID/u);
+  });
+
   it("reports capabilities that the selected backend cannot provide", () => {
-    const policy = {
-      ...defaultExecutionPolicy(),
-      requiredCapabilities: ["shell-free", "network-denied", "process-isolated"] as const
-    };
+    const requiredCapabilities: ExecutionCapability[] = [
+      "shell-free", "network-denied", "process-isolated"
+    ];
+    const policy = { ...defaultExecutionPolicy(), requiredCapabilities };
     expect(missingCapabilities(policy, ["shell-free", "environment-sanitized"]))
       .toEqual(["network-denied", "process-isolated"]);
   });
