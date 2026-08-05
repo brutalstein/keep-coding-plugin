@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { readFile, realpath, stat } from "node:fs/promises";
 import path from "node:path";
-import type { NetworkAccess } from "./command-spec.js";
+import { minimatch } from "minimatch";
+import { commandSpecHash, parseCommandSpec, type CommandSpec, type NetworkAccess } from "./command-spec.js";
 
 export type SandboxBackendPreference = "auto" | "process" | "bubblewrap";
 export type ProjectWritePolicy = "phase" | "deny";
@@ -18,11 +19,14 @@ export type ExecutionCapability =
 export interface ExecutionPolicyDocument {
   version: 1;
   allowedExecutables: string[];
+  allowedCommands?: string[];
   allowedEnvironment?: string[];
   fixedEnvironment?: Record<string, string>;
   sandbox?: SandboxBackendPreference;
   network?: NetworkAccess;
   projectWrites?: ProjectWritePolicy;
+  allowedWriteScopes?: string[];
+  allowProjectExecutables?: boolean;
   requiredCapabilities?: ExecutionCapability[];
   maxTimeoutMs?: number;
   maxOutputBytes?: number;
@@ -32,22 +36,25 @@ export interface ResolvedExecutionPolicy {
   source: string;
   hash: string;
   allowedExecutables: string[];
+  allowedCommandHashes: string[];
   allowedEnvironment: string[];
   fixedEnvironment: Record<string, string>;
   sandbox: SandboxBackendPreference;
   network: NetworkAccess;
   projectWrites: ProjectWritePolicy;
+  allowedWriteScopes: string[];
+  allowProjectExecutables: boolean;
   requiredCapabilities: ExecutionCapability[];
   maxTimeoutMs: number;
   maxOutputBytes: number;
 }
 
 const DEFAULT_ALLOWED_EXECUTABLES = [
-  "node", "npm", "npx", "pnpm", "yarn", "bun",
+  "node", "npm", "pnpm", "yarn", "bun",
   "python", "python3", "pytest", "ruff", "mypy", "pyright",
   "tsc", "eslint", "vitest", "jest", "mocha",
   "cargo", "rustc", "clippy", "go", "dotnet",
-  "mvn", "mvnw", "gradle", "gradlew", "cmake", "ctest", "make", "ninja",
+  "mvn", "gradle", "cmake", "ctest", "make", "ninja",
   "git", "ruby", "bundle", "php", "composer"
 ];
 const DEFAULT_ALLOWED_ENVIRONMENT = [
@@ -81,8 +88,13 @@ export async function loadExecutionPolicy(
   }
   const metadata = await stat(canonicalPolicy);
   if (!metadata.isFile()) throw new Error("EXECUTION_POLICY_PATH_INVALID: policy path must reference a regular file");
-  if (typeof process.getuid === "function" && metadata.uid !== process.getuid()) {
-    throw new Error("EXECUTION_POLICY_OWNER_INVALID: policy file must be owned by the Keep Coding process user");
+  if (typeof process.getuid === "function") {
+    if (metadata.uid !== process.getuid()) {
+      throw new Error("EXECUTION_POLICY_OWNER_INVALID: policy file must be owned by the Keep Coding process user");
+    }
+    if ((metadata.mode & 0o022) !== 0) {
+      throw new Error("EXECUTION_POLICY_PERMISSIONS_INVALID: policy file must not be group- or world-writable");
+    }
   }
 
   let parsed: unknown;
@@ -123,15 +135,28 @@ export function buildExecutionEnvironment(
 export function executableAllowed(
   policy: ResolvedExecutionPolicy,
   requestedExecutable: string,
-  resolvedExecutable: string
+  resolvedExecutable: string,
+  projectRoot?: string
 ): boolean {
+  if (projectRoot && !policy.allowProjectExecutables && isInside(projectRoot, resolvedExecutable)) return false;
   const requested = normalizeExecutable(requestedExecutable);
   const resolved = normalizeExecutable(resolvedExecutable);
   const basename = normalizeExecutable(path.basename(resolvedExecutable));
   return policy.allowedExecutables.some((entry) => {
     const allowed = normalizeExecutable(entry);
-    return allowed === requested || allowed === resolved || allowed === basename;
+    return path.isAbsolute(entry)
+      ? allowed === resolved
+      : allowed === requested || allowed === basename;
   });
+}
+
+export function commandAllowed(policy: ResolvedExecutionPolicy, spec: CommandSpec): boolean {
+  return policy.allowedCommandHashes.length === 0 || policy.allowedCommandHashes.includes(commandSpecHash(spec));
+}
+
+export function operatorAllowsWrite(policy: ResolvedExecutionPolicy, file: string): boolean {
+  if (policy.projectWrites === "deny") return false;
+  return policy.allowedWriteScopes.some((pattern) => minimatch(file, pattern, { dot: true, matchBase: false }));
 }
 
 export function missingCapabilities(
@@ -151,6 +176,8 @@ function defaultPolicy(): ExecutionPolicyDocument {
     sandbox: "auto",
     network: "inherit",
     projectWrites: "phase",
+    allowedWriteScopes: ["**"],
+    allowProjectExecutables: false,
     requiredCapabilities: DEFAULT_REQUIRED_CAPABILITIES,
     maxTimeoutMs: 300_000,
     maxOutputBytes: 16 * 1024 * 1024
@@ -162,6 +189,9 @@ function validatePolicyDocument(value: unknown): ExecutionPolicyDocument {
     throw new Error("EXECUTION_POLICY_SCHEMA: version must be exactly 1");
   }
   const allowedExecutables = stringArray(value.allowedExecutables, "allowedExecutables", true);
+  const allowedCommands = value.allowedCommands === undefined
+    ? undefined
+    : stringArray(value.allowedCommands, "allowedCommands", false);
   const allowedEnvironment = value.allowedEnvironment === undefined
     ? undefined
     : stringArray(value.allowedEnvironment, "allowedEnvironment", false);
@@ -171,6 +201,10 @@ function validatePolicyDocument(value: unknown): ExecutionPolicyDocument {
   const sandbox = enumValue(value.sandbox, ["auto", "process", "bubblewrap"] as const, "sandbox", "auto");
   const network = enumValue(value.network, ["inherit", "deny"] as const, "network", "inherit");
   const projectWrites = enumValue(value.projectWrites, ["phase", "deny"] as const, "projectWrites", "phase");
+  const allowedWriteScopes = value.allowedWriteScopes === undefined
+    ? undefined
+    : stringArray(value.allowedWriteScopes, "allowedWriteScopes", true);
+  const allowProjectExecutables = optionalBoolean(value.allowProjectExecutables, "allowProjectExecutables");
   const requiredCapabilities = value.requiredCapabilities === undefined
     ? undefined
     : stringArray(value.requiredCapabilities, "requiredCapabilities", false).map(executionCapability);
@@ -179,11 +213,14 @@ function validatePolicyDocument(value: unknown): ExecutionPolicyDocument {
   return {
     version: 1,
     allowedExecutables,
+    ...(allowedCommands !== undefined ? { allowedCommands } : {}),
     ...(allowedEnvironment !== undefined ? { allowedEnvironment } : {}),
     ...(fixedEnvironment !== undefined ? { fixedEnvironment } : {}),
     sandbox,
     network,
     projectWrites,
+    ...(allowedWriteScopes !== undefined ? { allowedWriteScopes } : {}),
+    ...(allowProjectExecutables !== undefined ? { allowProjectExecutables } : {}),
     ...(requiredCapabilities !== undefined ? { requiredCapabilities } : {}),
     ...(maxTimeoutMs !== undefined ? { maxTimeoutMs } : {}),
     ...(maxOutputBytes !== undefined ? { maxOutputBytes } : {})
@@ -191,14 +228,27 @@ function validatePolicyDocument(value: unknown): ExecutionPolicyDocument {
 }
 
 function resolvePolicy(document: ExecutionPolicyDocument, source: string): ResolvedExecutionPolicy {
+  const allowedCommandHashes = (document.allowedCommands ?? []).map((command) => {
+    try {
+      return commandSpecHash(parseCommandSpec(command));
+    } catch (error) {
+      throw new Error(
+        `EXECUTION_POLICY_COMMAND_INVALID: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
+    }
+  });
   const resolved = {
     source,
     allowedExecutables: [...new Set(document.allowedExecutables.map((entry) => entry.trim()))],
+    allowedCommandHashes: [...new Set(allowedCommandHashes)],
     allowedEnvironment: [...new Set(document.allowedEnvironment ?? DEFAULT_ALLOWED_ENVIRONMENT)],
     fixedEnvironment: { ...(document.fixedEnvironment ?? {}) },
     sandbox: document.sandbox ?? "auto",
     network: document.network ?? "inherit",
     projectWrites: document.projectWrites ?? "phase",
+    allowedWriteScopes: [...new Set(document.allowedWriteScopes ?? ["**"])],
+    allowProjectExecutables: document.allowProjectExecutables ?? false,
     requiredCapabilities: [...new Set(document.requiredCapabilities ?? DEFAULT_REQUIRED_CAPABILITIES)],
     maxTimeoutMs: document.maxTimeoutMs ?? 300_000,
     maxOutputBytes: document.maxOutputBytes ?? 16 * 1024 * 1024
@@ -210,7 +260,7 @@ function resolvePolicy(document: ExecutionPolicyDocument, source: string): Resol
 }
 
 function isInside(root: string, candidate: string): boolean {
-  const relative = path.relative(root, candidate);
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
@@ -248,6 +298,12 @@ function optionalPositiveInteger(value: unknown, field: string): number | undefi
     throw new Error(`EXECUTION_POLICY_SCHEMA: ${field} must be a positive integer`);
   }
   return Number(value);
+}
+
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new Error(`EXECUTION_POLICY_SCHEMA: ${field} must be a boolean`);
+  return value;
 }
 
 function enumValue<const Values extends readonly string[]>(
