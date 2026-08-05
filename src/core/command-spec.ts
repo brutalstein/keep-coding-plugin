@@ -39,7 +39,13 @@ export function parseCommandSpec(command: string): CommandSpec {
       continue;
     }
     if (character === "\\" && quote !== "single") {
-      escaping = true;
+      const next = command[index + 1] ?? "";
+      if (isEscapable(next, quote)) {
+        escaping = true;
+        tokenStarted = true;
+        continue;
+      }
+      current += character;
       tokenStarted = true;
       continue;
     }
@@ -92,6 +98,11 @@ export function formatCommandSpec(executable: string, argv: string[]): string {
 function quoteArgument(value: string): string {
   if (/^[A-Za-z0-9_./:@%+=,-]+$/u.test(value)) return value;
   return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
+function isEscapable(next: string, quote: "single" | "double" | null): boolean {
+  if (quote === "double") return next === '"' || next === "\\";
+  return next === '"' || next === "'" || next === "\\" || /\s/u.test(next);
 }
 
 function hasForbiddenControl(value: string): boolean {
