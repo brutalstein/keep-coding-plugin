@@ -6,7 +6,7 @@ import { PlaybookStore } from "../storage/playbook.js";
 import type { PlatformStore } from "../storage/platform-store.js";
 import { CriticRunner } from "./critic.js";
 import { assessAmbiguity } from "./detector.js";
-import { GitRepository } from "./git.js";
+import type { GitRepository } from "./git.js";
 import { indexRepository } from "./indexer.js";
 import { PhaseVerifier } from "./verifier.js";
 
