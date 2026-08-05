@@ -11,8 +11,8 @@ and evidence-gated completion for long-running coding agents.
 [![Keep Coding Verification](https://github.com/brutalstein/keep-coding-plugin/actions/workflows/keep-coding.yml/badge.svg)](https://github.com/brutalstein/keep-coding-plugin/actions/workflows/keep-coding.yml)
 ![Release](https://img.shields.io/badge/release-v0.4.0-7c3aed?style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?style=flat-square\&logo=nodedotjs\&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-149%20passing-22c55e?style=flat-square)
-![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.06%25-0ea5e9?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-206%20passing-22c55e?style=flat-square)
+![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.17%25-0ea5e9?style=flat-square)
 ![MCP](https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP-f97316?style=flat-square)
 
 [Quick Start](#-quick-start) ·
@@ -238,6 +238,7 @@ See [`docs/INSTALL_MCP.md`](docs/INSTALL_MCP.md) for the complete setup.
 * Preserves completed evidence during plan amendments
 * Upgrades existing v0.1–v0.3 SQLite state additively
 * Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal
+* Runs verification and critic commands through a shell-free, operator-owned execution policy kernel with durable attestation
 
 ### Scoped implementation
 
@@ -251,6 +252,7 @@ See [`docs/INSTALL_MCP.md`](docs/INSTALL_MCP.md) for the complete setup.
 
 * Runs impacted tests before broader suites
 * Executes explicit acceptance commands
+* Revalidates repository scope and secrets after every command and after independent critic execution
 * Enforces token, cost, and wall-clock budgets
 * Supports human approval gates
 * Supports an optional independent critic
@@ -339,18 +341,18 @@ Pyright or clangd integration is intentionally deferred until real evaluation ev
 
 | Metric                          |              v0.4.0 |
 | ------------------------------- | ------------------: |
-| Source tests                    |     **149 passing** |
-| Source test files               |              **38** |
+| Source tests                    |     **206 passing** |
+| Source test files               |              **45** |
 | Compiled distribution scenarios |       **5 passing** |
-| Statement coverage              |          **85.74%** |
-| Branch coverage                 |          **75.06%** |
+| Statement coverage              |          **85.54%** |
+| Branch coverage                 |          **75.17%** |
 | Enforced branch floor           |             **75%** |
-| Function coverage               |          **88.53%** |
-| Line coverage                   |          **91.34%** |
-| Executable size                 | **1,337,591 bytes** |
+| Function coverage               |          **89.07%** |
+| Line coverage                   |          **91.21%** |
+| Executable size                 | **1,372,543 bytes** |
 | Verified parser sidecars        | **4,721,428 bytes** |
 
-Verified source suite: 149 tests across 38 files.
+Verified source suite: 206 tests across 45 files.
 
 The complete check command runs:
 
@@ -480,6 +482,7 @@ Read [`SECURITY.md`](SECURITY.md) before exposing the HTTP transport.
 | ---------------------------------------------------------- | ------------------------------------------------- |
 | [`docs/INSTALL_MCP.md`](docs/INSTALL_MCP.md)               | Host-agnostic MCP installation                    |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)             | Components, state, graph, and verification design |
+| [`docs/EXECUTION_POLICY.md`](docs/EXECUTION_POLICY.md)       | Operator command authority and sandbox backends    |
 | [`docs/EVALUATION.md`](docs/EVALUATION.md)                 | Evaluation methodology                            |
 | [`docs/EVALUATION_RESULTS.md`](docs/EVALUATION_RESULTS.md) | Current evidence and result boundary              |
 | [`SECURITY.md`](SECURITY.md)                               | Security model and deployment boundaries          |
