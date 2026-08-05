@@ -12,7 +12,7 @@ and evidence-gated completion for long-running coding agents.
 ![Release](https://img.shields.io/badge/release-v0.4.0-7c3aed?style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?style=flat-square\&logo=nodedotjs\&logoColor=white)
 ![Tests](https://img.shields.io/badge/tests-149%20passing-22c55e?style=flat-square)
-![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.05%25-0ea5e9?style=flat-square)
+![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.06%25-0ea5e9?style=flat-square)
 ![MCP](https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP-f97316?style=flat-square)
 
 [Quick Start](#-quick-start) ·
@@ -340,17 +340,17 @@ Pyright or clangd integration is intentionally deferred until real evaluation ev
 | Metric                          |              v0.4.0 |
 | ------------------------------- | ------------------: |
 | Source tests                    |     **149 passing** |
-| Source test files               |              **39** |
+| Source test files               |              **38** |
 | Compiled distribution scenarios |       **5 passing** |
-| Statement coverage              |          **84.32%** |
-| Branch coverage                 |          **75.05%** |
+| Statement coverage              |          **85.74%** |
+| Branch coverage                 |          **75.06%** |
 | Enforced branch floor           |             **75%** |
-| Function coverage               |          **88.13%** |
-| Line coverage                   |          **89.56%** |
-| Executable size                 | **1,309,988 bytes** |
+| Function coverage               |          **88.53%** |
+| Line coverage                   |          **91.34%** |
+| Executable size                 | **1,337,591 bytes** |
 | Verified parser sidecars        | **4,721,428 bytes** |
 
-Verified source suite: 149 tests across 39 files.
+Verified source suite: 149 tests across 38 files.
 
 The complete check command runs:
 
