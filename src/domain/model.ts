@@ -20,6 +20,18 @@ export type PhaseStatus =
   | "COMPLETED"
   | "SUPERSEDED";
 
+export type CheckpointExecutionMode = "serial" | "parallel";
+export type CheckpointRunStatus =
+  | "PREPARING"
+  | "VERIFYING"
+  | "VERIFIED"
+  | "GIT_COMMITTED"
+  | "STATE_COMMITTED"
+  | "POST_PROCESSING"
+  | "DONE"
+  | "FAILED_RETRYABLE"
+  | "FAILED_TERMINAL";
+
 export interface BudgetLimits {
   maxTokens?: number | undefined;
   maxCostUsd?: number | undefined;
@@ -185,7 +197,34 @@ export interface VerificationEvidence {
 }
 
 export interface CheckpointRecord { id: string; phaseId: string; gitSha: string; summary: string; changedFiles: string[]; verification: VerificationEvidence; createdAt: string }
-export interface WorktreeRecord { phaseId: string; path: string; branch: string; status: "prepared" | "active" | "merged" | "failed"; baseSha: string; createdAt: string }
+export interface CheckpointRunRecord {
+  id: string;
+  phaseId: string;
+  executionMode: CheckpointExecutionMode;
+  summary: string;
+  status: CheckpointRunStatus;
+  workspaceBaselineSha: string;
+  targetBaselineSha: string;
+  actualGitSha: string | null;
+  diffHash: string | null;
+  changedFiles: string[];
+  impactedCompletedPhases: string[];
+  reverificationRequired: string[];
+  evidence: VerificationEvidence | null;
+  correctionId: string | null;
+  leaseOwner: string | null;
+  leaseExpiresAt: string | null;
+  lastError: string | null;
+  indexCompletedAt: string | null;
+  reverificationCompletedAt: string | null;
+  memoryCompletedAt: string | null;
+  cleanupCompletedAt: string | null;
+  correctionCompletedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  completedAt: string | null;
+}
+export interface WorktreeRecord { phaseId: string; path: string; branch: string; status: "prepared" | "active" | "merged" | "failed" | "cleaned"; baseSha: string; createdAt: string }
 
 export interface GraphNode {
   id: string;
@@ -257,6 +296,7 @@ export interface ProjectSnapshot {
   failures: FailureRecord[];
   approvals?: ApprovalRecord[] | undefined;
   checkpoints: CheckpointRecord[];
+  checkpointRuns?: CheckpointRunRecord[] | undefined;
   planRevisions?: PlanRevisionRecord[] | undefined;
   worktrees?: WorktreeRecord[] | undefined;
   budgetUsage?: Record<string, BudgetUsage> | undefined;

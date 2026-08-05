@@ -80,7 +80,8 @@ export function listBudgetUsage(db: DatabaseSync): Record<string, BudgetUsage> {
 }
 
 export function recordCriticReview(db: DatabaseSync, phaseId: string, evidence: CriticEvidence): void {
-  db.prepare("INSERT INTO critic_reviews VALUES (?, ?, ?, ?)").run(randomUUID(), phaseId, JSON.stringify(evidence), now());
+  db.prepare("INSERT INTO critic_reviews(id, phase_id, evidence_json, created_at) VALUES (?, ?, ?, ?)")
+    .run(randomUUID(), phaseId, JSON.stringify(evidence), now());
 }
 
 export function setWorktree(db: DatabaseSync, record: WorktreeRecord): void {

@@ -13,12 +13,16 @@ import { indexRepository } from "./indexer.js";
 import { ParallelOrchestrator } from "./orchestrator.js";
 import { PhaseVerifier } from "./verifier.js";
 import { WorkspaceTools } from "./workspace.js";
-import { generateCommitMessage, generatePullRequestDescription } from "../integrations/github.js";
+import { generatePullRequestDescription } from "../integrations/github.js";
 
 export class KeepCodingService {
   static async open(projectRoot: string): Promise<KeepCodingService> {
     const git = await GitRepository.open(projectRoot);
     const store = new PlatformStore(git.root);
+    const recovery = await CheckpointPipeline.recover(git, store);
+    if ([...recovery.recovered, ...recovery.reset, ...recovery.blocked, ...recovery.deferred].length > 0) {
+      store.appendEvent("checkpoint_recovery_scanned", null, { ...recovery });
+    }
     return new KeepCodingService(git, store, new WorkspaceTools(git, store));
   }
 
@@ -135,12 +139,9 @@ export class KeepCodingService {
     return new CheckpointPipeline(this.store).run({
       phaseId,
       summary,
+      executionMode: "serial",
       workspaceGit: this.git,
       indexGit: this.git,
-      commitEvidence: (evidence) => this.git.commitFiles(
-        evidence.changedFiles,
-        generateCommitMessage(phaseId, summary)
-      ),
       reverificationReason: (changedFiles) => `Files affected by ${phaseId}: ${changedFiles.join(", ")}`
     });
   }

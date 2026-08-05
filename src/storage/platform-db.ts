@@ -5,13 +5,15 @@ export type DbRow = Record<string, unknown>;
 
 export class PlatformDb {
   readonly db: DatabaseSync;
+  private readonly ownsDatabase: boolean;
 
-  constructor(databasePath: string) {
-    this.db = new DatabaseSync(databasePath);
+  constructor(database: string | DatabaseSync) {
+    this.ownsDatabase = typeof database === "string";
+    this.db = typeof database === "string" ? new DatabaseSync(database) : database;
     this.migrate();
   }
 
-  close(): void { this.db.close(); }
+  close(): void { if (this.ownsDatabase) this.db.close(); }
 
   transaction<T>(operation: () => T): T {
     this.db.exec("BEGIN IMMEDIATE");
@@ -41,6 +43,9 @@ export class PlatformDb {
         estimated_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
         wall_clock_ms INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id)
       );
+      CREATE TABLE IF NOT EXISTS budget_usage_receipts (
+        receipt_key TEXT PRIMARY KEY, created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS critic_reviews (
         id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at TEXT NOT NULL
       );
@@ -53,9 +58,30 @@ export class PlatformDb {
         stdout TEXT NOT NULL, stderr TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
         PRIMARY KEY (phase_id, command, attempt)
       );
+      CREATE TABLE IF NOT EXISTS checkpoint_runs (
+        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, execution_mode TEXT NOT NULL, summary TEXT NOT NULL,
+        status TEXT NOT NULL, workspace_baseline_sha TEXT NOT NULL, target_baseline_sha TEXT NOT NULL,
+        actual_git_sha TEXT, diff_hash TEXT, changed_files_json TEXT NOT NULL DEFAULT '[]',
+        impacted_completed_phases_json TEXT NOT NULL DEFAULT '[]',
+        reverification_required_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT, correction_id TEXT,
+        lease_owner TEXT, lease_expires_at TEXT, last_error TEXT, index_completed_at TEXT,
+        reverification_completed_at TEXT, memory_completed_at TEXT, cleanup_completed_at TEXT,
+        correction_completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+      );
       CREATE INDEX IF NOT EXISTS idx_command_failures_latest ON command_failures(phase_id, command, attempt DESC);
+      CREATE INDEX IF NOT EXISTS idx_checkpoint_runs_recovery ON checkpoint_runs(status, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoint_runs_active_phase
+        ON checkpoint_runs(phase_id) WHERE status NOT IN ('DONE','FAILED_TERMINAL');
     `);
     addColumn(this.db, "budget_usage", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
+    addColumn(this.db, "checkpoints", "run_id", "TEXT");
+    addColumn(this.db, "critic_reviews", "run_id", "TEXT");
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_run_id
+        ON checkpoints(run_id) WHERE run_id IS NOT NULL;
+      DROP INDEX IF EXISTS idx_critic_reviews_run_id;
+      CREATE UNIQUE INDEX idx_critic_reviews_run_id ON critic_reviews(run_id);
+    `);
     const additions: Record<string, string> = {
       revision: "INTEGER NOT NULL DEFAULT 1",
       superseded_by: "TEXT",
