@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { KernelCommandEvidence } from "../src/core/execution-kernel.js";
+import { ExecutionKernel, type KernelCommandEvidence } from "../src/core/execution-kernel.js";
 import { GitRepository } from "../src/core/git.js";
 import { PhaseVerifier } from "../src/core/verifier.js";
 import type { PhaseRecord, ProjectContract } from "../src/domain/model.js";
@@ -75,6 +75,34 @@ describe("verifier execution boundaries", () => {
     expect(result.passed).toBe(false);
     expect(result.scopeViolations).toContain("outside.txt");
     expect(result.commands[0]?.stderr).toMatch(/EXECUTION_WRITE_SCOPE_VIOLATION/u);
+  });
+
+  it("rejects writes allowed by the phase but denied by operator policy", async () => {
+    const root = repository("require('node:fs').writeFileSync('src/operator-denied.js', 'created');\n");
+    mkdirSync(path.join(root, "src", "generated"));
+    const policyRoot = mkdtempSync(path.join(tmpdir(), "keep-coding-write-policy-"));
+    roots.push(policyRoot);
+    const policyPath = path.join(policyRoot, "policy.json");
+    writeFileSync(policyPath, JSON.stringify({
+      version: 1,
+      allowedExecutables: ["node"],
+      sandbox: "process",
+      network: "inherit",
+      projectWrites: "phase",
+      allowedWriteScopes: ["src/generated/**"]
+    }));
+    const kernel = await ExecutionKernel.open(root, {
+      ...process.env,
+      KEEP_CODING_EXECUTION_POLICY_PATH: policyPath
+    });
+    const result = await new PhaseVerifier(2_000).verify(
+      await GitRepository.open(root),
+      phase("node verify.js"),
+      { ...options, executionKernel: kernel }
+    );
+    expect(result.scopeViolations).toEqual([]);
+    expect(result.commands[0]?.stderr).toMatch(/EXECUTION_WRITE_SCOPE_VIOLATION.*src\/operator-denied\.js/u);
+    expect(result.passed).toBe(false);
   });
 
   it("rescans secrets produced by a passing command", async () => {
