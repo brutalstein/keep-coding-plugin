@@ -24,36 +24,3 @@ jobs:
           name: keep-coding-dist
           path: plugins/keep-coding/dist
           if-no-files-found: error
-
-  cleanup-checkpoint-documentation:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/agent/crash-safe-checkpoints'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: agent/crash-safe-checkpoints
-      - name: Remove duplicate recovery capability line
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('README.md')
-          text = path.read_text(encoding='utf-8')
-          line = '* Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal'
-          duplicate = line + '\n' + line
-          while duplicate in text:
-              text = text.replace(duplicate, line)
-          path.write_text(text, encoding='utf-8')
-          PY
-      - name: Commit cleanup when needed
-        run: |
-          if git diff --quiet -- README.md; then
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md
-          git commit -m "Deduplicate checkpoint recovery documentation"
-          git push origin HEAD:agent/crash-safe-checkpoints
