@@ -24,3 +24,57 @@ jobs:
           name: keep-coding-dist
           path: plugins/keep-coding/dist
           if-no-files-found: error
+
+  harden-http-command-policy:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/agent/execution-policy-kernel'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/execution-policy-kernel
+      - name: Apply exact HTTP command-policy patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          target = Path('src/mcp/http.ts')
+          text = target.read_text(encoding='utf-8')
+          marker = 'import { createAllowedRootResolver, parseAllowedRoots } from "./root-policy.js";'
+          addition = marker + '\nimport { parseCommandSpec } from "../core/command-spec.js";'
+          if 'import { parseCommandSpec } from "../core/command-spec.js";' not in text:
+              if marker not in text:
+                  raise SystemExit('HTTP import marker missing')
+              text = text.replace(marker, addition, 1)
+
+          old = '''  return [...new Set(parsed)];
+}'''
+          new = '''  for (const command of parsed) {
+    try {
+      parseCommandSpec(command);
+    } catch (error) {
+      throw new Error(
+        `KEEP_CODING_ALLOWED_COMMANDS_JSON contains an unsafe command: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
+    }
+  }
+  return [...new Set(parsed)];
+}'''
+          if new not in text:
+              if old not in text:
+                  raise SystemExit('HTTP return marker missing')
+              text = text.replace(old, new, 1)
+          target.write_text(text, encoding='utf-8')
+          PY
+      - name: Commit HTTP hardening
+        run: |
+          if git diff --quiet -- src/mcp/http.ts; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/mcp/http.ts
+          git commit -m "Validate HTTP execution commands"
+          git push origin HEAD:agent/execution-policy-kernel
