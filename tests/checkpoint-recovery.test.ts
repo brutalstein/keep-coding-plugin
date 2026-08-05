@@ -173,7 +173,13 @@ describe("crash-safe serial checkpoints", () => {
     service = await KeepCodingService.open(root);
     service.close();
     service = await KeepCodingService.open(root);
-    service.close();
+    try {
+      const memoryEvents = service.store.eventsSince(0)
+        .filter((event) => event.type === "playbook_pattern_recorded");
+      expect(memoryEvents).toHaveLength(1);
+    } finally {
+      service.close();
+    }
 
     const playbook = new PlaybookStore(playbookPath);
     try {
