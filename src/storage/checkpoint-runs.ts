@@ -165,10 +165,21 @@ export function recordCheckpointCommit(
   gitSha: string,
   leaseDurationMs: number
 ): CheckpointRunRecord {
+  const run = required(getCheckpointRun(db, id), `unknown checkpoint run: ${id}`);
+  const evidence = required(run.evidence, `checkpoint evidence missing: ${id}`);
+  const committedEvidence: VerificationEvidence = { ...evidence, gitSha };
   const result = db.prepare(`
-    UPDATE checkpoint_runs SET status='GIT_COMMITTED',actual_git_sha=?,lease_expires_at=?,updated_at=?
+    UPDATE checkpoint_runs SET status='GIT_COMMITTED',actual_git_sha=?,evidence_json=?,
+      lease_expires_at=?,updated_at=?
     WHERE id=? AND lease_owner=? AND status IN ('VERIFIED','FAILED_RETRYABLE')
-  `).run(gitSha, leaseExpiration(leaseDurationMs), now(), id, leaseOwner);
+  `).run(
+    gitSha,
+    JSON.stringify(committedEvidence),
+    leaseExpiration(leaseDurationMs),
+    now(),
+    id,
+    leaseOwner
+  );
   assertChanged(result.changes, `CHECKPOINT_COMMIT_CAS_FAILED: ${id}`);
   return required(getCheckpointRun(db, id), "checkpoint commit update failed");
 }
@@ -181,7 +192,7 @@ export function markCheckpointStateCommitted(
 ): CheckpointRunRecord {
   const result = db.prepare(`
     UPDATE checkpoint_runs SET status='STATE_COMMITTED',lease_expires_at=?,updated_at=?
-    WHERE id=? AND lease_owner=? AND status IN ('GIT_COMMITTED','FAILED_RETRYABLE')
+    WHERE id=? AND lease_owner=? AND status IN ('VERIFIED','GIT_COMMITTED','FAILED_RETRYABLE')
   `).run(leaseExpiration(leaseDurationMs), now(), id, leaseOwner);
   assertChanged(result.changes, `CHECKPOINT_STATE_CAS_FAILED: ${id}`);
   return required(getCheckpointRun(db, id), "checkpoint state update failed");
