@@ -48,8 +48,9 @@ export class KeepCodingService {
 
   amendPlan(amendment: PlanAmendment): Record<string, unknown> {
     const contract = this.store.getProject()?.contract ?? null;
-    const effectiveContract = contract && amendment.contractPatch
-      ? { ...contract, ...amendment.contractPatch }
+    const patchedSelectiveTests = amendment.contractPatch?.selectiveTests;
+    const effectiveContract = contract && patchedSelectiveTests !== undefined
+      ? { ...contract, selectiveTests: patchedSelectiveTests }
       : contract;
     const warnings = lintAcceptanceCommands(amendment.addPhases, effectiveContract);
     return { snapshot: this.store.amendPlan(amendment), commandQualityWarnings: warnings, nextAction: "get_context" };
