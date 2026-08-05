@@ -26,65 +26,35 @@ jobs:
           if-no-files-found: error
 
   synchronize-bundle:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/agent/checkpoint-policy-parity'
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/agent/')) ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       startsWith(github.head_ref, 'agent/'))
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TARGET_BRANCH: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: agent/checkpoint-policy-parity
-      - name: Synchronize verified README metrics
+          ref: ${{ env.TARGET_BRANCH }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Commit generated bundle when changed
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-
-          english_path = Path("README.md")
-          english = english_path.read_text(encoding="utf-8")
-          english = english.replace("tests-128%20passing", "tests-131%20passing")
-          english = english.replace("branch%20coverage-75.04%25", "branch%20coverage-75.89%25")
-          replacements = {
-              "**128 passing**": "**131 passing**",
-              "**31**": "**32**",
-              "**85.63%**": "**86.24%**",
-              "**75.04%**": "**75.89%**",
-              "**87.75%**": "**88.47%**",
-              "**91.50%**": "**92.18%**",
-              "**1,293,223 bytes**": "**1,292,929 bytes**",
-          }
-          for old, new in replacements.items():
-              english = english.replace(old, new)
-          english = re.sub(
-              r"Verified source suite: [0-9]+ tests across [0-9]+ files\.",
-              "Verified source suite: 131 tests across 32 files.",
-              english,
-          )
-          if "Verified source suite:" not in english:
-              marker = "| Verified parser sidecars        | **4,721,428 bytes** |"
-              replacement = marker + "\n\nVerified source suite: 131 tests across 32 files."
-              if marker not in english:
-                  raise SystemExit("English quality snapshot marker not found")
-              english = english.replace(marker, replacement, 1)
-          english_path.write_text(english, encoding="utf-8")
-
-          turkish_path = Path("docs/README.tr.md")
-          turkish = turkish_path.read_text(encoding="utf-8")
-          turkish = re.sub(
-              r"Doğrulanmış source suite: [0-9]+ test, [0-9]+ dosya\.",
-              "Doğrulanmış source suite: 131 test, 32 dosya.",
-              turkish,
-          )
-          turkish_path.write_text(turkish, encoding="utf-8")
-          PY
-      - name: Commit synchronized documentation
-        run: |
-          if git diff --quiet -- README.md docs/README.tr.md; then
-            echo "Documentation metrics are current."
+          if git diff --quiet -- plugins/keep-coding/dist; then
+            echo "Committed bundle is current."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add README.md docs/README.tr.md
-          git commit -m "Synchronize verified quality metrics"
-          git push origin HEAD:agent/checkpoint-policy-parity
+          git add plugins/keep-coding/dist
+          git commit -m "Build v0.4 plugin distribution"
+          git push origin "HEAD:${TARGET_BRANCH}"
