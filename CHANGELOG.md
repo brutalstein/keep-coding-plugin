@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Replaced shell-interpreted acceptance, selective-test, full-suite, and critic commands with one shell-free executable-plus-argv execution kernel.
+- Added operator-owned JSON execution policies with executable and exact-command authority, sanitized environments, fixed operator values, write scopes, resource bounds, network policy, and fail-closed capability requirements.
+- Added portable audited process execution and an optional Linux Bubblewrap backend with namespace isolation, capability dropping, read-only repository mounting, scoped writable bindings, and network denial.
+- Added durable execution attestation covering command and policy hashes, executable identity, backend capabilities, environment key names, input state, output digest, produced files, and resource-limit outcomes.
+- Added plan-time and amendment-time command validation, HTTP startup validation, repository executable-shadowing protection, post-command scope and secret rescanning, and read-only critic enforcement.
+- Added malicious-command coverage for shell injection, environment-secret exposure, output flooding, timeout/process-tree termination, policy-file trust, exact-command authority, operator/phase scope intersection, repository PATH shadowing, generated secrets, and critic writes.
+- Compatibility tightening: persisted commands that depend on shell operators, substitutions, redirection, inline environment assignment, or Windows `.cmd`/`.bat` interpretation are intentionally rejected. Operators must use a real executable/interpreter argv entry point.
+
 ## 0.4.0 — 2026-08-04
 
 - Replaced regex-first Python and C/C++ graph extraction with pinned, hash-verified `web-tree-sitter` WASM parsers and explicit degraded fallback telemetry.
