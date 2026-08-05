@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer as createNodeServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import path from "node:path";
 import { createMcpHandler } from "@modelcontextprotocol/server";
+import { parseCommandSpec } from "../core/command-spec.js";
 import { createServer as createKeepCodingServer } from "./server.js";
 import { createAllowedRootResolver, parseAllowedRoots } from "./root-policy.js";
 
@@ -257,6 +258,16 @@ export function parseAllowedCommands(value: string | undefined): string[] {
   }
   if (!isTrimmedStringArray(parsed)) {
     throw new Error("KEEP_CODING_ALLOWED_COMMANDS_JSON must be a JSON array of non-empty, trimmed command strings");
+  }
+  for (const command of parsed) {
+    try {
+      parseCommandSpec(command);
+    } catch (error) {
+      throw new Error(
+        `KEEP_CODING_ALLOWED_COMMANDS_JSON contains an unsafe command: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error }
+      );
+    }
   }
   return [...new Set(parsed)];
 }
