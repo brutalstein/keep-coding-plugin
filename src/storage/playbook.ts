@@ -30,6 +30,9 @@ export class PlaybookStore {
         fingerprint TEXT PRIMARY KEY, summary TEXT NOT NULL, resolution TEXT, occurrences INTEGER NOT NULL,
         source_project TEXT NOT NULL, updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS playbook_receipts (
+        receipt_key TEXT PRIMARY KEY, created_at TEXT NOT NULL
+      );
     `);
     addColumn(this.db, "playbook_patterns", "kind", "TEXT NOT NULL DEFAULT 'phase'");
     addColumn(this.db, "playbook_patterns", "metadata_json", "TEXT NOT NULL DEFAULT '{}'");
@@ -67,6 +70,20 @@ export class PlaybookStore {
     return patternFromRow(required(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature) as Row | undefined), 1);
   }
 
+  rememberPhaseOnce(receiptKey: string, sourceProject: string, phase: PhaseDefinition, keywords: string[]): PlaybookPattern {
+    const tuple = compactPhase(phase, keywords);
+    const signature = patternSignature(tuple.pattern, tuple.triggerConditions, tuple.resolution, tuple.applicabilityScope);
+    return this.transaction(() => {
+      const receipt = this.db.prepare("INSERT OR IGNORE INTO playbook_receipts(receipt_key,created_at) VALUES(?,?)")
+        .run(receiptKey, new Date().toISOString());
+      if (Number(receipt.changes) === 0) {
+        const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature=?").get(signature) as Row | undefined;
+        return patternFromRow(required(existing), 1);
+      }
+      return this.rememberPhase(sourceProject, phase, keywords);
+    });
+  }
+
   rememberCorrection(sourceProject: string, assumption: AssumptionRecord, correction: CorrectionRecord): PlaybookPattern {
     const pattern = `Avoid assumption: ${assumption.statement}`;
     const triggerConditions = normalizeKeywords(`${assumption.statement} ${correction.rootCause}`);
@@ -89,6 +106,24 @@ export class PlaybookStore {
         success_count=playbook_patterns.success_count+1,updated_at=excluded.updated_at,kind='anti_pattern',metadata_json=excluded.metadata_json
     `).run(id, signature, pattern, JSON.stringify(triggerConditions), JSON.stringify(resolution), JSON.stringify(applicabilityScope), JSON.stringify(sources), timestamp, timestamp, JSON.stringify(metadata));
     return patternFromRow(required(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature) as Row | undefined), 1);
+  }
+
+  rememberCorrectionOnce(
+    receiptKey: string,
+    sourceProject: string,
+    assumption: AssumptionRecord,
+    correction: CorrectionRecord
+  ): PlaybookPattern {
+    const signature = normalizedDiagnosticSignature(`${assumption.statement}\n${correction.rootCause}`, 32);
+    return this.transaction(() => {
+      const receipt = this.db.prepare("INSERT OR IGNORE INTO playbook_receipts(receipt_key,created_at) VALUES(?,?)")
+        .run(receiptKey, new Date().toISOString());
+      if (Number(receipt.changes) === 0) {
+        const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature=?").get(signature) as Row | undefined;
+        return patternFromRow(required(existing), 1);
+      }
+      return this.rememberCorrection(sourceProject, assumption, correction);
+    });
   }
 
   list(kind?: "phase" | "anti_pattern"): PlaybookPattern[] {
@@ -145,6 +180,18 @@ export class PlaybookStore {
         JSON.stringify(tuple.applicabilityScope), JSON.stringify([String(row.source_project)]),
         Number(row.success_count), String(row.created_at), now
       );
+    }
+  }
+
+  private transaction<T>(operation: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = operation();
+      this.db.exec("COMMIT");
+      return value;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
     }
   }
 }
