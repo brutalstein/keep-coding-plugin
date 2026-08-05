@@ -238,8 +238,6 @@ See [`docs/INSTALL_MCP.md`](docs/INSTALL_MCP.md) for the complete setup.
 * Preserves completed evidence during plan amendments
 * Upgrades existing v0.1–v0.3 SQLite state additively
 * Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal
-* Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal
-* Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal
 
 ### Scoped implementation
 
