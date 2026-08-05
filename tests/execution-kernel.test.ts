@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -31,7 +31,8 @@ describe("attested execution kernel", () => {
       backend: "process",
       purpose: "acceptance",
       policySource: "builtin",
-      outputLimitExceeded: false
+      outputLimitExceeded: false,
+      producedFiles: []
     });
     expect(result.attestation.capabilities).toContain("shell-free");
     expect(result.attestation.executableSha256).toHaveLength(64);
@@ -95,6 +96,60 @@ describe("attested execution kernel", () => {
     expect(result.durationMs).toBeLessThan(2_000);
   });
 
+  it.runIf(process.platform !== "win32")("rejects repository-controlled PATH shadowing", async () => {
+    const root = project();
+    const fakeNode = path.join(root, "node");
+    writeFileSync(fakeNode, "#!/bin/sh\nexit 0\n");
+    chmodSync(fakeNode, 0o755);
+    const kernel = await ExecutionKernel.open(root, {
+      ...process.env,
+      PATH: `${root}${path.delimiter}${process.env.PATH ?? ""}`
+    });
+    const result = await kernel.execute({
+      command: "node --version",
+      cwd: root,
+      purpose: "acceptance",
+      writeScopes: []
+    });
+    expect(result.passed).toBe(false);
+    expect(result.policyViolations).toContain("EXECUTION_EXECUTABLE_DENIED: node");
+  });
+
+  it("enforces an operator-owned exact command set", async () => {
+    const root = project();
+    const policyRoot = mkdtempSync(path.join(tmpdir(), "keep-coding-exact-command-policy-"));
+    roots.push(policyRoot);
+    const policyPath = path.join(policyRoot, "policy.json");
+    writeFileSync(policyPath, JSON.stringify({
+      version: 1,
+      allowedExecutables: ["node"],
+      allowedCommands: ["node --version"],
+      sandbox: "process",
+      network: "inherit",
+      projectWrites: "deny"
+    }));
+    const kernel = await ExecutionKernel.open(root, {
+      ...process.env,
+      KEEP_CODING_EXECUTION_POLICY_PATH: policyPath
+    });
+    expect((await kernel.execute({
+      command: "node --version",
+      cwd: root,
+      purpose: "acceptance",
+      writeScopes: []
+    })).passed).toBe(true);
+    const denied = await kernel.execute({
+      command: 'node -p "1 + 1"',
+      cwd: root,
+      purpose: "acceptance",
+      writeScopes: []
+    });
+    expect(denied.passed).toBe(false);
+    expect(denied.policyViolations).toContain(
+      "EXECUTION_COMMAND_DENIED: command is not present in the operator policy"
+    );
+  });
+
   it("fails closed when operator-required isolation is unavailable", async () => {
     const root = project();
     const policyRoot = mkdtempSync(path.join(tmpdir(), "keep-coding-kernel-policy-"));
@@ -122,6 +177,8 @@ describe("attested execution kernel", () => {
     });
     expect(result.passed).toBe(false);
     expect(result.attestation.backend).toBe("denied");
-    expect(result.policyViolations.join("\n")).toMatch(/EXECUTION_CAPABILITY_UNAVAILABLE|EXECUTION_NETWORK_ISOLATION_UNAVAILABLE/u);
+    expect(result.policyViolations.join("\n")).toMatch(
+      /EXECUTION_CAPABILITY_UNAVAILABLE|EXECUTION_NETWORK_ISOLATION_UNAVAILABLE/u
+    );
   });
 });
