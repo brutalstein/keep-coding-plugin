@@ -1,4 +1,5 @@
 import type { CommandQualityWarning, PhaseDefinition, ProjectContract } from "../domain/model.js";
+import { parseCommandSpec } from "./command-spec.js";
 
 const VERIFICATION_CATEGORIES: Array<{ name: string; pattern: RegExp }> = [
   { name: "test", pattern: /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|vitest|jest|mocha|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b/iu },
@@ -8,7 +9,11 @@ const VERIFICATION_CATEGORIES: Array<{ name: string; pattern: RegExp }> = [
   { name: "syntax", pattern: /\b(?:node|python|ruby)\s+--?check\b|\bgit\s+diff\s+--check\b/iu }
 ];
 
-export function lintAcceptanceCommands(phases: PhaseDefinition[], contract?: ProjectContract | null): CommandQualityWarning[] {
+export function lintAcceptanceCommands(
+  phases: PhaseDefinition[],
+  contract?: ProjectContract | null
+): CommandQualityWarning[] {
+  validateExecutableCommands(phases, contract);
   const warnings: CommandQualityWarning[] = [];
   const owners = new Map<string, string[]>();
   for (const phase of phases) {
@@ -46,8 +51,35 @@ export function lintAcceptanceCommands(phases: PhaseDefinition[], contract?: Pro
   return dedupeWarnings(warnings);
 }
 
+export function validateExecutableCommands(
+  phases: Array<Pick<PhaseDefinition, "id" | "acceptanceCommands">>,
+  contract?: ProjectContract | null
+): void {
+  for (const phase of phases) {
+    for (const command of phase.acceptanceCommands) validateCommand(command, `phase ${phase.id}`);
+  }
+  for (const command of contract?.selectiveTests?.fullSuiteCommands ?? []) {
+    validateCommand(command, "full-suite gate");
+  }
+  const template = contract?.selectiveTests?.commandTemplate;
+  if (template !== undefined) {
+    validateCommand(template.replaceAll("{tests}", "test-file"), "selective-test template");
+  }
+}
+
 export function recognizedVerification(command: string): boolean {
   return VERIFICATION_CATEGORIES.some((category) => category.pattern.test(command));
+}
+
+function validateCommand(command: string, owner: string): void {
+  try {
+    parseCommandSpec(command);
+  } catch (error) {
+    throw new Error(
+      `EXECUTION_COMMAND_REJECTED: ${owner}: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    );
+  }
 }
 
 function normalizeCommand(value: string): string { return value.trim().replace(/\s+/g, " ").toLowerCase(); }
