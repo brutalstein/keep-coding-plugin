@@ -229,9 +229,6 @@ function splitNull(value) {
   return Buffer.isBuffer(value) ? value.toString("utf8").split("\0").filter(Boolean) : value.split("\0").filter(Boolean);
 }
 
-// src/core/service.ts
-import { createHash as createHash8 } from "node:crypto";
-
 // src/core/signature.ts
 import { createHash as createHash2 } from "node:crypto";
 function normalizeDiagnosticText(value) {
@@ -1926,60 +1923,8 @@ function addColumn2(db, table, name2, definition) {
   if (!columns.some((row) => String(row.name) === name2)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name2} ${definition}`);
 }
 
-// src/core/command-quality.ts
-var VERIFICATION_CATEGORIES = [
-  { name: "test", pattern: /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|vitest|jest|mocha|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b/iu },
-  { name: "lint", pattern: /\b(?:eslint|ruff|pylint|flake8|golangci-lint|clippy|shellcheck|stylelint|lint)\b/iu },
-  { name: "typecheck", pattern: /\b(?:tsc|mypy|pyright|typecheck|cargo\s+check|go\s+vet)\b/iu },
-  { name: "build", pattern: /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?build\b|\b(?:cargo\s+build|go\s+build|dotnet\s+build|mvn\s+package|gradle\s+build|cmake\s+--build|make)\b/iu },
-  { name: "syntax", pattern: /\b(?:node|python|ruby)\s+--?check\b|\bgit\s+diff\s+--check\b/iu }
-];
-function lintAcceptanceCommands(phases, contract) {
-  const warnings = [];
-  const owners = /* @__PURE__ */ new Map();
-  for (const phase of phases) {
-    const normalized = phase.acceptanceCommands.map(normalizeCommand);
-    for (const command2 of normalized) owners.set(command2, [...owners.get(command2) ?? [], phase.id]);
-    if (phase.verificationKind !== "non-code" && !phase.acceptanceCommands.some(recognizedVerification)) {
-      warnings.push({
-        phaseId: phase.id,
-        code: "weak-verification-category",
-        message: `Phase ${phase.id} has no recognizable test, lint, type-check, build, or syntax verification command.`,
-        commands: phase.acceptanceCommands
-      });
-      if (contract?.critic?.blocking !== true && phase.criticBlocking !== true) {
-        warnings.push({
-          phaseId: phase.id,
-          code: "critic-recommended",
-          message: `Enable a blocking independent critic for phase ${phase.id} while deterministic acceptance evidence remains weak.`,
-          commands: phase.acceptanceCommands
-        });
-      }
-    }
-  }
-  for (const [command2, phaseIds] of owners) {
-    const unique = [...new Set(phaseIds)];
-    if (unique.length < 2) continue;
-    for (const phaseId of unique) {
-      warnings.push({
-        phaseId,
-        code: "duplicate-verification-command",
-        message: `The same acceptance command is reused by unrelated phases: ${unique.join(", ")}. Confirm that it validates each phase's deliverable.`,
-        commands: [command2]
-      });
-    }
-  }
-  return dedupeWarnings(warnings);
-}
-function recognizedVerification(command2) {
-  return VERIFICATION_CATEGORIES.some((category) => category.pattern.test(command2));
-}
-function normalizeCommand(value) {
-  return value.trim().replace(/\s+/g, " ").toLowerCase();
-}
-function dedupeWarnings(values) {
-  return [...new Map(values.map((warning) => [`${warning.phaseId}:${warning.code}:${warning.commands.join("|")}`, warning])).values()];
-}
+// src/core/checkpoint.ts
+import { createHash as createHash8 } from "node:crypto";
 
 // src/core/critic.ts
 import { spawn } from "node:child_process";
@@ -2075,236 +2020,6 @@ async function runCommand(command2, cwd, input, timeoutMs) {
 function appendBounded(current, chunk) {
   const combined = current + chunk;
   return combined.length <= MAX_OUTPUT ? combined : combined.slice(-MAX_OUTPUT);
-}
-
-// src/core/context.ts
-var DEFAULT_MAX_CHARS = 12e3;
-var ALL_SECTIONS = [
-  "header",
-  "contract",
-  "active_phase",
-  "approvals",
-  "budget",
-  "decisions",
-  "assumptions",
-  "corrections",
-  "failures",
-  "checkpoints",
-  "graph",
-  "playbook"
-];
-function compileContextEnvelope(store, options = {}) {
-  const sequence = store.latestEventSequence();
-  const since = options.sinceSequence;
-  if (since !== void 0 && since >= sequence) return { unchanged: true, sequence };
-  const snapshot = store.snapshot();
-  const active = snapshot.project.currentPhaseId ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) ?? null : null;
-  const terms = tokenize([active?.title, active?.goal, ...active?.allowedScope ?? []].filter(Boolean).join(" "));
-  const related = store.searchGraph(terms, 200);
-  const changedSections = since === void 0 ? [...ALL_SECTIONS] : changedSectionsFromEvents(store.eventsSince(since));
-  const effectiveChanged = changedSections.length === 0 ? ["header"] : changedSections;
-  const sectionValues = /* @__PURE__ */ new Map([
-    ["header", header(snapshot)],
-    ["contract", contractSection(snapshot)],
-    ["active_phase", phaseSection(snapshot)],
-    ["approvals", approvalSection(snapshot)],
-    ["budget", budgetSection(snapshot)],
-    ["decisions", decisionSection(snapshot)],
-    ["assumptions", assumptionSection(snapshot)],
-    ["corrections", correctionSection(snapshot, options.playbook ?? [])],
-    ["failures", failureSection(snapshot)],
-    ["checkpoints", checkpointSection(snapshot)],
-    ["graph", graphSummarySection(related)],
-    ["playbook", playbookSection(options.playbook ?? [])]
-  ]);
-  const rendered = effectiveChanged.map((section) => sectionValues.get(section) ?? "").filter(Boolean);
-  const unchangedSections = ALL_SECTIONS.filter((section) => !effectiveChanged.includes(section));
-  if (since !== void 0 && unchangedSections.length > 0) {
-    rendered.push(`Unchanged since sequence ${since}: ${unchangedSections.join(", ")}.`);
-  }
-  const context = fitSections(rendered, options.maxChars ?? DEFAULT_MAX_CHARS);
-  return {
-    unchanged: false,
-    sequence,
-    context,
-    changedSections: effectiveChanged,
-    unchangedSections,
-    estimatedTokens: estimateTokens(context)
-  };
-}
-function changedSectionsFromEvents(events) {
-  const sections = /* @__PURE__ */ new Set();
-  for (const event of events) {
-    const type = event.type;
-    if (/^(project_initialized|plan_saved|plan_amended)$/u.test(type)) {
-      sections.add("header");
-      sections.add("contract");
-      sections.add("active_phase");
-    }
-    if (/^(phase_|project_completion|project_completed|approval_)/u.test(type)) {
-      sections.add("header");
-      sections.add("active_phase");
-    }
-    if (/^approval_/u.test(type)) sections.add("approvals");
-    if (/^(budget_|plugin_token_)/u.test(type)) sections.add("budget");
-    if (/^decision_/u.test(type)) sections.add("decisions");
-    if (/^assumption_/u.test(type)) sections.add("assumptions");
-    if (/^correction_/u.test(type)) sections.add("corrections");
-    if (/^failure_/u.test(type)) sections.add("failures");
-    if (/^(phase_completed|phase_verification|project_completion_gate)/u.test(type)) sections.add("checkpoints");
-    if (/^(repository_indexed|phase_completed|phase_reverification)/u.test(type)) sections.add("graph");
-    if (/^playbook_/u.test(type)) sections.add("playbook");
-  }
-  return ALL_SECTIONS.filter((section) => sections.has(section));
-}
-function header(snapshot) {
-  return [
-    "# KEEP CODING ACTIVE",
-    "Use the evidence-gated workflow. Never claim completion without passing deterministic evidence.",
-    `Project root: ${snapshot.project.root}`,
-    `Project status: ${snapshot.project.status}`,
-    `Plan version: ${snapshot.project.planVersion}`
-  ].join("\n");
-}
-function contractSection(snapshot) {
-  const contract = snapshot.project.contract;
-  if (!contract) return "## Required next action\nInspect the repository, then call `save_plan`.";
-  return [
-    "## Project contract",
-    `Goal: ${contract.goal}`,
-    `Deliverables:
-${bullets(contract.deliverables)}`,
-    `Constraints:
-${bullets(contract.constraints)}`,
-    `Invariants:
-${bullets(contract.invariants)}`,
-    `Done when:
-${bullets(contract.doneWhen)}`
-  ].join("\n");
-}
-function phaseSection(snapshot) {
-  const active = snapshot.project.currentPhaseId ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) : null;
-  if (!active) return `## Phase status
-${snapshot.phases.map((phase) => `- ${phase.id}: ${phase.status}`).join("\n") || "Plan not saved."}`;
-  const ambiguity = assessAmbiguity(active.goal, snapshot.project.contract?.doneWhen ?? []);
-  const hasAssumptions = snapshot.assumptions.some((assumption) => assumption.phaseId === active.id);
-  return [
-    "## Active phase",
-    `${active.id} \u2014 ${active.title} [${active.status}]`,
-    `Goal: ${active.goal}`,
-    ambiguity.high && !hasAssumptions ? `AMBIGUITY PREFLIGHT: record_assumption before any scoped edit (${ambiguity.reasons.join("; ")}).` : "",
-    `Allowed scope:
-${bullets(active.allowedScope)}`,
-    `Acceptance commands:
-${bullets(active.acceptanceCommands)}`,
-    `Attempts: ${active.attempts}/${active.maxAttempts}`,
-    active.reverifyReason ? `Reverification reason: ${active.reverifyReason}` : "",
-    "Implement, checkpoint, repair failures, and continue without weakening gates."
-  ].filter(Boolean).join("\n");
-}
-function approvalSection(snapshot) {
-  const pending = (snapshot.approvals ?? []).filter((item) => item.status === "pending");
-  return pending.length === 0 ? "" : `## Pending human approvals
-${pending.map((item) => `- ${item.id} [${item.phaseId}]: ${item.prompt}`).join("\n")}`;
-}
-function budgetSection(snapshot) {
-  const entries = Object.entries(snapshot.budgetUsage ?? {});
-  const lines = entries.map(([scope, usage]) => {
-    const estimated = usage.estimatedTokens ? ` (${usage.estimatedTokens} estimated plugin tokens)` : "";
-    return `- ${scope}: ${usage.tokens} tokens${estimated}, $${usage.costUsd.toFixed(4)}, ${usage.wallClockMs} ms`;
-  });
-  const maximum = snapshot.project.contract?.budget?.maxTokens;
-  const projectUsage = snapshot.budgetUsage?.[`project:${snapshot.project.id}`];
-  if (maximum && projectUsage) {
-    const percentage = Math.floor(projectUsage.tokens / maximum * 100);
-    if (percentage >= 90) lines.unshift(`Budget ${percentage}% used \u2014 use delta context, minimal diffs, file digests, and avoid rereading unchanged files.`);
-    else if (percentage >= 70) lines.unshift(`Budget ${percentage}% used \u2014 prefer get_file_digest and expand_graph over broad file or graph reads.`);
-  }
-  return lines.length === 0 ? "" : `## Budget usage
-${lines.join("\n")}`;
-}
-function decisionSection(snapshot) {
-  const decisions = snapshot.decisions.filter((decision) => decision.status === "active").slice(-12);
-  return decisions.length === 0 ? "" : `## Active decisions
-${decisions.map((decision) => `- ${decision.title}: ${decision.rationale}`).join("\n")}`;
-}
-function assumptionSection(snapshot) {
-  const phaseId = snapshot.project.currentPhaseId;
-  const open = snapshot.assumptions.filter((assumption) => assumption.status === "open" && (phaseId === null || assumption.phaseId === phaseId)).sort((left, right) => left.confidence - right.confidence || left.createdAt.localeCompare(right.createdAt));
-  if (open.length === 0) return "";
-  const threshold = snapshot.project.contract?.assumptionConfidenceThreshold ?? 0.6;
-  return `## Open assumptions
-${open.map((assumption) => {
-    const line = `- ${assumption.id} [confidence ${assumption.confidence.toFixed(2)}]: ${assumption.statement}`;
-    return assumption.confidence < threshold ? `${line}
-  Confidence below ${threshold.toFixed(2)} \u2014 confirm or invalidate this assumption before checkpointing.` : line;
-  }).join("\n")}`;
-}
-function correctionSection(snapshot, patterns) {
-  const corrections = snapshot.corrections.slice(-8);
-  const antiPatterns = patterns.filter((pattern) => pattern.kind === "anti_pattern").slice(0, 3);
-  if (corrections.length === 0 && antiPatterns.length === 0) return "";
-  const lines = [
-    ...antiPatterns.map((pattern) => `- Relevant past correction: ${pattern.pattern} \u2192 ${pattern.resolution.join("; ")}`),
-    ...corrections.map((correction) => `- ${correction.id} [${correction.outcome ?? "pending"}] ${correction.rootCause}; radius=${correction.blastRadiusSize}`)
-  ];
-  return `## Known corrections
-${lines.join("\n")}`;
-}
-function failureSection(snapshot) {
-  const unresolved = snapshot.failures.filter((failure) => failure.resolution === null);
-  const failures = [...unresolved].sort((left, right) => right.count - left.count || right.lastSeenAt.localeCompare(left.lastSeenAt)).slice(0, 5);
-  if (failures.length === 0) return "";
-  const suppressed = unresolved.length - failures.length;
-  return `## Unresolved failure memory
-${failures.map((failure) => `- [${failure.phaseId}] x${failure.count} ${failure.summary}`).join("\n")}${suppressed > 0 ? `
-+${suppressed} similar failures suppressed (see get_status for the complete list).` : ""}`;
-}
-function checkpointSection(snapshot) {
-  const checkpoints = snapshot.checkpoints.slice(-5);
-  return checkpoints.length === 0 ? "" : `## Recent verified checkpoints
-${checkpoints.map((checkpoint) => `- ${checkpoint.phaseId} @ ${checkpoint.gitSha.slice(0, 12)}: ${checkpoint.summary}`).join("\n")}`;
-}
-function graphSummarySection(nodes) {
-  if (nodes.length === 0) return "";
-  const files = new Set(nodes.map((node) => node.path).filter((value) => Boolean(value)));
-  const counts = /* @__PURE__ */ new Map();
-  for (const node of nodes) counts.set(node.type, (counts.get(node.type) ?? 0) + 1);
-  const groups = [...counts.entries()].sort((left, right) => right[1] - left[1]).slice(0, 5).map(([type, count]) => `${count} ${type}`).join(", ");
-  return [
-    "## Semantic graph \u2014 Tier 0",
-    `${nodes.length} relevant nodes across ${files.size} files: ${groups}.`,
-    "Use `expand_graph` only when exact node, import, call, or reference detail is needed."
-  ].join("\n");
-}
-function playbookSection(patterns) {
-  if (patterns.length === 0) return "";
-  const phases = patterns.filter((entry) => entry.kind !== "anti_pattern");
-  if (phases.length === 0) return "";
-  return `## Relevant playbook patterns
-${phases.slice(0, 3).map((entry) => `- ${entry.pattern}: ${entry.resolution.join("; ")} [scope: ${entry.applicabilityScope.join(", ")}]`).join("\n")}`;
-}
-function fitSections(sections, maxChars) {
-  const selected = [];
-  let remaining = Math.max(1e3, maxChars);
-  for (const section of sections) {
-    if (remaining <= 0) break;
-    const chunk = section.length <= remaining ? section : `${section.slice(0, Math.max(0, remaining - 40))}
-[context truncated]`;
-    selected.push(chunk);
-    remaining -= chunk.length + 2;
-  }
-  return selected.join("\n\n");
-}
-function tokenize(value) {
-  const stop2 = /* @__PURE__ */ new Set(["the", "and", "for", "with", "from", "this", "that", "bir", "ve", "ile", "i\xE7in", "bu"]);
-  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop2.has(term)).slice(0, 20);
-}
-function estimateTokens(value) {
-  return Math.ceil(value.length / 4);
-}
-function bullets(values) {
-  return values.length === 0 ? "- None" : values.map((value) => `- ${value}`).join("\n");
 }
 
 // src/core/indexer.ts
@@ -7018,36 +6733,6 @@ function sha2562(value) {
   return createHash6("sha256").update(value).digest("hex");
 }
 
-// src/integrations/github.ts
-function generatePullRequestDescription(snapshot) {
-  const completed = snapshot.phases.filter((phase) => phase.status === "COMPLETED");
-  const decisions = snapshot.decisions.filter((decision) => decision.status === "active").slice(-12);
-  const checks = snapshot.checkpoints.flatMap((checkpoint) => [...checkpoint.verification.selectiveCommands, ...checkpoint.verification.commands]).filter((item, index, all) => all.findIndex((candidate) => candidate.command === item.command) === index);
-  return [
-    `## Goal
-
-${snapshot.project.contract?.goal ?? snapshot.project.originalPrompt}`,
-    `## Delivered phases
-
-${completed.map((phase) => `- **${phase.title}** \u2014 ${phase.summary ?? phase.goal}`).join("\n") || "- None"}`,
-    decisions.length > 0 ? `## Decisions
-
-${decisions.map((decision) => `- **${decision.title}:** ${decision.rationale}`).join("\n")}` : "",
-    `## Verification
-
-${checks.map((check) => `- \`${check.command}\` \u2014 ${check.passed ? "passed" : "failed"}`).join("\n") || "- No checkpoint commands recorded"}`,
-    `## Evidence
-
-- Plan version: ${snapshot.project.planVersion}
-- Checkpoints: ${snapshot.checkpoints.length}
-- Event sequence: ${snapshot.recentEvents.at(-1)?.sequence ?? 0}`
-  ].filter(Boolean).join("\n\n");
-}
-function generateCommitMessage(phaseId, summary) {
-  const normalized = summary.trim().replace(/\s+/g, " ").slice(0, 68);
-  return `keep-coding(${phaseId}): ${normalized}`;
-}
-
 // src/core/verifier.ts
 import { exec } from "node:child_process";
 import { promisify as promisify2 } from "node:util";
@@ -9169,6 +8854,486 @@ function skippedCritic(blocking, enabled = true) {
   return { configured: false, blocking, passed: !blocking, summary, findings: [], rawOutput: "" };
 }
 
+// src/core/checkpoint.ts
+var CheckpointPipeline = class {
+  constructor(store) {
+    this.store = store;
+  }
+  store;
+  async run(options) {
+    const phase = this.store.getPhase(options.phaseId);
+    if (!phase) throw new Error(`unknown phase: ${options.phaseId}`);
+    const project = this.store.getProject();
+    if (!project?.contract) throw new Error("project contract is missing");
+    const baseline = this.store.getPhaseBaseline(options.phaseId) ?? void 0;
+    const changedFiles = baseline ? await options.workspaceGit.changedFilesSince(baseline) : await options.workspaceGit.changedFiles();
+    this.store.autoLinkChangedFiles(options.phaseId, changedFiles);
+    await this.enforceAssumptionPolicy(options.workspaceGit, phase, project.contract, changedFiles);
+    const correction = this.store.activeCorrection(options.phaseId);
+    const correctionAllowedFiles = correction ? this.store.correctionAllowedFiles(correction.id) : void 0;
+    this.store.markVerifying(options.phaseId);
+    const verifying = this.store.getPhase(options.phaseId);
+    if (!verifying) throw new Error(`unknown phase: ${options.phaseId}`);
+    const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, options.phaseId);
+    const impactedTests2 = this.store.impactedTests(changedFiles);
+    const selectiveCommands = project.contract.selectiveTests && impactedTests2.length > 0 ? [project.contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests2.map(shellQuote).join(" "))] : [];
+    const previousFailures = [.../* @__PURE__ */ new Set([...selectiveCommands, ...verifying.acceptanceCommands])].map((command2) => this.store.latestCommandFailure(options.phaseId, command2)).filter((record2) => record2 !== null);
+    const evidence = await new PhaseVerifier().verify(options.workspaceGit, verifying, {
+      ...baseline ? { baseline } : {},
+      selectiveCommands,
+      budget: this.store.budgetEvidence(options.phaseId),
+      contract: project.contract,
+      impactedCompletedPhases,
+      previousFailures,
+      ...correctionAllowedFiles ? { correctionAllowedFiles } : {}
+    });
+    this.persistCommandFailures(options.phaseId, phase.attempts + 1, [...evidence.selectiveCommands, ...evidence.commands]);
+    recordCommandOutputUsage(this.store, options.phaseId, [...evidence.selectiveCommands, ...evidence.commands]);
+    let correctionResult = null;
+    if (correction) {
+      const assessed = this.store.assessCorrectionOutcome(
+        correction.id,
+        changedFiles,
+        this.store.totalRecordedTokens(),
+        false
+      );
+      correctionResult = assessed.correction;
+      if (assessed.unauthorizedFiles.length > 0) {
+        evidence.passed = false;
+        evidence.scopePassed = false;
+        evidence.scopeViolations = [.../* @__PURE__ */ new Set([...evidence.scopeViolations, ...assessed.unauthorizedFiles])];
+      }
+    }
+    if (evidence.passed) {
+      evidence.gitSha = await options.commitEvidence(evidence);
+      if (correction) {
+        correctionResult = this.store.assessCorrectionOutcome(
+          correction.id,
+          changedFiles,
+          this.store.totalRecordedTokens(),
+          true
+        ).correction;
+      }
+    }
+    const updated = this.store.finishVerification(options.phaseId, options.summary, evidence);
+    let reverificationRequired = [];
+    if (evidence.passed) {
+      await indexRepository(this.store, options.indexGit);
+      reverificationRequired = this.store.markReverification(
+        impactedCompletedPhases,
+        options.reverificationReason(changedFiles),
+        options.phaseId
+      );
+      this.rememberSuccessfulPhase(updated, options.indexGit.root);
+      if (correctionResult?.completedAt) this.rememberCorrection(correctionResult);
+    }
+    return {
+      phase: updated,
+      evidence,
+      correction: correctionResult,
+      reverificationRequired,
+      project: this.store.getProject(),
+      nextAction: evidence.passed ? this.store.currentPhase() ? "start_phase" : "complete_project" : "repair_phase"
+    };
+  }
+  async enforceAssumptionPolicy(git, phase, contract, changedFiles) {
+    const phaseAssumptions = this.store.listAssumptions(phase.id);
+    const ambiguity = assessAmbiguity(phase.goal, contract.doneWhen);
+    if (ambiguity.high && phaseAssumptions.length === 0) {
+      throw new Error(
+        `HIGH_AMBIGUITY_WITHOUT_ASSUMPTION: record_assumption before checkpoint: ${ambiguity.reasons.join("; ")}`
+      );
+    }
+    const threshold = contract.assumptionConfidenceThreshold ?? 0.6;
+    const unresolved = phaseAssumptions.filter(
+      (assumption) => assumption.status === "open" && assumption.confidence < threshold
+    );
+    if (unresolved.length === 0) return;
+    const critic = await new CriticRunner().review(
+      { root: git.root, phase, contract, changedFiles, diff: await git.diff() },
+      true
+    );
+    this.store.appendEvent("assumption_critic_escalated", phase.id, {
+      assumptionIds: unresolved.map((item) => item.id),
+      critic
+    });
+    const detail = unresolved.map((assumption) => `${assumption.id}: ${assumption.statement}`).join("; ");
+    throw new Error(
+      `LOW_CONFIDENCE_ASSUMPTIONS: confirm or invalidate before checkpoint: ${detail}; critic=${critic.summary}`
+    );
+  }
+  persistCommandFailures(phaseId, attempt, commands) {
+    for (const command2 of commands) {
+      if (command2.passed) continue;
+      const fingerprint = createHash8("sha256").update(`${command2.command}\0${command2.stdout}\0${command2.stderr}`).digest("hex").slice(0, 24);
+      this.store.recordCommandFailure({
+        phaseId,
+        command: command2.command,
+        attempt,
+        stdout: command2.stdout,
+        stderr: command2.stderr,
+        fingerprint,
+        createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+    }
+  }
+  rememberCorrection(correction) {
+    const project = this.store.getProject();
+    if (!project?.contract?.playbookOptIn || correction.outcome === null) return;
+    const assumption = this.store.getAssumption(correction.assumptionId);
+    if (!assumption) return;
+    const playbook = new PlaybookStore();
+    try {
+      const pattern = playbook.rememberCorrection(project.root, assumption, correction);
+      this.store.appendEvent("playbook_antipattern_recorded", correction.phaseId, {
+        correctionId: correction.id,
+        patternId: pattern.id
+      });
+    } finally {
+      playbook.close();
+    }
+  }
+  rememberSuccessfulPhase(phase, fallbackRoot) {
+    if (!this.store.getProject()?.contract?.playbookOptIn) return;
+    const playbook = new PlaybookStore();
+    try {
+      const project = this.store.getProject();
+      playbook.rememberPhase(project?.root ?? fallbackRoot, phase, [project?.contract?.goal ?? phase.goal]);
+      this.store.appendEvent("playbook_pattern_recorded", phase.id, { phaseId: phase.id });
+    } finally {
+      playbook.close();
+    }
+  }
+};
+function recordCommandOutputUsage(store, phaseId, commands) {
+  const chars = commands.reduce((sum, command2) => sum + command2.stdout.length + command2.stderr.length, 0);
+  const tokens = Math.ceil(chars / 4);
+  if (tokens <= 0) return;
+  const project = store.getProject();
+  if (!project) return;
+  const delta = { tokens, estimatedTokens: tokens };
+  store.recordBudgetUsage("project", project.id, delta, "plugin_token_command_output_estimated");
+  if (phaseId) store.recordBudgetUsage("phase", phaseId, delta, "plugin_token_command_output_estimated");
+}
+function shellQuote(value) {
+  return process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+// src/core/command-quality.ts
+var VERIFICATION_CATEGORIES = [
+  { name: "test", pattern: /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b|\b(?:pytest|vitest|jest|mocha|go\s+test|cargo\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b/iu },
+  { name: "lint", pattern: /\b(?:eslint|ruff|pylint|flake8|golangci-lint|clippy|shellcheck|stylelint|lint)\b/iu },
+  { name: "typecheck", pattern: /\b(?:tsc|mypy|pyright|typecheck|cargo\s+check|go\s+vet)\b/iu },
+  { name: "build", pattern: /(?:^|\s)(?:npm|pnpm|yarn)\s+(?:run\s+)?build\b|\b(?:cargo\s+build|go\s+build|dotnet\s+build|mvn\s+package|gradle\s+build|cmake\s+--build|make)\b/iu },
+  { name: "syntax", pattern: /\b(?:node|python|ruby)\s+--?check\b|\bgit\s+diff\s+--check\b/iu }
+];
+function lintAcceptanceCommands(phases, contract) {
+  const warnings = [];
+  const owners = /* @__PURE__ */ new Map();
+  for (const phase of phases) {
+    const normalized = phase.acceptanceCommands.map(normalizeCommand);
+    for (const command2 of normalized) owners.set(command2, [...owners.get(command2) ?? [], phase.id]);
+    if (phase.verificationKind !== "non-code" && !phase.acceptanceCommands.some(recognizedVerification)) {
+      warnings.push({
+        phaseId: phase.id,
+        code: "weak-verification-category",
+        message: `Phase ${phase.id} has no recognizable test, lint, type-check, build, or syntax verification command.`,
+        commands: phase.acceptanceCommands
+      });
+      if (contract?.critic?.blocking !== true && phase.criticBlocking !== true) {
+        warnings.push({
+          phaseId: phase.id,
+          code: "critic-recommended",
+          message: `Enable a blocking independent critic for phase ${phase.id} while deterministic acceptance evidence remains weak.`,
+          commands: phase.acceptanceCommands
+        });
+      }
+    }
+  }
+  for (const [command2, phaseIds] of owners) {
+    const unique = [...new Set(phaseIds)];
+    if (unique.length < 2) continue;
+    for (const phaseId of unique) {
+      warnings.push({
+        phaseId,
+        code: "duplicate-verification-command",
+        message: `The same acceptance command is reused by unrelated phases: ${unique.join(", ")}. Confirm that it validates each phase's deliverable.`,
+        commands: [command2]
+      });
+    }
+  }
+  return dedupeWarnings(warnings);
+}
+function recognizedVerification(command2) {
+  return VERIFICATION_CATEGORIES.some((category) => category.pattern.test(command2));
+}
+function normalizeCommand(value) {
+  return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+function dedupeWarnings(values) {
+  return [...new Map(values.map((warning) => [`${warning.phaseId}:${warning.code}:${warning.commands.join("|")}`, warning])).values()];
+}
+
+// src/core/context.ts
+var DEFAULT_MAX_CHARS = 12e3;
+var ALL_SECTIONS = [
+  "header",
+  "contract",
+  "active_phase",
+  "approvals",
+  "budget",
+  "decisions",
+  "assumptions",
+  "corrections",
+  "failures",
+  "checkpoints",
+  "graph",
+  "playbook"
+];
+function compileContextEnvelope(store, options = {}) {
+  const sequence = store.latestEventSequence();
+  const since = options.sinceSequence;
+  if (since !== void 0 && since >= sequence) return { unchanged: true, sequence };
+  const snapshot = store.snapshot();
+  const active = snapshot.project.currentPhaseId ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) ?? null : null;
+  const terms = tokenize([active?.title, active?.goal, ...active?.allowedScope ?? []].filter(Boolean).join(" "));
+  const related = store.searchGraph(terms, 200);
+  const changedSections = since === void 0 ? [...ALL_SECTIONS] : changedSectionsFromEvents(store.eventsSince(since));
+  const effectiveChanged = changedSections.length === 0 ? ["header"] : changedSections;
+  const sectionValues = /* @__PURE__ */ new Map([
+    ["header", header(snapshot)],
+    ["contract", contractSection(snapshot)],
+    ["active_phase", phaseSection(snapshot)],
+    ["approvals", approvalSection(snapshot)],
+    ["budget", budgetSection(snapshot)],
+    ["decisions", decisionSection(snapshot)],
+    ["assumptions", assumptionSection(snapshot)],
+    ["corrections", correctionSection(snapshot, options.playbook ?? [])],
+    ["failures", failureSection(snapshot)],
+    ["checkpoints", checkpointSection(snapshot)],
+    ["graph", graphSummarySection(related)],
+    ["playbook", playbookSection(options.playbook ?? [])]
+  ]);
+  const rendered = effectiveChanged.map((section) => sectionValues.get(section) ?? "").filter(Boolean);
+  const unchangedSections = ALL_SECTIONS.filter((section) => !effectiveChanged.includes(section));
+  if (since !== void 0 && unchangedSections.length > 0) {
+    rendered.push(`Unchanged since sequence ${since}: ${unchangedSections.join(", ")}.`);
+  }
+  const context = fitSections(rendered, options.maxChars ?? DEFAULT_MAX_CHARS);
+  return {
+    unchanged: false,
+    sequence,
+    context,
+    changedSections: effectiveChanged,
+    unchangedSections,
+    estimatedTokens: estimateTokens(context)
+  };
+}
+function changedSectionsFromEvents(events) {
+  const sections = /* @__PURE__ */ new Set();
+  for (const event of events) {
+    const type = event.type;
+    if (/^(project_initialized|plan_saved|plan_amended)$/u.test(type)) {
+      sections.add("header");
+      sections.add("contract");
+      sections.add("active_phase");
+    }
+    if (/^(phase_|project_completion|project_completed|approval_)/u.test(type)) {
+      sections.add("header");
+      sections.add("active_phase");
+    }
+    if (/^approval_/u.test(type)) sections.add("approvals");
+    if (/^(budget_|plugin_token_)/u.test(type)) sections.add("budget");
+    if (/^decision_/u.test(type)) sections.add("decisions");
+    if (/^assumption_/u.test(type)) sections.add("assumptions");
+    if (/^correction_/u.test(type)) sections.add("corrections");
+    if (/^failure_/u.test(type)) sections.add("failures");
+    if (/^(phase_completed|phase_verification|project_completion_gate)/u.test(type)) sections.add("checkpoints");
+    if (/^(repository_indexed|phase_completed|phase_reverification)/u.test(type)) sections.add("graph");
+    if (/^playbook_/u.test(type)) sections.add("playbook");
+  }
+  return ALL_SECTIONS.filter((section) => sections.has(section));
+}
+function header(snapshot) {
+  return [
+    "# KEEP CODING ACTIVE",
+    "Use the evidence-gated workflow. Never claim completion without passing deterministic evidence.",
+    `Project root: ${snapshot.project.root}`,
+    `Project status: ${snapshot.project.status}`,
+    `Plan version: ${snapshot.project.planVersion}`
+  ].join("\n");
+}
+function contractSection(snapshot) {
+  const contract = snapshot.project.contract;
+  if (!contract) return "## Required next action\nInspect the repository, then call `save_plan`.";
+  return [
+    "## Project contract",
+    `Goal: ${contract.goal}`,
+    `Deliverables:
+${bullets(contract.deliverables)}`,
+    `Constraints:
+${bullets(contract.constraints)}`,
+    `Invariants:
+${bullets(contract.invariants)}`,
+    `Done when:
+${bullets(contract.doneWhen)}`
+  ].join("\n");
+}
+function phaseSection(snapshot) {
+  const active = snapshot.project.currentPhaseId ? snapshot.phases.find((phase) => phase.id === snapshot.project.currentPhaseId) : null;
+  if (!active) return `## Phase status
+${snapshot.phases.map((phase) => `- ${phase.id}: ${phase.status}`).join("\n") || "Plan not saved."}`;
+  const ambiguity = assessAmbiguity(active.goal, snapshot.project.contract?.doneWhen ?? []);
+  const hasAssumptions = snapshot.assumptions.some((assumption) => assumption.phaseId === active.id);
+  return [
+    "## Active phase",
+    `${active.id} \u2014 ${active.title} [${active.status}]`,
+    `Goal: ${active.goal}`,
+    ambiguity.high && !hasAssumptions ? `AMBIGUITY PREFLIGHT: record_assumption before any scoped edit (${ambiguity.reasons.join("; ")}).` : "",
+    `Allowed scope:
+${bullets(active.allowedScope)}`,
+    `Acceptance commands:
+${bullets(active.acceptanceCommands)}`,
+    `Attempts: ${active.attempts}/${active.maxAttempts}`,
+    active.reverifyReason ? `Reverification reason: ${active.reverifyReason}` : "",
+    "Implement, checkpoint, repair failures, and continue without weakening gates."
+  ].filter(Boolean).join("\n");
+}
+function approvalSection(snapshot) {
+  const pending = (snapshot.approvals ?? []).filter((item) => item.status === "pending");
+  return pending.length === 0 ? "" : `## Pending human approvals
+${pending.map((item) => `- ${item.id} [${item.phaseId}]: ${item.prompt}`).join("\n")}`;
+}
+function budgetSection(snapshot) {
+  const entries = Object.entries(snapshot.budgetUsage ?? {});
+  const lines = entries.map(([scope, usage]) => {
+    const estimated = usage.estimatedTokens ? ` (${usage.estimatedTokens} estimated plugin tokens)` : "";
+    return `- ${scope}: ${usage.tokens} tokens${estimated}, $${usage.costUsd.toFixed(4)}, ${usage.wallClockMs} ms`;
+  });
+  const maximum = snapshot.project.contract?.budget?.maxTokens;
+  const projectUsage = snapshot.budgetUsage?.[`project:${snapshot.project.id}`];
+  if (maximum && projectUsage) {
+    const percentage = Math.floor(projectUsage.tokens / maximum * 100);
+    if (percentage >= 90) lines.unshift(`Budget ${percentage}% used \u2014 use delta context, minimal diffs, file digests, and avoid rereading unchanged files.`);
+    else if (percentage >= 70) lines.unshift(`Budget ${percentage}% used \u2014 prefer get_file_digest and expand_graph over broad file or graph reads.`);
+  }
+  return lines.length === 0 ? "" : `## Budget usage
+${lines.join("\n")}`;
+}
+function decisionSection(snapshot) {
+  const decisions = snapshot.decisions.filter((decision) => decision.status === "active").slice(-12);
+  return decisions.length === 0 ? "" : `## Active decisions
+${decisions.map((decision) => `- ${decision.title}: ${decision.rationale}`).join("\n")}`;
+}
+function assumptionSection(snapshot) {
+  const phaseId = snapshot.project.currentPhaseId;
+  const open = snapshot.assumptions.filter((assumption) => assumption.status === "open" && (phaseId === null || assumption.phaseId === phaseId)).sort((left, right) => left.confidence - right.confidence || left.createdAt.localeCompare(right.createdAt));
+  if (open.length === 0) return "";
+  const threshold = snapshot.project.contract?.assumptionConfidenceThreshold ?? 0.6;
+  return `## Open assumptions
+${open.map((assumption) => {
+    const line = `- ${assumption.id} [confidence ${assumption.confidence.toFixed(2)}]: ${assumption.statement}`;
+    return assumption.confidence < threshold ? `${line}
+  Confidence below ${threshold.toFixed(2)} \u2014 confirm or invalidate this assumption before checkpointing.` : line;
+  }).join("\n")}`;
+}
+function correctionSection(snapshot, patterns) {
+  const corrections = snapshot.corrections.slice(-8);
+  const antiPatterns = patterns.filter((pattern) => pattern.kind === "anti_pattern").slice(0, 3);
+  if (corrections.length === 0 && antiPatterns.length === 0) return "";
+  const lines = [
+    ...antiPatterns.map((pattern) => `- Relevant past correction: ${pattern.pattern} \u2192 ${pattern.resolution.join("; ")}`),
+    ...corrections.map((correction) => `- ${correction.id} [${correction.outcome ?? "pending"}] ${correction.rootCause}; radius=${correction.blastRadiusSize}`)
+  ];
+  return `## Known corrections
+${lines.join("\n")}`;
+}
+function failureSection(snapshot) {
+  const unresolved = snapshot.failures.filter((failure) => failure.resolution === null);
+  const failures = [...unresolved].sort((left, right) => right.count - left.count || right.lastSeenAt.localeCompare(left.lastSeenAt)).slice(0, 5);
+  if (failures.length === 0) return "";
+  const suppressed = unresolved.length - failures.length;
+  return `## Unresolved failure memory
+${failures.map((failure) => `- [${failure.phaseId}] x${failure.count} ${failure.summary}`).join("\n")}${suppressed > 0 ? `
++${suppressed} similar failures suppressed (see get_status for the complete list).` : ""}`;
+}
+function checkpointSection(snapshot) {
+  const checkpoints = snapshot.checkpoints.slice(-5);
+  return checkpoints.length === 0 ? "" : `## Recent verified checkpoints
+${checkpoints.map((checkpoint) => `- ${checkpoint.phaseId} @ ${checkpoint.gitSha.slice(0, 12)}: ${checkpoint.summary}`).join("\n")}`;
+}
+function graphSummarySection(nodes) {
+  if (nodes.length === 0) return "";
+  const files = new Set(nodes.map((node) => node.path).filter((value) => Boolean(value)));
+  const counts = /* @__PURE__ */ new Map();
+  for (const node of nodes) counts.set(node.type, (counts.get(node.type) ?? 0) + 1);
+  const groups = [...counts.entries()].sort((left, right) => right[1] - left[1]).slice(0, 5).map(([type, count]) => `${count} ${type}`).join(", ");
+  return [
+    "## Semantic graph \u2014 Tier 0",
+    `${nodes.length} relevant nodes across ${files.size} files: ${groups}.`,
+    "Use `expand_graph` only when exact node, import, call, or reference detail is needed."
+  ].join("\n");
+}
+function playbookSection(patterns) {
+  if (patterns.length === 0) return "";
+  const phases = patterns.filter((entry) => entry.kind !== "anti_pattern");
+  if (phases.length === 0) return "";
+  return `## Relevant playbook patterns
+${phases.slice(0, 3).map((entry) => `- ${entry.pattern}: ${entry.resolution.join("; ")} [scope: ${entry.applicabilityScope.join(", ")}]`).join("\n")}`;
+}
+function fitSections(sections, maxChars) {
+  const selected = [];
+  let remaining = Math.max(1e3, maxChars);
+  for (const section of sections) {
+    if (remaining <= 0) break;
+    const chunk = section.length <= remaining ? section : `${section.slice(0, Math.max(0, remaining - 40))}
+[context truncated]`;
+    selected.push(chunk);
+    remaining -= chunk.length + 2;
+  }
+  return selected.join("\n\n");
+}
+function tokenize(value) {
+  const stop2 = /* @__PURE__ */ new Set(["the", "and", "for", "with", "from", "this", "that", "bir", "ve", "ile", "i\xE7in", "bu"]);
+  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}_-]{3,}/gu) ?? [])].filter((term) => !stop2.has(term)).slice(0, 20);
+}
+function estimateTokens(value) {
+  return Math.ceil(value.length / 4);
+}
+function bullets(values) {
+  return values.length === 0 ? "- None" : values.map((value) => `- ${value}`).join("\n");
+}
+
+// src/integrations/github.ts
+function generatePullRequestDescription(snapshot) {
+  const completed = snapshot.phases.filter((phase) => phase.status === "COMPLETED");
+  const decisions = snapshot.decisions.filter((decision) => decision.status === "active").slice(-12);
+  const checks = snapshot.checkpoints.flatMap((checkpoint) => [...checkpoint.verification.selectiveCommands, ...checkpoint.verification.commands]).filter((item, index, all) => all.findIndex((candidate) => candidate.command === item.command) === index);
+  return [
+    `## Goal
+
+${snapshot.project.contract?.goal ?? snapshot.project.originalPrompt}`,
+    `## Delivered phases
+
+${completed.map((phase) => `- **${phase.title}** \u2014 ${phase.summary ?? phase.goal}`).join("\n") || "- None"}`,
+    decisions.length > 0 ? `## Decisions
+
+${decisions.map((decision) => `- **${decision.title}:** ${decision.rationale}`).join("\n")}` : "",
+    `## Verification
+
+${checks.map((check) => `- \`${check.command}\` \u2014 ${check.passed ? "passed" : "failed"}`).join("\n") || "- No checkpoint commands recorded"}`,
+    `## Evidence
+
+- Plan version: ${snapshot.project.planVersion}
+- Checkpoints: ${snapshot.checkpoints.length}
+- Event sequence: ${snapshot.recentEvents.at(-1)?.sequence ?? 0}`
+  ].filter(Boolean).join("\n\n");
+}
+function generateCommitMessage(phaseId, summary) {
+  const normalized = summary.trim().replace(/\s+/g, " ").slice(0, 68);
+  return `keep-coding(${phaseId}): ${normalized}`;
+}
+
 // src/core/orchestrator.ts
 var ParallelOrchestrator = class {
   constructor(git, store) {
@@ -9224,48 +9389,29 @@ var ParallelOrchestrator = class {
   async checkpoint(phaseId, summary) {
     const record2 = this.store.getWorktree(phaseId);
     if (!record2 || record2.status !== "active") throw new Error(`active worktree not found for phase ${phaseId}`);
-    const phase = this.store.getPhase(phaseId);
-    if (!phase) throw new Error(`unknown phase: ${phaseId}`);
-    const contract = this.store.getProject()?.contract ?? {
-      goal: phase.goal,
-      nonGoals: [],
-      constraints: [],
-      deliverables: [phase.goal],
-      invariants: [],
-      doneWhen: phase.acceptanceCommands
-    };
     const isolated = await GitRepository.open(record2.path);
-    const baseline = this.store.getPhaseBaseline(phaseId);
-    const changedFiles = baseline ? await isolated.changedFilesSince(baseline) : await isolated.changedFiles();
-    const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
-    const impactedTests2 = this.store.impactedTests(changedFiles);
-    const selectiveCommands = contract.selectiveTests && impactedTests2.length > 0 ? [contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests2.map(shellQuote).join(" "))] : [];
-    this.store.markVerifying(phaseId);
-    const evidence = await new PhaseVerifier().verify(isolated, { ...phase, status: "VERIFYING" }, {
-      ...baseline ? { baseline } : {},
-      selectiveCommands,
-      budget: this.store.budgetEvidence(phaseId),
-      contract,
-      impactedCompletedPhases
+    const result = await new CheckpointPipeline(this.store).run({
+      phaseId,
+      summary,
+      workspaceGit: isolated,
+      indexGit: this.git,
+      commitEvidence: async (evidence) => {
+        await isolated.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
+        return this.git.mergeWorktree(record2.branch);
+      },
+      reverificationReason: (changedFiles) => `Files affected by parallel phase ${phaseId}: ${changedFiles.join(", ")}`
     });
-    if (!evidence.passed) {
-      this.store.finishVerification(phaseId, summary, evidence);
+    if (!result.evidence.passed) {
       this.store.setWorktree({ ...record2, status: "failed" });
       throw new Error(`parallel phase ${phaseId} failed verification`);
     }
-    const commitSha = await isolated.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
-    const mergeSha = await this.git.mergeWorktree(record2.branch);
-    evidence.gitSha = mergeSha;
-    this.store.finishVerification(phaseId, summary, evidence);
-    await indexRepository(this.store, this.git);
-    const reverificationRequired = this.store.markReverification(
-      impactedCompletedPhases,
-      `Files affected by parallel phase ${phaseId}: ${changedFiles.join(", ")}`,
-      phaseId
-    );
     this.store.setWorktree({ ...record2, status: "merged" });
     await this.git.removeWorktree(record2.path, record2.branch);
-    return { evidence, mergeSha: commitSha === mergeSha ? commitSha : mergeSha, reverificationRequired };
+    return {
+      evidence: result.evidence,
+      mergeSha: result.evidence.gitSha,
+      reverificationRequired: result.reverificationRequired
+    };
   }
 };
 function scopesIndependent(left, right) {
@@ -9281,9 +9427,6 @@ function scopePrefix(scope) {
   const wildcard = withoutNegation.search(/[*?{[]/);
   const prefix = wildcard >= 0 ? withoutNegation.slice(0, wildcard) : withoutNegation;
   return prefix.replace(/\/+$/, "");
-}
-function shellQuote(value) {
-  return process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 // src/core/workspace.ts
@@ -9548,80 +9691,17 @@ var KeepCodingService = class _KeepCodingService {
     if (project.currentPhaseId) this.store.recordBudgetUsage("phase", project.currentPhaseId, { tokens: Math.ceil(tokens) }, "budget_host_tokens_recorded");
   }
   async checkpoint(phaseId, summary) {
-    const phase = this.store.getPhase(phaseId);
-    if (!phase) throw new Error(`unknown phase: ${phaseId}`);
-    const project = this.store.getProject();
-    if (!project?.contract) throw new Error("project contract is missing");
-    const baseline = this.store.getPhaseBaseline(phaseId) ?? void 0;
-    const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
-    this.store.autoLinkChangedFiles(phaseId, changedFiles);
-    const phaseAssumptions = this.store.listAssumptions(phaseId);
-    const ambiguity = assessAmbiguity(phase.goal, project.contract.doneWhen);
-    if (ambiguity.high && phaseAssumptions.length === 0) {
-      throw new Error(`HIGH_AMBIGUITY_WITHOUT_ASSUMPTION: record_assumption before checkpoint: ${ambiguity.reasons.join("; ")}`);
-    }
-    const threshold = project.contract.assumptionConfidenceThreshold ?? 0.6;
-    const unresolved = phaseAssumptions.filter((assumption) => assumption.status === "open" && assumption.confidence < threshold);
-    if (unresolved.length > 0) {
-      const critic = await new CriticRunner().review({ root: this.git.root, phase, contract: project.contract, changedFiles, diff: await this.git.diff() }, true);
-      this.store.appendEvent("assumption_critic_escalated", phaseId, { assumptionIds: unresolved.map((item) => item.id), critic });
-      const detail = unresolved.map((assumption) => `${assumption.id}: ${assumption.statement}`).join("; ");
-      throw new Error(`LOW_CONFIDENCE_ASSUMPTIONS: confirm or invalidate before checkpoint: ${detail}; critic=${critic.summary}`);
-    }
-    const correction = this.store.activeCorrection(phaseId);
-    const correctionAllowedFiles = correction ? this.store.correctionAllowedFiles(correction.id) : void 0;
-    this.store.markVerifying(phaseId);
-    const verifying = this.store.getPhase(phaseId);
-    if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
-    const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
-    const impactedTests2 = this.store.impactedTests(changedFiles);
-    const selectiveCommands = project.contract.selectiveTests && impactedTests2.length > 0 ? [project.contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests2.map(shellQuote2).join(" "))] : [];
-    const previousFailures = [.../* @__PURE__ */ new Set([...selectiveCommands, ...verifying.acceptanceCommands])].map((command2) => this.store.latestCommandFailure(phaseId, command2)).filter((record2) => record2 !== null);
-    const evidence = await new PhaseVerifier().verify(this.git, verifying, {
-      ...baseline ? { baseline } : {},
-      selectiveCommands,
-      budget: this.store.budgetEvidence(phaseId),
-      contract: project.contract,
-      impactedCompletedPhases,
-      previousFailures,
-      ...correctionAllowedFiles ? { correctionAllowedFiles } : {}
+    return new CheckpointPipeline(this.store).run({
+      phaseId,
+      summary,
+      workspaceGit: this.git,
+      indexGit: this.git,
+      commitEvidence: (evidence) => this.git.commitFiles(
+        evidence.changedFiles,
+        generateCommitMessage(phaseId, summary)
+      ),
+      reverificationReason: (changedFiles) => `Files affected by ${phaseId}: ${changedFiles.join(", ")}`
     });
-    this.persistCommandFailures(phaseId, phase.attempts + 1, [...evidence.selectiveCommands, ...evidence.commands]);
-    this.recordCommandOutputUsage(phaseId, [...evidence.selectiveCommands, ...evidence.commands]);
-    let correctionResult = null;
-    if (correction) {
-      const assessed = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), false);
-      correctionResult = assessed.correction;
-      if (assessed.unauthorizedFiles.length > 0) {
-        evidence.passed = false;
-        evidence.scopePassed = false;
-        evidence.scopeViolations = [.../* @__PURE__ */ new Set([...evidence.scopeViolations, ...assessed.unauthorizedFiles])];
-      }
-    }
-    if (evidence.passed) {
-      evidence.gitSha = await this.git.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
-      if (correction) correctionResult = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), true).correction;
-    }
-    const updated = this.store.finishVerification(phaseId, summary, evidence);
-    let reverificationRequired = [];
-    if (evidence.passed) {
-      await indexRepository(this.store, this.git);
-      reverificationRequired = this.store.markReverification(
-        impactedCompletedPhases,
-        `Files affected by ${phaseId}: ${changedFiles.join(", ")}`,
-        phaseId
-      );
-      this.rememberSuccessfulPhase(updated);
-      if (correctionResult?.completedAt) this.rememberCorrection(correctionResult);
-    }
-    return {
-      phase: updated,
-      evidence,
-      correction: correctionResult,
-      reverificationRequired,
-      project: this.store.getProject(),
-      nextAction: evidence.passed ? this.store.currentPhase() ? "start_phase" : "complete_project" : "repair_phase"
-    };
   }
   async restorePhaseBaseline(phaseId) {
     const baseline = this.store.getPhaseBaseline(phaseId);
@@ -9636,7 +9716,7 @@ var KeepCodingService = class _KeepCodingService {
     if (!project?.contract) throw new Error("project contract is missing");
     const fullSuite = project.contract.selectiveTests?.fullSuiteCommands ?? [];
     const commands = await new PhaseVerifier().runCommands(fullSuite, this.git.root);
-    this.recordCommandOutputUsage(project.currentPhaseId, commands);
+    recordCommandOutputUsage(this.store, project.currentPhaseId, commands);
     if (commands.length !== fullSuite.length || commands.some((command2) => !command2.passed)) {
       this.store.appendEvent("project_completion_gate_failed", null, { commands });
       throw new Error("full-suite project completion gate failed");
@@ -9699,51 +9779,7 @@ var KeepCodingService = class _KeepCodingService {
     this.store.recordBudgetUsage("project", project.id, delta, "plugin_token_context_estimated");
     if (project.currentPhaseId) this.store.recordBudgetUsage("phase", project.currentPhaseId, delta, "plugin_token_context_estimated");
   }
-  recordCommandOutputUsage(phaseId, commands) {
-    const chars = commands.reduce((sum, command2) => sum + command2.stdout.length + command2.stderr.length, 0);
-    const tokens = Math.ceil(chars / 4);
-    if (tokens <= 0) return;
-    const project = this.store.getProject();
-    if (!project) return;
-    const delta = { tokens, estimatedTokens: tokens };
-    this.store.recordBudgetUsage("project", project.id, delta, "plugin_token_command_output_estimated");
-    if (phaseId) this.store.recordBudgetUsage("phase", phaseId, delta, "plugin_token_command_output_estimated");
-  }
-  persistCommandFailures(phaseId, attempt, commands) {
-    for (const command2 of commands) {
-      if (command2.passed) continue;
-      const fingerprint = createHash8("sha256").update(`${command2.command}\0${command2.stdout}\0${command2.stderr}`).digest("hex").slice(0, 24);
-      this.store.recordCommandFailure({ phaseId, command: command2.command, attempt, stdout: command2.stdout, stderr: command2.stderr, fingerprint, createdAt: (/* @__PURE__ */ new Date()).toISOString() });
-    }
-  }
-  rememberCorrection(correction) {
-    const project = this.store.getProject();
-    if (!project?.contract?.playbookOptIn || correction.outcome === null) return;
-    const assumption = this.store.getAssumption(correction.assumptionId);
-    if (!assumption) return;
-    const playbook = new PlaybookStore();
-    try {
-      const pattern = playbook.rememberCorrection(project.root, assumption, correction);
-      this.store.appendEvent("playbook_antipattern_recorded", correction.phaseId, { correctionId: correction.id, patternId: pattern.id });
-    } finally {
-      playbook.close();
-    }
-  }
-  rememberSuccessfulPhase(phase) {
-    if (!this.store.getProject()?.contract?.playbookOptIn) return;
-    const playbook = new PlaybookStore();
-    try {
-      const project = this.store.getProject();
-      playbook.rememberPhase(project?.root ?? this.git.root, phase, [project?.contract?.goal ?? phase.goal]);
-      this.store.appendEvent("playbook_pattern_recorded", phase.id, { phaseId: phase.id });
-    } finally {
-      playbook.close();
-    }
-  }
 };
-function shellQuote2(value) {
-  return process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : `'${value.replaceAll("'", "'\\''")}'`;
-}
 
 // src/hooks/handler.ts
 var CONTEXT_EVENTS = /* @__PURE__ */ new Set(["SessionStart", "UserPromptSubmit", "PreCompact", "PostCompact"]);
