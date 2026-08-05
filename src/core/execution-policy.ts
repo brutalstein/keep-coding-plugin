@@ -29,7 +29,7 @@ export interface ExecutionPolicyDocument {
 }
 
 export interface ResolvedExecutionPolicy {
-  source: "builtin" | string;
+  source: string;
   hash: string;
   allowedExecutables: string[];
   allowedEnvironment: string[];
@@ -89,7 +89,10 @@ export async function loadExecutionPolicy(
   try {
     parsed = JSON.parse(await readFile(canonicalPolicy, "utf8"));
   } catch (error) {
-    throw new Error(`EXECUTION_POLICY_PARSE_FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(
+      `EXECUTION_POLICY_PARSE_FAILED: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error }
+    );
   }
   return resolvePolicy(validatePolicyDocument(parsed), canonicalPolicy);
 }
@@ -170,12 +173,7 @@ function validatePolicyDocument(value: unknown): ExecutionPolicyDocument {
   const projectWrites = enumValue(value.projectWrites, ["phase", "deny"] as const, "projectWrites", "phase");
   const requiredCapabilities = value.requiredCapabilities === undefined
     ? undefined
-    : stringArray(value.requiredCapabilities, "requiredCapabilities", false).map((item) => {
-        if (!CAPABILITIES.has(item as ExecutionCapability)) {
-          throw new Error(`EXECUTION_POLICY_SCHEMA: unknown required capability ${item}`);
-        }
-        return item as ExecutionCapability;
-      });
+    : stringArray(value.requiredCapabilities, "requiredCapabilities", false).map(executionCapability);
   const maxTimeoutMs = optionalPositiveInteger(value.maxTimeoutMs, "maxTimeoutMs");
   const maxOutputBytes = optionalPositiveInteger(value.maxOutputBytes, "maxOutputBytes");
   return {
@@ -192,7 +190,7 @@ function validatePolicyDocument(value: unknown): ExecutionPolicyDocument {
   };
 }
 
-function resolvePolicy(document: ExecutionPolicyDocument, source: "builtin" | string): ResolvedExecutionPolicy {
+function resolvePolicy(document: ExecutionPolicyDocument, source: string): ResolvedExecutionPolicy {
   const resolved = {
     source,
     allowedExecutables: [...new Set(document.allowedExecutables.map((entry) => entry.trim()))],
@@ -218,7 +216,9 @@ function isInside(root: string, candidate: string): boolean {
 
 function normalizeExecutable(value: string): string {
   const normalized = value.replaceAll("\\", "/");
-  return process.platform === "win32" ? normalized.toLowerCase().replace(/\.(?:exe|cmd|bat)$/u, "") : normalized;
+  return process.platform === "win32"
+    ? normalized.toLowerCase().replace(/\.(?:exe|cmd|bat)$/u, "")
+    : normalized;
 }
 
 function stringArray(value: unknown, field: string, requireOne: boolean): string[] {
@@ -226,14 +226,20 @@ function stringArray(value: unknown, field: string, requireOne: boolean): string
     throw new Error(`EXECUTION_POLICY_SCHEMA: ${field} must be an array of non-empty trimmed strings`);
   }
   if (requireOne && value.length === 0) throw new Error(`EXECUTION_POLICY_SCHEMA: ${field} must not be empty`);
-  return value as string[];
+  return value.map((entry) => String(entry));
 }
 
 function stringRecord(value: unknown, field: string): Record<string, string> {
   if (!isRecord(value) || Object.entries(value).some(([key, entry]) => key.trim() === "" || typeof entry !== "string")) {
     throw new Error(`EXECUTION_POLICY_SCHEMA: ${field} must map non-empty names to string values`);
   }
-  return value as Record<string, string>;
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, String(entry)]));
+}
+
+function executionCapability(value: string): ExecutionCapability {
+  const match = [...CAPABILITIES].find((capability) => capability === value);
+  if (!match) throw new Error(`EXECUTION_POLICY_SCHEMA: unknown required capability ${value}`);
+  return match;
 }
 
 function optionalPositiveInteger(value: unknown, field: string): number | undefined {
@@ -251,10 +257,9 @@ function enumValue<const Values extends readonly string[]>(
   fallback: Values[number]
 ): Values[number] {
   if (value === undefined) return fallback;
-  if (typeof value !== "string" || !values.includes(value)) {
-    throw new Error(`EXECUTION_POLICY_SCHEMA: ${field} must be one of ${values.join(", ")}`);
-  }
-  return value as Values[number];
+  const match = values.find((candidate) => candidate === value);
+  if (!match) throw new Error(`EXECUTION_POLICY_SCHEMA: ${field} must be one of ${values.join(", ")}`);
+  return match;
 }
 
 function stableJson(value: unknown): string {
