@@ -39,12 +39,10 @@ describe("command output telemetry fallback", () => {
     try {
       const project = instance.store.initialize("Measure standalone verifier output");
       recordCommandOutputUsage(instance.store, null, [{ stdout: "12345678", stderr: "" }]);
-      expect(instance.store.listBudgetUsage()).toEqual({
-        [`project:${project.id}`]: expect.objectContaining({
-          tokens: 2,
-          estimatedTokens: 2
-        })
-      });
+      const usage = instance.store.listBudgetUsage();
+      expect(Object.keys(usage)).toEqual([`project:${project.id}`]);
+      expect(usage[`project:${project.id}`]?.tokens).toBe(2);
+      expect(usage[`project:${project.id}`]?.estimatedTokens).toBe(2);
     } finally {
       instance.close();
     }
