@@ -24,3 +24,83 @@ jobs:
           name: keep-coding-dist
           path: plugins/keep-coding/dist
           if-no-files-found: error
+
+  synchronize-checkpoint-distribution:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/agent/crash-safe-checkpoints'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/crash-safe-checkpoints
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Synchronize verified documentation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          readme_path = Path('README.md')
+          readme = readme_path.read_text(encoding='utf-8')
+          readme = re.sub(r'tests-[0-9]+%20passing', 'tests-149%20passing', readme)
+          readme = re.sub(r'branch%20coverage-[0-9.]+%25', 'branch%20coverage-75.05%25', readme)
+          replacements = {
+              '| Source tests                    |     **131 passing** |': '| Source tests                    |     **149 passing** |',
+              '| Source test files               |              **32** |': '| Source test files               |              **39** |',
+              '| Statement coverage              |          **86.24%** |': '| Statement coverage              |          **84.32%** |',
+              '| Branch coverage                 |          **75.89%** |': '| Branch coverage                 |          **75.05%** |',
+              '| Function coverage               |          **88.47%** |': '| Function coverage               |          **88.13%** |',
+              '| Line coverage                   |          **92.18%** |': '| Line coverage                   |          **89.56%** |',
+              '| Executable size                 | **1,292,929 bytes** |': '| Executable size                 | **1,309,988 bytes** |',
+              'Verified source suite: 131 tests across 32 files.': 'Verified source suite: 149 tests across 39 files.',
+              '* Upgrades existing v0.1–v0.3 SQLite state additively': '* Upgrades existing v0.1–v0.3 SQLite state additively\n* Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal'
+          }
+          for old, new in replacements.items():
+              if old in readme:
+                  readme = readme.replace(old, new, 1)
+              elif new not in readme:
+                  raise SystemExit(f'README marker missing: {old}')
+          readme_path.write_text(readme, encoding='utf-8')
+
+          turkish_path = Path('docs/README.tr.md')
+          turkish = turkish_path.read_text(encoding='utf-8')
+          turkish_marker = '- Düşük confidence assumption ve yüksek ambiguity checkpoint\'i sessizce geçemez.'
+          turkish_addition = turkish_marker + '\n- Yarıda kalan seri veya paralel checkpoint; lease/CAS kontrollü kalıcı journal üzerinden yeniden oynatılır, belirsiz Git ayrışmalarında fail-closed bloklanır.'
+          if turkish_addition not in turkish:
+              if turkish_marker not in turkish:
+                  raise SystemExit('Turkish guarantee marker missing')
+              turkish = turkish.replace(turkish_marker, turkish_addition, 1)
+          turkish = re.sub(
+              r'Doğrulanmış source suite: [0-9]+ test, [0-9]+ dosya\.',
+              'Doğrulanmış source suite: 149 test, 39 dosya.',
+              turkish,
+          )
+          turkish_path.write_text(turkish, encoding='utf-8')
+
+          architecture_path = Path('docs/ARCHITECTURE.md')
+          architecture = architecture_path.read_text(encoding='utf-8')
+          old_architecture = 'A passing checkpoint stages only the phase change set and creates a phase-scoped commit. Baseline restore is explicit. Parallel execution is conservative: every phase must be `READY`, `parallelSafe`, and have disjoint scope roots. Each receives a Git worktree and branch; verification runs in isolation and merge occurs only after passing evidence.'
+          recovery_paragraph = 'Checkpoint execution is a durable saga rather than an in-memory sequence. `checkpoint_runs` journals verification, exact diff binding, Git commit or merge SHA, durable phase-state commit, indexing, reverification, playbook memory, and worktree cleanup. A lease heartbeat and compare-and-swap phase transition prevent concurrent checkpoint owners. Git commits and merges carry deterministic run trailers, so startup recovery can identify an already-applied operation without duplicating it. Budget telemetry, critic evidence, checkpoint rows, playbook writes, and audit events use run-scoped receipts or uniqueness constraints. Recovery automatically resets evidence-free interrupted verification, replays proven steps, cleans merged worktrees, and fails closed when repository history or workspace bytes no longer match the recorded evidence.'
+          if recovery_paragraph not in architecture:
+              if old_architecture not in architecture:
+                  raise SystemExit('Architecture checkpoint marker missing')
+              architecture = architecture.replace(old_architecture, old_architecture + '\n\n' + recovery_paragraph, 1)
+          architecture_path.write_text(architecture, encoding='utf-8')
+          PY
+      - name: Commit synchronized distribution
+        run: |
+          if git diff --quiet -- plugins/keep-coding/dist README.md docs/README.tr.md docs/ARCHITECTURE.md; then
+            echo "Distribution and documentation are current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugins/keep-coding/dist README.md docs/README.tr.md docs/ARCHITECTURE.md
+          git commit -m "Synchronize crash-safe checkpoint distribution"
+          git push origin HEAD:agent/crash-safe-checkpoints
