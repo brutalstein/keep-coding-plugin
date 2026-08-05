@@ -1,6 +1,5 @@
 import type { PhaseRecord, VerificationEvidence } from "../domain/model.js";
 import type { PlatformStore } from "../storage/platform-store.js";
-import { generateCommitMessage } from "../integrations/github.js";
 import { CheckpointPipeline } from "./checkpoint.js";
 import { GitRepository } from "./git.js";
 
@@ -60,23 +59,14 @@ export class ParallelOrchestrator {
     const result = await new CheckpointPipeline(this.store).run({
       phaseId,
       summary,
+      executionMode: "parallel",
       workspaceGit: isolated,
       indexGit: this.git,
-      commitEvidence: async (evidence) => {
-        await isolated.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
-        return this.git.mergeWorktree(record.branch);
-      },
       reverificationReason: (changedFiles) =>
         `Files affected by parallel phase ${phaseId}: ${changedFiles.join(", ")}`
     });
 
-    if (!result.evidence.passed) {
-      this.store.setWorktree({ ...record, status: "failed" });
-      throw new Error(`parallel phase ${phaseId} failed verification`);
-    }
-
-    this.store.setWorktree({ ...record, status: "merged" });
-    await this.git.removeWorktree(record.path, record.branch);
+    if (!result.evidence.passed) throw new Error(`parallel phase ${phaseId} failed verification`);
     return {
       evidence: result.evidence,
       mergeSha: result.evidence.gitSha,
