@@ -161,7 +161,9 @@ describe("crash-safe serial checkpoints", () => {
 
   it("applies playbook memory exactly once across the external-database crash window", async () => {
     const root = repository();
-    const playbookPath = path.join(root, "playbook", "patterns.db");
+    const playbookRoot = mkdtempSync(path.join(tmpdir(), "keep-coding-playbook-recovery-"));
+    roots.push(playbookRoot);
+    const playbookPath = path.join(playbookRoot, "patterns.db");
     process.env.KEEP_CODING_PLAYBOOK_PATH = playbookPath;
     let service = await active(root, true);
     await expect(run(service, crashing(service, "after_memory_write")))
