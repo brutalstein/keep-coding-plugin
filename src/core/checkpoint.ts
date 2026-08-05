@@ -427,7 +427,7 @@ export class CheckpointPipeline {
     if (!run.memoryCompletedAt) {
       const memory = this.rememberCheckpoint(run, git.root);
       await this.fault("after_memory_write", run.id);
-      for (const event of memory.events) this.store.appendEvent(event.type, event.phaseId, event.payload);
+      this.appendMemoryEventsOnce(run.id, memory.events);
       this.store.markCheckpointMemoryCompleted(run.id, owner, LEASE_DURATION_MS);
       await this.fault("after_memory", run.id);
     }
@@ -485,6 +485,23 @@ export class CheckpointPipeline {
       playbook.close();
     }
     return { events };
+  }
+
+  private appendMemoryEventsOnce(
+    runId: string,
+    events: Array<{ type: string; phaseId: string | null; payload: Record<string, unknown> }>
+  ): void {
+    const existing = new Set(
+      this.store.eventsSince(0)
+        .filter((event) => event.payload.runId === runId)
+        .map((event) => `${event.type}\0${event.phaseId ?? ""}`)
+    );
+    for (const event of events) {
+      const key = `${event.type}\0${event.phaseId ?? ""}`;
+      if (existing.has(key)) continue;
+      this.store.appendEvent(event.type, event.phaseId, event.payload);
+      existing.add(key);
+    }
   }
 
   private async cleanupParallelRun(run: CheckpointRunRecord, git: GitRepository): Promise<void> {
