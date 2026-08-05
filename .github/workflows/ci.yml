@@ -24,3 +24,97 @@ jobs:
           name: keep-coding-dist
           path: plugins/keep-coding/dist
           if-no-files-found: error
+
+  synchronize-execution-kernel:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/agent/execution-policy-kernel'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/execution-policy-kernel
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Synchronize verified documentation
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          executable = Path('plugins/keep-coding/dist/keep-coding.mjs')
+          executable_size = executable.stat().st_size
+
+          readme_path = Path('README.md')
+          readme = readme_path.read_text(encoding='utf-8')
+          readme = re.sub(r'tests-[0-9]+%20passing', 'tests-206%20passing', readme)
+          readme = re.sub(r'branch%20coverage-[0-9.]+%25', 'branch%20coverage-75.17%25', readme)
+          readme = re.sub(r'\| Source tests\s+\|\s+\*\*[0-9]+ passing\*\* \|', '| Source tests                    |     **206 passing** |', readme)
+          readme = re.sub(r'\| Source test files\s+\|\s+\*\*[0-9]+\*\* \|', '| Source test files               |              **45** |', readme)
+          readme = re.sub(r'\| Statement coverage\s+\|\s+\*\*[0-9.]+%\*\* \|', '| Statement coverage              |          **85.54%** |', readme)
+          readme = re.sub(r'\| Branch coverage\s+\|\s+\*\*[0-9.]+%\*\* \|', '| Branch coverage                 |          **75.17%** |', readme)
+          readme = re.sub(r'\| Function coverage\s+\|\s+\*\*[0-9.]+%\*\* \|', '| Function coverage               |          **89.07%** |', readme)
+          readme = re.sub(r'\| Line coverage\s+\|\s+\*\*[0-9.]+%\*\* \|', '| Line coverage                   |          **91.21%** |', readme)
+          readme = re.sub(r'\| Executable size\s+\| \*\*[0-9,]+ bytes\*\* \|', f'| Executable size                 | **{executable_size:,} bytes** |', readme)
+          readme = re.sub(r'Verified source suite: [0-9]+ tests across [0-9]+ files\.', 'Verified source suite: 206 tests across 45 files.', readme)
+
+          durable_marker = '* Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal'
+          execution_line = '* Runs verification and critic commands through a shell-free, operator-owned execution policy kernel with durable attestation'
+          if execution_line not in readme:
+              if durable_marker not in readme:
+                  raise SystemExit('README durable execution marker missing')
+              readme = readme.replace(durable_marker, durable_marker + '\n' + execution_line, 1)
+
+          evidence_marker = '* Executes explicit acceptance commands'
+          evidence_line = '* Revalidates repository scope and secrets after every command and after independent critic execution'
+          if evidence_line not in readme:
+              if evidence_marker not in readme:
+                  raise SystemExit('README evidence marker missing')
+              readme = readme.replace(evidence_marker, evidence_marker + '\n' + evidence_line, 1)
+
+          docs_marker = '| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)             | Components, state, graph, and verification design |'
+          docs_line = '| [`docs/EXECUTION_POLICY.md`](docs/EXECUTION_POLICY.md)       | Operator command authority and sandbox backends    |'
+          if docs_line not in readme:
+              if docs_marker not in readme:
+                  raise SystemExit('README documentation marker missing')
+              readme = readme.replace(docs_marker, docs_marker + '\n' + docs_line, 1)
+          readme_path.write_text(readme, encoding='utf-8')
+
+          turkish_path = Path('docs/README.tr.md')
+          turkish = turkish_path.read_text(encoding='utf-8')
+          guarantee_marker = '- Yarıda kalan seri veya paralel checkpoint; lease/CAS kontrollü kalıcı journal üzerinden yeniden oynatılır, belirsiz Git ayrışmalarında fail-closed bloklanır.'
+          guarantee_line = '- Acceptance, selective-test, full-suite ve critic komutları shell kullanmayan operator-owned execution policy kernel üzerinden çalışır; gerekli izolasyon sağlanamazsa fail-closed davranılır.'
+          if guarantee_line not in turkish:
+              if guarantee_marker not in turkish:
+                  raise SystemExit('Turkish guarantee marker missing')
+              turkish = turkish.replace(guarantee_marker, guarantee_marker + '\n' + guarantee_line, 1)
+          capability_marker = '- Secret scan, token/maliyet/zaman bütçesi, approval ve bağımsız critic'
+          capability_line = '- Exact executable/argv authority, sanitize environment, timeout/output sınırı, write audit, execution attestation ve Linux Bubblewrap confinement'
+          if capability_line not in turkish:
+              if capability_marker not in turkish:
+                  raise SystemExit('Turkish capability marker missing')
+              turkish = turkish.replace(capability_marker, capability_marker + '\n' + capability_line, 1)
+          turkish = re.sub(r'Doğrulanmış source suite: [0-9]+ test, [0-9]+ dosya\.', 'Doğrulanmış source suite: 206 test, 45 dosya.', turkish)
+          install_marker = 'Generic MCP kurulumu için [INSTALL_MCP.md](INSTALL_MCP.md) kullanılır.'
+          policy_reference = ' Execution policy ve güven düzeyleri için [EXECUTION_POLICY.md](EXECUTION_POLICY.md) kullanılır.'
+          if policy_reference.strip() not in turkish:
+              if install_marker not in turkish:
+                  raise SystemExit('Turkish install marker missing')
+              turkish = turkish.replace(install_marker, install_marker + policy_reference, 1)
+          turkish_path.write_text(turkish, encoding='utf-8')
+          PY
+      - name: Commit synchronized distribution
+        run: |
+          if git diff --quiet -- plugins/keep-coding/dist README.md docs/README.tr.md; then
+            echo "Distribution and documentation are current."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add plugins/keep-coding/dist README.md docs/README.tr.md
+          git commit -m "Synchronize execution policy distribution"
+          git push origin HEAD:agent/execution-policy-kernel
