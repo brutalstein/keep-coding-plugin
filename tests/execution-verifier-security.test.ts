@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { KernelCommandEvidence } from "../src/core/execution-kernel.js";
 import { GitRepository } from "../src/core/git.js";
 import { PhaseVerifier } from "../src/core/verifier.js";
 import type { PhaseRecord, ProjectContract } from "../src/domain/model.js";
@@ -99,21 +100,13 @@ describe("verifier execution boundaries", () => {
       options
     );
     expect(result.passed).toBe(true);
-    const command = result.commands[0] as unknown as {
-      attestation: {
-        backend: string;
-        commandSpecHash: string;
-        policyHash: string;
-        executableSha256: string;
-        inputTreeHash: string;
-      };
-      policyViolations: string[];
-    };
+    const command = result.commands[0] as KernelCommandEvidence | undefined;
+    expect(command).toBeDefined();
+    if (!command) throw new Error("command evidence missing");
     expect(command.policyViolations).toEqual([]);
-    expect(command.attestation).toMatchObject({
-      backend: "process",
-      inputTreeHash: expect.any(String)
-    });
+    expect(command.attestation.backend).toBe("process");
+    expect(command.attestation.inputTreeHash).not.toBeNull();
+    expect(command.attestation.inputTreeHash).toHaveLength(64);
     expect(command.attestation.commandSpecHash).toHaveLength(64);
     expect(command.attestation.policyHash).toHaveLength(64);
     expect(command.attestation.executableSha256).toHaveLength(64);
