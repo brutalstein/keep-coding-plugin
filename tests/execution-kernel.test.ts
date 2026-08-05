@@ -96,6 +96,36 @@ describe("attested execution kernel", () => {
     expect(result.durationMs).toBeLessThan(2_000);
   });
 
+  it("terminates output flooding and records an attested output limit", async () => {
+    const root = project();
+    const policyRoot = mkdtempSync(path.join(tmpdir(), "keep-coding-output-policy-"));
+    roots.push(policyRoot);
+    const policyPath = path.join(policyRoot, "policy.json");
+    writeFileSync(policyPath, JSON.stringify({
+      version: 1,
+      allowedExecutables: ["node"],
+      sandbox: "process",
+      network: "inherit",
+      projectWrites: "deny",
+      maxTimeoutMs: 2_000,
+      maxOutputBytes: 256
+    }));
+    const kernel = await ExecutionKernel.open(root, {
+      ...process.env,
+      KEEP_CODING_EXECUTION_POLICY_PATH: policyPath
+    });
+    const result = await kernel.execute({
+      command: 'node -e "process.stdout.write(\'x\'.repeat(4096))"',
+      cwd: root,
+      purpose: "acceptance",
+      writeScopes: []
+    });
+    expect(result.passed).toBe(false);
+    expect(result.attestation.outputLimitExceeded).toBe(true);
+    expect(result.stderr).toContain("EXECUTION_OUTPUT_LIMIT_EXCEEDED");
+    expect(result.durationMs).toBeLessThan(2_000);
+  });
+
   it.runIf(process.platform !== "win32")("rejects repository-controlled PATH shadowing", async () => {
     const root = project();
     const fakeNode = path.join(root, "node");
