@@ -79,8 +79,8 @@ export class PlatformDb {
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_run_id
         ON checkpoints(run_id) WHERE run_id IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_critic_reviews_run_id
-        ON critic_reviews(run_id) WHERE run_id IS NOT NULL;
+      DROP INDEX IF EXISTS idx_critic_reviews_run_id;
+      CREATE UNIQUE INDEX idx_critic_reviews_run_id ON critic_reviews(run_id);
     `);
     const additions: Record<string, string> = {
       revision: "INTEGER NOT NULL DEFAULT 1",
