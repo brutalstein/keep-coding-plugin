@@ -11,8 +11,8 @@ and evidence-gated completion for long-running coding agents.
 [![Keep Coding Verification](https://github.com/brutalstein/keep-coding-plugin/actions/workflows/keep-coding.yml/badge.svg)](https://github.com/brutalstein/keep-coding-plugin/actions/workflows/keep-coding.yml)
 ![Release](https://img.shields.io/badge/release-v0.4.0-7c3aed?style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?style=flat-square\&logo=nodedotjs\&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-128%20passing-22c55e?style=flat-square)
-![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.04%25-0ea5e9?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-131%20passing-22c55e?style=flat-square)
+![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.89%25-0ea5e9?style=flat-square)
 ![MCP](https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP-f97316?style=flat-square)
 
 [Quick Start](#-quick-start) ·
@@ -338,16 +338,18 @@ Pyright or clangd integration is intentionally deferred until real evaluation ev
 
 | Metric                          |              v0.4.0 |
 | ------------------------------- | ------------------: |
-| Source tests                    |     **128 passing** |
-| Source test files               |              **31** |
+| Source tests                    |     **131 passing** |
+| Source test files               |              **32** |
 | Compiled distribution scenarios |       **5 passing** |
-| Statement coverage              |          **85.63%** |
-| Branch coverage                 |          **75.04%** |
+| Statement coverage              |          **86.24%** |
+| Branch coverage                 |          **75.89%** |
 | Enforced branch floor           |             **75%** |
-| Function coverage               |          **87.75%** |
-| Line coverage                   |          **91.50%** |
-| Executable size                 | **1,293,223 bytes** |
+| Function coverage               |          **88.47%** |
+| Line coverage                   |          **92.18%** |
+| Executable size                 | **1,292,929 bytes** |
 | Verified parser sidecars        | **4,721,428 bytes** |
+
+Verified source suite: 131 tests across 32 files.
 
 The complete check command runs:
 

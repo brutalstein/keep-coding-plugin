@@ -1,9 +1,8 @@
 import type { PhaseRecord, VerificationEvidence } from "../domain/model.js";
 import type { PlatformStore } from "../storage/platform-store.js";
 import { generateCommitMessage } from "../integrations/github.js";
+import { CheckpointPipeline } from "./checkpoint.js";
 import { GitRepository } from "./git.js";
-import { indexRepository } from "./indexer.js";
-import { PhaseVerifier } from "./verifier.js";
 
 export class ParallelOrchestrator {
   constructor(private readonly git: GitRepository, private readonly store: PlatformStore) {}
@@ -57,46 +56,32 @@ export class ParallelOrchestrator {
   }> {
     const record = this.store.getWorktree(phaseId);
     if (!record || record.status !== "active") throw new Error(`active worktree not found for phase ${phaseId}`);
-    const phase = this.store.getPhase(phaseId);
-    if (!phase) throw new Error(`unknown phase: ${phaseId}`);
-    const contract = this.store.getProject()?.contract ?? {
-      goal: phase.goal, nonGoals: [], constraints: [], deliverables: [phase.goal], invariants: [], doneWhen: phase.acceptanceCommands
-    };
     const isolated = await GitRepository.open(record.path);
-    const baseline = this.store.getPhaseBaseline(phaseId);
-    const changedFiles = baseline ? await isolated.changedFilesSince(baseline) : await isolated.changedFiles();
-    const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
-    const impactedTests = this.store.impactedTests(changedFiles);
-    const selectiveCommands = contract.selectiveTests && impactedTests.length > 0
-      ? [contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests.map(shellQuote).join(" "))]
-      : [];
-
-    this.store.markVerifying(phaseId);
-    const evidence = await new PhaseVerifier().verify(isolated, { ...phase, status: "VERIFYING" }, {
-      ...(baseline ? { baseline } : {}),
-      selectiveCommands,
-      budget: this.store.budgetEvidence(phaseId),
-      contract,
-      impactedCompletedPhases
+    const result = await new CheckpointPipeline(this.store).run({
+      phaseId,
+      summary,
+      workspaceGit: isolated,
+      indexGit: this.git,
+      commitEvidence: async (evidence) => {
+        await isolated.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
+        return this.git.mergeWorktree(record.branch);
+      },
+      reverificationReason: (changedFiles) =>
+        `Files affected by parallel phase ${phaseId}: ${changedFiles.join(", ")}`
     });
-    if (!evidence.passed) {
-      this.store.finishVerification(phaseId, summary, evidence);
+
+    if (!result.evidence.passed) {
       this.store.setWorktree({ ...record, status: "failed" });
       throw new Error(`parallel phase ${phaseId} failed verification`);
     }
-    const commitSha = await isolated.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
-    const mergeSha = await this.git.mergeWorktree(record.branch);
-    evidence.gitSha = mergeSha;
-    this.store.finishVerification(phaseId, summary, evidence);
-    await indexRepository(this.store, this.git);
-    const reverificationRequired = this.store.markReverification(
-      impactedCompletedPhases,
-      `Files affected by parallel phase ${phaseId}: ${changedFiles.join(", ")}`,
-      phaseId
-    );
+
     this.store.setWorktree({ ...record, status: "merged" });
     await this.git.removeWorktree(record.path, record.branch);
-    return { evidence, mergeSha: commitSha === mergeSha ? commitSha : mergeSha, reverificationRequired };
+    return {
+      evidence: result.evidence,
+      mergeSha: result.evidence.gitSha,
+      reverificationRequired: result.reverificationRequired
+    };
   }
 }
 
@@ -114,8 +99,4 @@ function scopePrefix(scope: string): string {
   const wildcard = withoutNegation.search(/[*?{[]/);
   const prefix = wildcard >= 0 ? withoutNegation.slice(0, wildcard) : withoutNegation;
   return prefix.replace(/\/+$/, "");
-}
-
-function shellQuote(value: string): string {
-  return process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : `'${value.replaceAll("'", "'\\''")}'`;
 }

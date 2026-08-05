@@ -42,7 +42,7 @@ npm run check
 
 Commitlenen dağıtım yalnızca `keep-coding.mjs` değildir; `plugins/keep-coding/dist/` altındaki executable, hash-manifestli WASM grammar'lar ve query dosyalarının tamamıdır.
 
-Doğrulanmış source suite: 128 test, 31 dosya. Build sonrası artifact suite beş compiled-distribution senaryosu ekler; context ve graph benchmark'ları ayrı çalışır.
+Doğrulanmış source suite: 131 test, 32 dosya. Build sonrası artifact suite beş compiled-distribution senaryosu ekler; context ve graph benchmark'ları ayrı çalışır.
 
 ## Kullanım ve dağıtım
 

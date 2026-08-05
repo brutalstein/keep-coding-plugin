@@ -1,13 +1,12 @@
-import { createHash } from "node:crypto";
 import type {
-  AssumptionAlternative, AssumptionRecord, CommandFailureRecord, ContextEnvelope, CorrectionRecord, FailureRecord, FileDigest, PhaseDefinition,
+  AssumptionAlternative, AssumptionRecord, ContextEnvelope, CorrectionRecord, FailureRecord, FileDigest, PhaseDefinition,
   PlanAmendment, PlaybookPattern, ProjectContract
 } from "../domain/model.js";
 import { PlatformStore } from "../storage/platform-store.js";
 import { PlaybookStore } from "../storage/playbook.js";
+import type { CheckpointRunResult } from "./checkpoint.js";
+import { CheckpointPipeline, recordCommandOutputUsage } from "./checkpoint.js";
 import { lintAcceptanceCommands } from "./command-quality.js";
-import { CriticRunner } from "./critic.js";
-import { assessAmbiguity } from "./detector.js";
 import { compileContextEnvelope, tokenize } from "./context.js";
 import { GitRepository } from "./git.js";
 import { indexRepository } from "./indexer.js";
@@ -132,88 +131,18 @@ export class KeepCodingService {
     if (project.currentPhaseId) this.store.recordBudgetUsage("phase", project.currentPhaseId, { tokens: Math.ceil(tokens) }, "budget_host_tokens_recorded");
   }
 
-  async checkpoint(phaseId: string, summary: string): Promise<Record<string, unknown>> {
-    const phase = this.store.getPhase(phaseId);
-    if (!phase) throw new Error(`unknown phase: ${phaseId}`);
-    const project = this.store.getProject();
-    if (!project?.contract) throw new Error("project contract is missing");
-    const baseline = this.store.getPhaseBaseline(phaseId) ?? undefined;
-    const changedFiles = baseline ? await this.git.changedFilesSince(baseline) : await this.git.changedFiles();
-    this.store.autoLinkChangedFiles(phaseId, changedFiles);
-    const phaseAssumptions = this.store.listAssumptions(phaseId);
-    const ambiguity = assessAmbiguity(phase.goal, project.contract.doneWhen);
-    if (ambiguity.high && phaseAssumptions.length === 0) {
-      throw new Error(`HIGH_AMBIGUITY_WITHOUT_ASSUMPTION: record_assumption before checkpoint: ${ambiguity.reasons.join("; ")}`);
-    }
-    const threshold = project.contract.assumptionConfidenceThreshold ?? 0.6;
-    const unresolved = phaseAssumptions.filter((assumption) => assumption.status === "open" && assumption.confidence < threshold);
-    if (unresolved.length > 0) {
-      const critic = await new CriticRunner().review({ root: this.git.root, phase, contract: project.contract, changedFiles, diff: await this.git.diff() }, true);
-      this.store.appendEvent("assumption_critic_escalated", phaseId, { assumptionIds: unresolved.map((item) => item.id), critic });
-      const detail = unresolved.map((assumption) => `${assumption.id}: ${assumption.statement}`).join("; ");
-      throw new Error(`LOW_CONFIDENCE_ASSUMPTIONS: confirm or invalidate before checkpoint: ${detail}; critic=${critic.summary}`);
-    }
-
-    const correction = this.store.activeCorrection(phaseId);
-    const correctionAllowedFiles = correction ? this.store.correctionAllowedFiles(correction.id) : undefined;
-    this.store.markVerifying(phaseId);
-    const verifying = this.store.getPhase(phaseId);
-    if (!verifying) throw new Error(`unknown phase: ${phaseId}`);
-    const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, phaseId);
-    const impactedTests = this.store.impactedTests(changedFiles);
-    const selectiveCommands = project.contract.selectiveTests && impactedTests.length > 0
-      ? [project.contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests.map(shellQuote).join(" "))]
-      : [];
-    const previousFailures = [...new Set([...selectiveCommands, ...verifying.acceptanceCommands])]
-      .map((command) => this.store.latestCommandFailure(phaseId, command))
-      .filter((record): record is CommandFailureRecord => record !== null);
-    const evidence = await new PhaseVerifier().verify(this.git, verifying, {
-      ...(baseline ? { baseline } : {}),
-      selectiveCommands,
-      budget: this.store.budgetEvidence(phaseId),
-      contract: project.contract,
-      impactedCompletedPhases,
-      previousFailures,
-      ...(correctionAllowedFiles ? { correctionAllowedFiles } : {})
+  async checkpoint(phaseId: string, summary: string): Promise<CheckpointRunResult> {
+    return new CheckpointPipeline(this.store).run({
+      phaseId,
+      summary,
+      workspaceGit: this.git,
+      indexGit: this.git,
+      commitEvidence: (evidence) => this.git.commitFiles(
+        evidence.changedFiles,
+        generateCommitMessage(phaseId, summary)
+      ),
+      reverificationReason: (changedFiles) => `Files affected by ${phaseId}: ${changedFiles.join(", ")}`
     });
-    this.persistCommandFailures(phaseId, phase.attempts + 1, [...evidence.selectiveCommands, ...evidence.commands]);
-    this.recordCommandOutputUsage(phaseId, [...evidence.selectiveCommands, ...evidence.commands]);
-
-    let correctionResult: CorrectionRecord | null = null;
-    if (correction) {
-      const assessed = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), false);
-      correctionResult = assessed.correction;
-      if (assessed.unauthorizedFiles.length > 0) {
-        evidence.passed = false;
-        evidence.scopePassed = false;
-        evidence.scopeViolations = [...new Set([...evidence.scopeViolations, ...assessed.unauthorizedFiles])];
-      }
-    }
-
-    if (evidence.passed) {
-      evidence.gitSha = await this.git.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
-      if (correction) correctionResult = this.store.assessCorrectionOutcome(correction.id, changedFiles, this.store.totalRecordedTokens(), true).correction;
-    }
-    const updated = this.store.finishVerification(phaseId, summary, evidence);
-    let reverificationRequired: string[] = [];
-    if (evidence.passed) {
-      await indexRepository(this.store, this.git);
-      reverificationRequired = this.store.markReverification(
-        impactedCompletedPhases,
-        `Files affected by ${phaseId}: ${changedFiles.join(", ")}`,
-        phaseId
-      );
-      this.rememberSuccessfulPhase(updated);
-      if (correctionResult?.completedAt) this.rememberCorrection(correctionResult);
-    }
-    return {
-      phase: updated,
-      evidence,
-      correction: correctionResult,
-      reverificationRequired,
-      project: this.store.getProject(),
-      nextAction: evidence.passed ? (this.store.currentPhase() ? "start_phase" : "complete_project") : "repair_phase"
-    };
   }
 
   async restorePhaseBaseline(phaseId: string): Promise<Record<string, unknown>> {
@@ -230,7 +159,7 @@ export class KeepCodingService {
     if (!project?.contract) throw new Error("project contract is missing");
     const fullSuite = project.contract.selectiveTests?.fullSuiteCommands ?? [];
     const commands = await new PhaseVerifier().runCommands(fullSuite, this.git.root);
-    this.recordCommandOutputUsage(project.currentPhaseId, commands);
+    recordCommandOutputUsage(this.store, project.currentPhaseId, commands);
     if (commands.length !== fullSuite.length || commands.some((command) => !command.passed)) {
       this.store.appendEvent("project_completion_gate_failed", null, { commands });
       throw new Error("full-suite project completion gate failed");
@@ -289,51 +218,4 @@ export class KeepCodingService {
     this.store.recordBudgetUsage("project", project.id, delta, "plugin_token_context_estimated");
     if (project.currentPhaseId) this.store.recordBudgetUsage("phase", project.currentPhaseId, delta, "plugin_token_context_estimated");
   }
-
-  private recordCommandOutputUsage(phaseId: string | null, commands: Array<{ stdout: string; stderr: string }>): void {
-    const chars = commands.reduce((sum, command) => sum + command.stdout.length + command.stderr.length, 0);
-    const tokens = Math.ceil(chars / 4);
-    if (tokens <= 0) return;
-    const project = this.store.getProject();
-    if (!project) return;
-    const delta = { tokens, estimatedTokens: tokens };
-    this.store.recordBudgetUsage("project", project.id, delta, "plugin_token_command_output_estimated");
-    if (phaseId) this.store.recordBudgetUsage("phase", phaseId, delta, "plugin_token_command_output_estimated");
-  }
-
-  private persistCommandFailures(phaseId: string, attempt: number, commands: Array<{ command: string; passed: boolean; stdout: string; stderr: string }>): void {
-    for (const command of commands) {
-      if (command.passed) continue;
-      const fingerprint = createHash("sha256").update(`${command.command}\0${command.stdout}\0${command.stderr}`).digest("hex").slice(0, 24);
-      this.store.recordCommandFailure({ phaseId, command: command.command, attempt, stdout: command.stdout, stderr: command.stderr, fingerprint, createdAt: new Date().toISOString() });
-    }
-  }
-
-  private rememberCorrection(correction: CorrectionRecord): void {
-    const project = this.store.getProject();
-    if (!project?.contract?.playbookOptIn || correction.outcome === null) return;
-    const assumption = this.store.getAssumption(correction.assumptionId);
-    if (!assumption) return;
-    const playbook = new PlaybookStore();
-    try {
-      const pattern = playbook.rememberCorrection(project.root, assumption, correction);
-      this.store.appendEvent("playbook_antipattern_recorded", correction.phaseId, { correctionId: correction.id, patternId: pattern.id });
-    } finally { playbook.close(); }
-  }
-
-  private rememberSuccessfulPhase(phase: PhaseDefinition): void {
-    if (!this.store.getProject()?.contract?.playbookOptIn) return;
-    const playbook = new PlaybookStore();
-    try {
-      const project = this.store.getProject();
-      playbook.rememberPhase(project?.root ?? this.git.root, phase, [project?.contract?.goal ?? phase.goal]);
-      this.store.appendEvent("playbook_pattern_recorded", phase.id, { phaseId: phase.id });
-    } finally {
-      playbook.close();
-    }
-  }
-}
-
-function shellQuote(value: string): string {
-  return process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : `'${value.replaceAll("'", "'\\''")}'`;
 }
