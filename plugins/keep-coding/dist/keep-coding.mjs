@@ -109,7 +109,7 @@ function assessAmbiguity(goal, doneWhen = [], threshold = 3) {
 // src/core/git.ts
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { access, mkdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -148,7 +148,15 @@ var GitRepository = class _GitRepository {
   async diffHash() {
     const hash = createHash("sha256");
     hash.update(await this.diff(64 * 1024 * 1024));
-    for (const file of await this.changedFiles()) hash.update(`\0${file}`);
+    for (const file of await this.changedFiles()) {
+      hash.update(`\0path:${file}\0`);
+      const content = await readFile(path.join(this.root, file)).catch(() => null);
+      if (content === null) hash.update("<missing>");
+      else {
+        hash.update(`size:${content.byteLength}\0`);
+        hash.update(content);
+      }
+    }
     return hash.digest("hex");
   }
   async diff(maxBytes = 1e6) {
@@ -183,6 +191,30 @@ var GitRepository = class _GitRepository {
     await execFileAsync("git", ["commit", "-m", message], { cwd: this.root, timeout: 6e4, maxBuffer: 16 * 1024 * 1024 });
     return this.headSha();
   }
+  async commitFilesForRun(files, message, runId) {
+    const existing = await this.checkpointCommit(runId, "HEAD");
+    if (existing) return existing;
+    const detached = await this.checkpointCommit(runId, "--all");
+    if (detached) {
+      if (await this.isAncestor(detached, "HEAD")) return detached;
+      throw new Error(`CHECKPOINT_COMMIT_DIVERGED: ${runId} exists at ${detached} outside HEAD`);
+    }
+    return this.commitFiles(files, `${message}
+
+Keep-Coding-Commit: ${runId}`);
+  }
+  async checkpointCommit(runId, ref = "HEAD") {
+    return this.findTrailer("Keep-Coding-Commit", runId, ref);
+  }
+  async checkpointMerge(runId, ref = "HEAD") {
+    return this.findTrailer("Keep-Coding-Merge", runId, ref);
+  }
+  async isAncestor(ancestor, descendant = "HEAD") {
+    return execFileAsync("git", ["merge-base", "--is-ancestor", ancestor, descendant], { cwd: this.root, timeout: 15e3 }).then(() => true).catch((error2) => {
+      if (error2.code === 1) return false;
+      throw error2;
+    });
+  }
   async restoreFiles(baseSha, files) {
     if (files.length === 0) return;
     await execFileAsync("git", ["restore", "--source", baseSha, "--staged", "--worktree", "--", ...files], { cwd: this.root, timeout: 3e4 }).catch(async () => {
@@ -215,10 +247,50 @@ var GitRepository = class _GitRepository {
     }
     return this.headSha();
   }
+  async mergeWorktreeForRun(branch, runId) {
+    const existing = await this.checkpointMerge(runId, "HEAD");
+    if (existing) return existing;
+    const phaseCommit = await this.checkpointCommit(runId, branch);
+    if (!phaseCommit) throw new Error(`CHECKPOINT_PHASE_COMMIT_MISSING: ${runId}/${branch}`);
+    if (await this.isAncestor(phaseCommit, "HEAD")) {
+      throw new Error(`CHECKPOINT_MERGE_TRAILER_MISSING: ${runId} is integrated without durable merge evidence`);
+    }
+    const dirty = await this.changedFiles();
+    if (dirty.length > 0) throw new Error("main worktree must be clean before merging a parallel phase");
+    try {
+      await execFileAsync(
+        "git",
+        ["merge", "--no-ff", "-m", `Merge checkpoint ${runId}
+
+Keep-Coding-Merge: ${runId}`, branch],
+        { cwd: this.root, timeout: 12e4, maxBuffer: 32 * 1024 * 1024 }
+      );
+    } catch (error2) {
+      await execFileAsync("git", ["merge", "--abort"], { cwd: this.root, timeout: 15e3 }).catch(() => void 0);
+      throw error2;
+    }
+    return this.headSha();
+  }
   async removeWorktree(worktreePath, branch) {
     await execFileAsync("git", ["worktree", "remove", "--force", worktreePath], { cwd: this.root, timeout: 6e4 }).catch(() => void 0);
+    await rm(worktreePath, { recursive: true, force: true });
+    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 3e4 });
     await execFileAsync("git", ["branch", "-D", branch], { cwd: this.root, timeout: 3e4 }).catch(() => void 0);
-    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 3e4 }).catch(() => void 0);
+    await execFileAsync("git", ["worktree", "prune"], { cwd: this.root, timeout: 3e4 });
+    const registered = await this.runText(["worktree", "list", "--porcelain"]).then((output) => output.split("\n").some((line) => line === `worktree ${path.resolve(worktreePath)}`));
+    const branchExists = await execFileAsync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: this.root, timeout: 1e4 }).then(() => true).catch((error2) => {
+      if (error2.code === 1) return false;
+      throw error2;
+    });
+    const directoryExists = await access(worktreePath).then(() => true).catch(() => false);
+    if (registered || branchExists || directoryExists) {
+      throw new Error(`WORKTREE_CLEANUP_INCOMPLETE: ${worktreePath} (${branch})`);
+    }
+  }
+  async findTrailer(label, runId, ref) {
+    const args2 = ["log", ref, "--format=%H", "--fixed-strings", `--grep=${label}: ${runId}`, "-n", "1"];
+    const value = await this.runText(args2).catch(() => "");
+    return value || null;
   }
   async runText(args2) {
     const { stdout } = await execFileAsync("git", args2, { cwd: this.root, encoding: "utf8", timeout: 3e4, maxBuffer: 16 * 1024 * 1024 });
@@ -229,6 +301,9 @@ function splitNull(value) {
   return Buffer.isBuffer(value) ? value.toString("utf8").split("\0").filter(Boolean) : value.split("\0").filter(Boolean);
 }
 
+// src/storage/platform-store.ts
+import { randomUUID as randomUUID4 } from "node:crypto";
+
 // src/core/signature.ts
 import { createHash as createHash2 } from "node:crypto";
 function normalizeDiagnosticText(value) {
@@ -238,11 +313,382 @@ function normalizedDiagnosticSignature(value, length = 24) {
   return createHash2("sha256").update(normalizeDiagnosticText(value)).digest("hex").slice(0, length);
 }
 
+// src/storage/checkpoint-runs.ts
+import { randomUUID } from "node:crypto";
+
+// src/storage/platform-db.ts
+import { DatabaseSync } from "node:sqlite";
+var PlatformDb = class {
+  db;
+  ownsDatabase;
+  constructor(database) {
+    this.ownsDatabase = typeof database === "string";
+    this.db = typeof database === "string" ? new DatabaseSync(database) : database;
+    this.migrate();
+  }
+  close() {
+    if (this.ownsDatabase) this.db.close();
+  }
+  transaction(operation) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = operation();
+      this.db.exec("COMMIT");
+      return value;
+    } catch (error2) {
+      this.db.exec("ROLLBACK");
+      throw error2;
+    }
+  }
+  migrate() {
+    this.db.exec(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA busy_timeout = 5000;
+      CREATE TABLE IF NOT EXISTS plan_revisions (
+        version INTEGER PRIMARY KEY, contract_json TEXT NOT NULL, amendment_json TEXT, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS approvals (
+        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
+        requested_at TEXT NOT NULL, resolved_at TEXT, resolution_note TEXT
+      );
+      CREATE TABLE IF NOT EXISTS budget_usage (
+        scope TEXT NOT NULL, scope_id TEXT NOT NULL, tokens INTEGER NOT NULL DEFAULT 0,
+        estimated_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
+        wall_clock_ms INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id)
+      );
+      CREATE TABLE IF NOT EXISTS budget_usage_receipts (
+        receipt_key TEXT PRIMARY KEY, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS critic_reviews (
+        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS worktrees (
+        phase_id TEXT PRIMARY KEY, path TEXT NOT NULL, branch TEXT NOT NULL, status TEXT NOT NULL,
+        base_sha TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS command_failures (
+        phase_id TEXT NOT NULL, command TEXT NOT NULL, attempt INTEGER NOT NULL,
+        stdout TEXT NOT NULL, stderr TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
+        PRIMARY KEY (phase_id, command, attempt)
+      );
+      CREATE TABLE IF NOT EXISTS checkpoint_runs (
+        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, execution_mode TEXT NOT NULL, summary TEXT NOT NULL,
+        status TEXT NOT NULL, workspace_baseline_sha TEXT NOT NULL, target_baseline_sha TEXT NOT NULL,
+        actual_git_sha TEXT, diff_hash TEXT, changed_files_json TEXT NOT NULL DEFAULT '[]',
+        impacted_completed_phases_json TEXT NOT NULL DEFAULT '[]',
+        reverification_required_json TEXT NOT NULL DEFAULT '[]', evidence_json TEXT, correction_id TEXT,
+        lease_owner TEXT, lease_expires_at TEXT, last_error TEXT, index_completed_at TEXT,
+        reverification_completed_at TEXT, memory_completed_at TEXT, cleanup_completed_at TEXT,
+        correction_completed_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_command_failures_latest ON command_failures(phase_id, command, attempt DESC);
+      CREATE INDEX IF NOT EXISTS idx_checkpoint_runs_recovery ON checkpoint_runs(status, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoint_runs_active_phase
+        ON checkpoint_runs(phase_id) WHERE status NOT IN ('DONE','FAILED_TERMINAL');
+    `);
+    addColumn(this.db, "budget_usage", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
+    addColumn(this.db, "checkpoints", "run_id", "TEXT");
+    addColumn(this.db, "critic_reviews", "run_id", "TEXT");
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_checkpoints_run_id
+        ON checkpoints(run_id) WHERE run_id IS NOT NULL;
+      DROP INDEX IF EXISTS idx_critic_reviews_run_id;
+      CREATE UNIQUE INDEX idx_critic_reviews_run_id ON critic_reviews(run_id);
+    `);
+    const additions = {
+      revision: "INTEGER NOT NULL DEFAULT 1",
+      superseded_by: "TEXT",
+      requires_approval: "INTEGER NOT NULL DEFAULT 0",
+      approval_prompt: "TEXT",
+      approved_at: "TEXT",
+      budget_json: "TEXT NOT NULL DEFAULT '{}'",
+      critic_blocking: "INTEGER NOT NULL DEFAULT 0",
+      parallel_safe: "INTEGER NOT NULL DEFAULT 0",
+      reverify_reason: "TEXT",
+      verification_kind: "TEXT NOT NULL DEFAULT 'code'"
+    };
+    for (const [name2, definition] of Object.entries(additions)) addColumn(this.db, "phases", name2, definition);
+  }
+};
+function addColumn(db, table, name2, definition) {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!columns.some((row) => text(row.name) === name2)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name2} ${definition}`);
+}
+function approvalFromRow(row) {
+  return {
+    id: text(row.id),
+    phaseId: text(row.phase_id),
+    prompt: text(row.prompt),
+    status: text(row.status),
+    requestedAt: text(row.requested_at),
+    resolvedAt: nullable(row.resolved_at),
+    resolutionNote: nullable(row.resolution_note)
+  };
+}
+function usageFromRow(row) {
+  return {
+    tokens: Number(row.tokens),
+    estimatedTokens: Number(row.estimated_tokens ?? 0),
+    costUsd: Number(row.cost_usd),
+    wallClockMs: Number(row.wall_clock_ms),
+    updatedAt: text(row.updated_at)
+  };
+}
+function worktreeFromRow(row) {
+  return {
+    phaseId: text(row.phase_id),
+    path: text(row.path),
+    branch: text(row.branch),
+    status: text(row.status),
+    baseSha: text(row.base_sha),
+    createdAt: text(row.created_at)
+  };
+}
+function text(value) {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
+  throw new Error("non-scalar database value");
+}
+function nullable(value) {
+  return value === null || value === void 0 ? null : text(value);
+}
+function json(value) {
+  return JSON.parse(text(value));
+}
+function now() {
+  return (/* @__PURE__ */ new Date()).toISOString();
+}
+function must(value, message) {
+  if (value === null || value === void 0) throw new Error(message);
+  return value;
+}
+
+// src/storage/checkpoint-runs.ts
+var TERMINAL_STATUSES = ["DONE", "FAILED_TERMINAL"];
+var STEP_COLUMNS = /* @__PURE__ */ new Set([
+  "index_completed_at",
+  "reverification_completed_at",
+  "memory_completed_at",
+  "cleanup_completed_at",
+  "correction_completed_at"
+]);
+function beginCheckpointRun(db, input) {
+  const existing = activeCheckpointRun(db, input.phaseId);
+  if (existing) throw new Error(`CHECKPOINT_ALREADY_ACTIVE: ${existing.id} (${existing.status})`);
+  const phaseUpdate = db.prepare("UPDATE phases SET status='VERIFYING' WHERE id=? AND status='IN_PROGRESS'").run(input.phaseId);
+  if (Number(phaseUpdate.changes) !== 1) {
+    const row = db.prepare("SELECT status FROM phases WHERE id=?").get(input.phaseId);
+    throw new Error(`CHECKPOINT_PHASE_CAS_FAILED: ${input.phaseId} is ${row ? text(row.status) : "missing"}`);
+  }
+  const id = randomUUID();
+  const timestamp = now();
+  db.prepare(`
+    INSERT INTO checkpoint_runs (
+      id, phase_id, execution_mode, summary, status, workspace_baseline_sha, target_baseline_sha,
+      actual_git_sha, diff_hash, changed_files_json, impacted_completed_phases_json,
+      reverification_required_json, evidence_json, correction_id, lease_owner, lease_expires_at,
+      last_error, index_completed_at, reverification_completed_at, memory_completed_at,
+      cleanup_completed_at, correction_completed_at, created_at, updated_at, completed_at
+    ) VALUES (?, ?, ?, ?, 'VERIFYING', ?, ?, NULL, NULL, '[]', '[]', '[]', NULL, NULL, ?, ?,
+      NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, NULL)
+  `).run(
+    id,
+    input.phaseId,
+    input.executionMode,
+    input.summary,
+    input.workspaceBaselineSha,
+    input.targetBaselineSha,
+    input.leaseOwner,
+    leaseExpiration(input.leaseDurationMs),
+    timestamp,
+    timestamp
+  );
+  return required(getCheckpointRun(db, id), "checkpoint run insert failed");
+}
+function getCheckpointRun(db, id) {
+  const row = db.prepare("SELECT * FROM checkpoint_runs WHERE id=?").get(id);
+  return row ? checkpointRunFromRow(row) : null;
+}
+function activeCheckpointRun(db, phaseId) {
+  const row = db.prepare(`
+    SELECT * FROM checkpoint_runs
+    WHERE phase_id=? AND status NOT IN ('DONE','FAILED_TERMINAL')
+    ORDER BY created_at DESC LIMIT 1
+  `).get(phaseId);
+  return row ? checkpointRunFromRow(row) : null;
+}
+function listRecoverableCheckpointRuns(db) {
+  return db.prepare(`
+    SELECT * FROM checkpoint_runs
+    WHERE status NOT IN ('DONE','FAILED_TERMINAL')
+    ORDER BY created_at, id
+  `).all().map(checkpointRunFromRow);
+}
+function listCheckpointRuns(db) {
+  return db.prepare("SELECT * FROM checkpoint_runs ORDER BY created_at, id").all().map(checkpointRunFromRow);
+}
+function claimCheckpointRun(db, id, leaseOwner2, leaseDurationMs, force = false) {
+  const run3 = required(getCheckpointRun(db, id), `unknown checkpoint run: ${id}`);
+  if (TERMINAL_STATUSES.includes(run3.status)) return run3;
+  const activeLease = run3.leaseOwner !== null && run3.leaseOwner !== leaseOwner2 && run3.leaseExpiresAt !== null && Date.parse(run3.leaseExpiresAt) > Date.now();
+  if (activeLease && !force) {
+    throw new Error(`CHECKPOINT_LEASE_HELD: ${id} by ${run3.leaseOwner} until ${run3.leaseExpiresAt}`);
+  }
+  db.prepare("UPDATE checkpoint_runs SET lease_owner=?,lease_expires_at=?,updated_at=? WHERE id=?").run(leaseOwner2, leaseExpiration(leaseDurationMs), now(), id);
+  return required(getCheckpointRun(db, id), "checkpoint lease claim failed");
+}
+function renewCheckpointLease(db, id, leaseOwner2, leaseDurationMs) {
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET lease_expires_at=?,updated_at=?
+    WHERE id=? AND lease_owner=? AND status NOT IN ('DONE','FAILED_TERMINAL')
+  `).run(leaseExpiration(leaseDurationMs), now(), id, leaseOwner2);
+  if (Number(result.changes) !== 1) throw new Error(`CHECKPOINT_LEASE_LOST: ${id}`);
+}
+function recordCheckpointEvidence(db, id, leaseOwner2, input, leaseDurationMs) {
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET status='VERIFIED',diff_hash=?,changed_files_json=?,
+      impacted_completed_phases_json=?,evidence_json=?,correction_id=?,last_error=NULL,
+      lease_expires_at=?,updated_at=?
+    WHERE id=? AND lease_owner=? AND status IN ('VERIFYING','FAILED_RETRYABLE')
+  `).run(
+    input.evidence.diffHash,
+    JSON.stringify(input.evidence.changedFiles),
+    JSON.stringify(input.impactedCompletedPhases),
+    JSON.stringify(input.evidence),
+    input.correctionId,
+    leaseExpiration(leaseDurationMs),
+    now(),
+    id,
+    leaseOwner2
+  );
+  assertChanged(result.changes, `CHECKPOINT_EVIDENCE_CAS_FAILED: ${id}`);
+  return required(getCheckpointRun(db, id), "checkpoint evidence update failed");
+}
+function recordCheckpointCommit(db, id, leaseOwner2, gitSha, leaseDurationMs) {
+  const run3 = required(getCheckpointRun(db, id), `unknown checkpoint run: ${id}`);
+  const evidence = required(run3.evidence, `checkpoint evidence missing: ${id}`);
+  const committedEvidence = { ...evidence, gitSha };
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET status='GIT_COMMITTED',actual_git_sha=?,evidence_json=?,
+      lease_expires_at=?,updated_at=?
+    WHERE id=? AND lease_owner=? AND status IN ('VERIFIED','FAILED_RETRYABLE')
+  `).run(
+    gitSha,
+    JSON.stringify(committedEvidence),
+    leaseExpiration(leaseDurationMs),
+    now(),
+    id,
+    leaseOwner2
+  );
+  assertChanged(result.changes, `CHECKPOINT_COMMIT_CAS_FAILED: ${id}`);
+  return required(getCheckpointRun(db, id), "checkpoint commit update failed");
+}
+function markCheckpointStep(db, id, leaseOwner2, column, leaseDurationMs) {
+  if (!STEP_COLUMNS.has(column)) throw new Error(`invalid checkpoint step column: ${column}`);
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET ${column}=COALESCE(${column},?),status='POST_PROCESSING',
+      lease_expires_at=?,updated_at=?
+    WHERE id=? AND lease_owner=? AND status IN ('STATE_COMMITTED','POST_PROCESSING','FAILED_RETRYABLE')
+  `).run(now(), leaseExpiration(leaseDurationMs), now(), id, leaseOwner2);
+  assertChanged(result.changes, `CHECKPOINT_STEP_CAS_FAILED: ${id}/${column}`);
+  return required(getCheckpointRun(db, id), "checkpoint step update failed");
+}
+function setCheckpointReverificationRequired(db, id, leaseOwner2, phaseIds, leaseDurationMs) {
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET reverification_required_json=?,reverification_completed_at=COALESCE(reverification_completed_at,?),
+      status='POST_PROCESSING',lease_expires_at=?,updated_at=?
+    WHERE id=? AND lease_owner=? AND status IN ('STATE_COMMITTED','POST_PROCESSING','FAILED_RETRYABLE')
+  `).run(
+    JSON.stringify([...new Set(phaseIds)]),
+    now(),
+    leaseExpiration(leaseDurationMs),
+    now(),
+    id,
+    leaseOwner2
+  );
+  assertChanged(result.changes, `CHECKPOINT_REVERIFY_CAS_FAILED: ${id}`);
+  return required(getCheckpointRun(db, id), "checkpoint reverification update failed");
+}
+function completeCheckpointRun(db, id, leaseOwner2) {
+  const timestamp = now();
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET status='DONE',lease_owner=NULL,lease_expires_at=NULL,
+      last_error=NULL,updated_at=?,completed_at=COALESCE(completed_at,?)
+    WHERE id=? AND lease_owner=? AND status NOT IN ('DONE','FAILED_TERMINAL')
+  `).run(timestamp, timestamp, id, leaseOwner2);
+  assertChanged(result.changes, `CHECKPOINT_COMPLETE_CAS_FAILED: ${id}`);
+  return required(getCheckpointRun(db, id), "checkpoint completion update failed");
+}
+function markCheckpointRetryable(db, id, leaseOwner2, error2) {
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET status='FAILED_RETRYABLE',last_error=?,lease_owner=NULL,
+      lease_expires_at=NULL,updated_at=?
+    WHERE id=? AND lease_owner=? AND status NOT IN ('DONE','FAILED_TERMINAL')
+  `).run(error2, now(), id, leaseOwner2);
+  assertChanged(result.changes, `CHECKPOINT_RETRYABLE_CAS_FAILED: ${id}`);
+  return required(getCheckpointRun(db, id), "checkpoint retryable update failed");
+}
+function markCheckpointTerminal(db, id, leaseOwner2, error2) {
+  const timestamp = now();
+  const result = db.prepare(`
+    UPDATE checkpoint_runs SET status='FAILED_TERMINAL',last_error=?,lease_owner=NULL,
+      lease_expires_at=NULL,updated_at=?,completed_at=COALESCE(completed_at,?)
+    WHERE id=? AND lease_owner=? AND status!='DONE'
+  `).run(error2, timestamp, timestamp, id, leaseOwner2);
+  assertChanged(result.changes, `CHECKPOINT_TERMINAL_CAS_FAILED: ${id}`);
+  return required(getCheckpointRun(db, id), "checkpoint terminal update failed");
+}
+function expireCheckpointLease(db, id, leaseOwner2) {
+  db.prepare(`
+    UPDATE checkpoint_runs SET lease_expires_at=?,updated_at=?
+    WHERE id=? AND lease_owner=? AND status NOT IN ('DONE','FAILED_TERMINAL')
+  `).run((/* @__PURE__ */ new Date(0)).toISOString(), now(), id, leaseOwner2);
+}
+function checkpointRunFromRow(row) {
+  return {
+    id: text(row.id),
+    phaseId: text(row.phase_id),
+    executionMode: text(row.execution_mode),
+    summary: text(row.summary),
+    status: text(row.status),
+    workspaceBaselineSha: text(row.workspace_baseline_sha),
+    targetBaselineSha: text(row.target_baseline_sha),
+    actualGitSha: nullable(row.actual_git_sha),
+    diffHash: nullable(row.diff_hash),
+    changedFiles: json(row.changed_files_json),
+    impactedCompletedPhases: json(row.impacted_completed_phases_json),
+    reverificationRequired: json(row.reverification_required_json),
+    evidence: row.evidence_json === null ? null : json(row.evidence_json),
+    correctionId: nullable(row.correction_id),
+    leaseOwner: nullable(row.lease_owner),
+    leaseExpiresAt: nullable(row.lease_expires_at),
+    lastError: nullable(row.last_error),
+    indexCompletedAt: nullable(row.index_completed_at),
+    reverificationCompletedAt: nullable(row.reverification_completed_at),
+    memoryCompletedAt: nullable(row.memory_completed_at),
+    cleanupCompletedAt: nullable(row.cleanup_completed_at),
+    correctionCompletedAt: nullable(row.correction_completed_at),
+    createdAt: text(row.created_at),
+    updatedAt: text(row.updated_at),
+    completedAt: nullable(row.completed_at)
+  };
+}
+function leaseExpiration(durationMs) {
+  return new Date(Date.now() + Math.max(3e4, durationMs)).toISOString();
+}
+function assertChanged(changes, message) {
+  if (Number(changes) !== 1) throw new Error(message);
+}
+function required(value, message) {
+  if (value === null || value === void 0) throw new Error(message);
+  return value;
+}
+
 // src/storage/store.ts
-import { randomUUID, createHash as createHash3 } from "node:crypto";
+import { randomUUID as randomUUID2, createHash as createHash3 } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import path2 from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
 
 // src/storage/migrations.ts
 function migrateProjectDatabase(db) {
@@ -309,27 +755,27 @@ function migrateProjectDatabase(db) {
 // src/storage/row-mappers.ts
 function projectFromRow(row) {
   return {
-    id: text(row.id),
-    root: text(row.root),
-    originalPrompt: text(row.original_prompt),
-    status: text(row.status),
-    contract: row.contract_json ? JSON.parse(text(row.contract_json)) : null,
+    id: text2(row.id),
+    root: text2(row.root),
+    originalPrompt: text2(row.original_prompt),
+    status: text2(row.status),
+    contract: row.contract_json ? JSON.parse(text2(row.contract_json)) : null,
     planVersion: Number(row.plan_version),
     currentPhaseId: nullableText(row.current_phase_id),
-    createdAt: text(row.created_at),
-    updatedAt: text(row.updated_at)
+    createdAt: text2(row.created_at),
+    updatedAt: text2(row.updated_at)
   };
 }
 function phaseFromRow(row) {
   return {
-    id: text(row.id),
+    id: text2(row.id),
     ordinal: Number(row.ordinal),
-    title: text(row.title),
-    goal: text(row.goal),
-    status: text(row.status),
-    dependencies: JSON.parse(text(row.dependencies_json)),
-    allowedScope: JSON.parse(text(row.allowed_scope_json)),
-    acceptanceCommands: JSON.parse(text(row.acceptance_commands_json)),
+    title: text2(row.title),
+    goal: text2(row.goal),
+    status: text2(row.status),
+    dependencies: JSON.parse(text2(row.dependencies_json)),
+    allowedScope: JSON.parse(text2(row.allowed_scope_json)),
+    acceptanceCommands: JSON.parse(text2(row.acceptance_commands_json)),
     maxAttempts: Number(row.max_attempts),
     attempts: Number(row.attempts),
     startedAt: nullableText(row.started_at),
@@ -341,37 +787,37 @@ function phaseFromRow(row) {
 }
 function decisionFromRow(row) {
   return {
-    id: text(row.id),
+    id: text2(row.id),
     phaseId: nullableText(row.phase_id),
-    title: text(row.title),
-    rationale: text(row.rationale),
-    alternatives: JSON.parse(text(row.alternatives_json)),
-    status: text(row.status),
-    createdAt: text(row.created_at)
+    title: text2(row.title),
+    rationale: text2(row.rationale),
+    alternatives: JSON.parse(text2(row.alternatives_json)),
+    status: text2(row.status),
+    createdAt: text2(row.created_at)
   };
 }
 function failureFromRow(row) {
   return {
-    id: text(row.id),
-    phaseId: text(row.phase_id),
-    fingerprint: text(row.fingerprint),
-    summary: text(row.summary),
+    id: text2(row.id),
+    phaseId: text2(row.phase_id),
+    fingerprint: text2(row.fingerprint),
+    summary: text2(row.summary),
     count: Number(row.count),
-    lastSeenAt: text(row.last_seen_at),
+    lastSeenAt: text2(row.last_seen_at),
     resolution: nullableText(row.resolution)
   };
 }
 function assumptionFromRow(row) {
-  const alternatives = JSON.parse(text(row.alternatives_json));
+  const alternatives = JSON.parse(text2(row.alternatives_json));
   if (!Array.isArray(alternatives)) throw new Error("INVALID_ALTERNATIVES: stored alternatives must be an array");
   return {
-    id: text(row.id),
+    id: text2(row.id),
     phaseId: nullableText(row.phase_id),
-    statement: text(row.statement),
+    statement: text2(row.statement),
     confidence: Number(row.confidence),
     alternatives,
-    status: text(row.status),
-    createdAt: text(row.created_at),
+    status: text2(row.status),
+    createdAt: text2(row.created_at),
     resolvedAt: nullableText(row.resolved_at),
     resolutionEvidence: nullableText(row.resolution_evidence),
     explicitLinkedAt: nullableText(row.explicit_linked_at)
@@ -379,15 +825,15 @@ function assumptionFromRow(row) {
 }
 function correctionFromRow(row) {
   return {
-    id: text(row.id),
-    assumptionId: text(row.assumption_id),
+    id: text2(row.id),
+    assumptionId: text2(row.assumption_id),
     phaseId: nullableText(row.phase_id),
-    rootCause: text(row.root_cause),
-    blastRadius: JSON.parse(text(row.blast_radius_json)),
+    rootCause: text2(row.root_cause),
+    blastRadius: JSON.parse(text2(row.blast_radius_json)),
     blastRadiusSize: Number(row.blast_radius_size),
-    appliedAt: text(row.applied_at),
-    outcome: row.outcome ? text(row.outcome) : null,
-    expansions: JSON.parse(text(row.expansions_json ?? "[]")),
+    appliedAt: text2(row.applied_at),
+    outcome: row.outcome ? text2(row.outcome) : null,
+    expansions: JSON.parse(text2(row.expansions_json ?? "[]")),
     completedAt: nullableText(row.completed_at),
     tokenStart: Number(row.token_start ?? 0),
     tokenEnd: row.token_end === null || row.token_end === void 0 ? null : Number(row.token_end)
@@ -395,47 +841,47 @@ function correctionFromRow(row) {
 }
 function checkpointFromRow(row) {
   return {
-    id: text(row.id),
-    phaseId: text(row.phase_id),
-    gitSha: text(row.git_sha),
-    summary: text(row.summary),
-    changedFiles: JSON.parse(text(row.changed_files_json)),
-    verification: JSON.parse(text(row.verification_json)),
-    createdAt: text(row.created_at)
+    id: text2(row.id),
+    phaseId: text2(row.phase_id),
+    gitSha: text2(row.git_sha),
+    summary: text2(row.summary),
+    changedFiles: JSON.parse(text2(row.changed_files_json)),
+    verification: JSON.parse(text2(row.verification_json)),
+    createdAt: text2(row.created_at)
   };
 }
 function eventFromRow(row) {
   return {
     sequence: Number(row.sequence),
-    timestamp: text(row.timestamp),
-    type: text(row.type),
+    timestamp: text2(row.timestamp),
+    type: text2(row.type),
     phaseId: nullableText(row.phase_id),
-    payload: JSON.parse(text(row.payload_json))
+    payload: JSON.parse(text2(row.payload_json))
   };
 }
 function graphEdgeFromRow(row) {
   return {
-    sourceId: text(row.source_id),
-    targetId: text(row.target_id),
-    type: text(row.type),
-    metadata: JSON.parse(text(row.metadata_json))
+    sourceId: text2(row.source_id),
+    targetId: text2(row.target_id),
+    type: text2(row.type),
+    metadata: JSON.parse(text2(row.metadata_json))
   };
 }
 function graphNodeFromRow(row) {
   return {
-    id: text(row.id),
-    type: text(row.type),
-    label: text(row.label),
+    id: text2(row.id),
+    type: text2(row.type),
+    label: text2(row.label),
     path: nullableText(row.path),
     symbol: nullableText(row.symbol),
     contentHash: nullableText(row.content_hash),
-    metadata: JSON.parse(text(row.metadata_json))
+    metadata: JSON.parse(text2(row.metadata_json))
   };
 }
 function nullableText(value) {
-  return value === null || value === void 0 ? null : text(value);
+  return value === null || value === void 0 ? null : text2(value);
 }
-function text(value) {
+function text2(value) {
   if (typeof value === "string") return value;
   if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return `${value}`;
   if (Buffer.isBuffer(value)) return value.toString("utf8");
@@ -510,7 +956,7 @@ var ProjectStore = class {
     const stateDirectory = path2.join(this.projectRoot, ".keep-coding");
     mkdirSync(stateDirectory, { recursive: true });
     this.databasePath = path2.join(stateDirectory, "state.db");
-    this.db = new DatabaseSync(this.databasePath);
+    this.db = new DatabaseSync2(this.databasePath);
     this.migrate();
   }
   close() {
@@ -526,7 +972,7 @@ var ProjectStore = class {
       VALUES (?, ?, ?, 'PLANNING', NULL, 0, NULL, ?, ?)
     `).run(id, this.projectRoot, originalPrompt.trim(), now2, now2);
     this.appendEvent("project_initialized", null, { promptHash: sha256(originalPrompt) });
-    return must(this.getProject(), "project initialization failed");
+    return must2(this.getProject(), "project initialization failed");
   }
   getProject() {
     const row = this.db.prepare("SELECT * FROM project LIMIT 1").get();
@@ -535,7 +981,7 @@ var ProjectStore = class {
   savePlan(contract, definitions) {
     validateContract(contract);
     validatePlan(definitions);
-    const project = must(this.getProject(), "initialize the project before saving a plan");
+    const project = must2(this.getProject(), "initialize the project before saving a plan");
     const existing = this.listPhases();
     if (existing.some((phase) => !["PENDING", "READY"].includes(phase.status))) {
       throw new Error("The plan cannot be replaced after implementation has started; record an explicit decision instead.");
@@ -601,11 +1047,11 @@ var ProjectStore = class {
     return project?.currentPhaseId ? this.getPhase(project.currentPhaseId) : null;
   }
   startPhase(id, baseSha) {
-    const phase = must(this.getPhase(id), `unknown phase: ${id}`);
+    const phase = must2(this.getPhase(id), `unknown phase: ${id}`);
     if (!["READY", "FAILED"].includes(phase.status)) {
       throw new Error(`phase ${id} cannot start from ${phase.status}`);
     }
-    const dependencies = phase.dependencies.map((dependency) => must(this.getPhase(dependency), `missing dependency: ${dependency}`));
+    const dependencies = phase.dependencies.map((dependency) => must2(this.getPhase(dependency), `missing dependency: ${dependency}`));
     if (dependencies.some((dependency) => dependency.status !== "COMPLETED")) {
       throw new Error(`phase ${id} has unfinished dependencies`);
     }
@@ -613,16 +1059,16 @@ var ProjectStore = class {
     this.db.prepare(`UPDATE phases SET status = 'IN_PROGRESS', started_at = COALESCE(started_at, ?), base_sha = COALESCE(base_sha, ?) WHERE id = ?`).run(now2, baseSha, id);
     this.db.prepare("UPDATE project SET status = 'ACTIVE', current_phase_id = ?, updated_at = ?").run(id, now2);
     this.appendEvent("phase_started", id, { baseSha });
-    return must(this.getPhase(id), "phase start failed");
+    return must2(this.getPhase(id), "phase start failed");
   }
   markVerifying(id) {
-    const phase = must(this.getPhase(id), `unknown phase: ${id}`);
+    const phase = must2(this.getPhase(id), `unknown phase: ${id}`);
     if (phase.status !== "IN_PROGRESS") throw new Error(`phase ${id} is not in progress`);
     this.db.prepare("UPDATE phases SET status = 'VERIFYING' WHERE id = ?").run(id);
     this.appendEvent("phase_verification_started", id, {});
   }
   finishVerification(id, summary, evidence) {
-    const phase = must(this.getPhase(id), `unknown phase: ${id}`);
+    const phase = must2(this.getPhase(id), `unknown phase: ${id}`);
     if (phase.status !== "VERIFYING") throw new Error(`phase ${id} is not being verified`);
     const now2 = (/* @__PURE__ */ new Date()).toISOString();
     if (!evidence.passed) {
@@ -638,13 +1084,13 @@ var ProjectStore = class {
         scopeViolations: evidence.scopeViolations,
         failedCommands: evidence.commands.filter((command2) => !command2.passed).map((command2) => command2.command)
       });
-      return must(this.getPhase(id), "phase failure update failed");
+      return must2(this.getPhase(id), "phase failure update failed");
     }
     this.transaction(() => {
       this.db.prepare(`
         UPDATE phases SET status = 'COMPLETED', completed_at = ?, head_sha = ?, summary = ? WHERE id = ?
       `).run(now2, evidence.gitSha, summary, id);
-      const checkpointId = randomUUID();
+      const checkpointId = randomUUID2();
       this.db.prepare(`
         INSERT INTO checkpoints (id, phase_id, git_sha, summary, changed_files_json, verification_json, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -664,7 +1110,7 @@ var ProjectStore = class {
       this.db.prepare("UPDATE project SET status = ?, current_phase_id = ?, updated_at = ?").run(status, next?.id ?? null, now2);
       this.appendEvent("phase_completed", id, { checkpointId, changedFiles: evidence.changedFiles, nextPhaseId: next?.id ?? null });
     });
-    return must(this.getPhase(id), "phase completion update failed");
+    return must2(this.getPhase(id), "phase completion update failed");
   }
   completeProject() {
     const phases = this.listPhases();
@@ -674,17 +1120,17 @@ var ProjectStore = class {
     const now2 = (/* @__PURE__ */ new Date()).toISOString();
     this.db.prepare("UPDATE project SET status = 'COMPLETED', current_phase_id = NULL, updated_at = ?").run(now2);
     this.appendEvent("project_completed", null, { phaseCount: phases.length });
-    return must(this.getProject(), "project completion failed");
+    return must2(this.getProject(), "project completion failed");
   }
   recordAssumption(input) {
     if (!Number.isFinite(input.confidence) || input.confidence < 0 || input.confidence > 1) {
       throw new Error("INVALID_CONFIDENCE: confidence must be a finite number in [0, 1]");
     }
     if (!Array.isArray(input.alternatives)) throw new Error("INVALID_ALTERNATIVES: alternatives must be an array");
-    if (input.phaseId !== null) must(this.getPhase(input.phaseId), `unknown phase: ${input.phaseId}`);
+    if (input.phaseId !== null) must2(this.getPhase(input.phaseId), `unknown phase: ${input.phaseId}`);
     const statement = input.statement.trim();
     if (!statement) throw new Error("assumption statement is required");
-    const id = randomUUID();
+    const id = randomUUID2();
     const createdAt = (/* @__PURE__ */ new Date()).toISOString();
     this.db.prepare(`
       INSERT INTO assumptions (id, phase_id, statement, confidence, alternatives_json, status, created_at, resolved_at, resolution_evidence, explicit_linked_at)
@@ -722,7 +1168,7 @@ var ProjectStore = class {
     return this.db.prepare(`SELECT * FROM assumptions${where} ORDER BY confidence ASC, created_at ASC`).all(...values).map(assumptionFromRow);
   }
   setAssumptionStatus(id, status, evidence = "") {
-    const current = must(this.getAssumption(id), `unknown assumption: ${id}`);
+    const current = must2(this.getAssumption(id), `unknown assumption: ${id}`);
     if (current.status !== "open") throw new Error(`one-way transition: ${current.status} -> ${status} is not allowed`);
     if (status === "open") return current;
     const resolvedAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -730,13 +1176,13 @@ var ProjectStore = class {
     const node = this.getGraphNode(id);
     if (node) this.upsertGraphNode({ ...node, metadata: { ...node.metadata, status, resolvedAt } });
     this.appendEvent(status === "confirmed" ? "assumption_confirmed" : "assumption_invalidated", current.phaseId, { id, evidence: evidence.trim() });
-    return must(this.getAssumption(id), "assumption status update failed");
+    return must2(this.getAssumption(id), "assumption status update failed");
   }
   confirmAssumption(id, evidence) {
     return this.setAssumptionStatus(id, "confirmed", evidence);
   }
   linkAssumption(assumptionId, nodeIds, explicit = true) {
-    const assumption = must(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
+    const assumption = must2(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
     if (assumption.status !== "open") throw new Error(`assumption ${assumptionId} is ${assumption.status}`);
     let linked = 0;
     for (const requested of [...new Set(nodeIds)]) {
@@ -772,7 +1218,7 @@ var ProjectStore = class {
     this.upsertGraphEdge({ sourceId, targetId, type, metadata: metadata2 });
   }
   computeBlastRadius(assumptionId, options = {}) {
-    must(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
+    must2(this.getAssumption(assumptionId), `unknown assumption: ${assumptionId}`);
     const maxHops = Math.max(0, Math.min(options.maxHops ?? 3, 12));
     const direct = this.getEdgesFrom(assumptionId, "depends_on_assumption").map((edge) => edge.targetId);
     if (direct.length === 0) return { nodeIds: [], files: [], decisionIds: [] };
@@ -794,12 +1240,12 @@ var ProjectStore = class {
     return { nodeIds: [...visited].sort(), files, decisionIds };
   }
   invalidateAssumption(id, rootCause, maxHops = 3, tokenStart = 0) {
-    const assumption = must(this.getAssumption(id), `unknown assumption: ${id}`);
+    const assumption = must2(this.getAssumption(id), `unknown assumption: ${id}`);
     if (assumption.status !== "open") throw new Error(`assumption ${id} is already ${assumption.status}`);
     const cause = rootCause.trim();
     if (!cause) throw new Error("root cause is required");
     const blastRadius = this.computeBlastRadius(id, { maxHops });
-    const correctionId = randomUUID();
+    const correctionId = randomUUID2();
     const appliedAt = (/* @__PURE__ */ new Date()).toISOString();
     this.transaction(() => {
       this.db.prepare("UPDATE assumptions SET status='invalidated',resolved_at=?,resolution_evidence=? WHERE id=?").run(appliedAt, cause, id);
@@ -810,7 +1256,7 @@ var ProjectStore = class {
       this.appendEvent("assumption_invalidated", assumption.phaseId, { id, rootCause: cause, correctionId });
       this.appendEvent("correction_recorded", assumption.phaseId, { correctionId, assumptionId: id, blastRadiusSize: blastRadius.nodeIds.length });
     });
-    return must(this.getCorrection(correctionId), "correction insert failed");
+    return must2(this.getCorrection(correctionId), "correction insert failed");
   }
   getCorrection(id) {
     const row = this.db.prepare("SELECT * FROM corrections WHERE id = ?").get(id);
@@ -826,7 +1272,7 @@ var ProjectStore = class {
     return row ? correctionFromRow(row) : null;
   }
   expandCorrectionScope(id, additionalNodeIds, justification) {
-    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const correction = must2(this.getCorrection(id), `unknown correction: ${id}`);
     const reason = justification.trim();
     if (!reason) throw new Error("justification must be non-empty");
     const normalized = [...new Set(additionalNodeIds.map((nodeId) => this.resolveGraphNodeId(nodeId) ?? nodeId))];
@@ -835,10 +1281,10 @@ var ProjectStore = class {
     const expansions = [...correction.expansions, expansion];
     this.db.prepare("UPDATE corrections SET expansions_json = ? WHERE id = ?").run(JSON.stringify(expansions), id);
     this.appendEvent("correction_scope_expanded", correction.phaseId, { correctionId: id, nodeIds: normalized, justification: reason });
-    return must(this.getCorrection(id), "correction expansion failed");
+    return must2(this.getCorrection(id), "correction expansion failed");
   }
   assessCorrectionOutcome(id, changedFiles, tokenEnd, complete) {
-    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const correction = must2(this.getCorrection(id), `unknown correction: ${id}`);
     const original = new Set(correction.blastRadius.files);
     const expandedFiles = new Set(correction.expansions.flatMap((item) => item.nodeIds.map((nodeId) => this.getGraphNode(nodeId)?.path).filter((value) => Boolean(value))));
     const excess = changedFiles.filter((file) => !original.has(file));
@@ -853,10 +1299,10 @@ var ProjectStore = class {
       unauthorizedFiles,
       complete: completedAt !== null
     });
-    return { correction: must(this.getCorrection(id), "correction outcome update failed"), unauthorizedFiles };
+    return { correction: must2(this.getCorrection(id), "correction outcome update failed"), unauthorizedFiles };
   }
   correctionAllowedFiles(id) {
-    const correction = must(this.getCorrection(id), `unknown correction: ${id}`);
+    const correction = must2(this.getCorrection(id), `unknown correction: ${id}`);
     const expanded = correction.expansions.flatMap((item) => item.nodeIds.map((nodeId) => this.getGraphNode(nodeId)?.path).filter((value) => Boolean(value)));
     return [.../* @__PURE__ */ new Set([...correction.blastRadius.files, ...expanded])].sort();
   }
@@ -894,7 +1340,7 @@ var ProjectStore = class {
     return null;
   }
   recordDecision(input) {
-    const id = randomUUID();
+    const id = randomUUID2();
     const createdAt = (/* @__PURE__ */ new Date()).toISOString();
     this.db.prepare(`
       INSERT INTO decisions (id, phase_id, title, rationale, alternatives_json, status, created_at)
@@ -913,25 +1359,25 @@ var ProjectStore = class {
       this.upsertGraphEdge({ sourceId: `phase:${input.phaseId}`, targetId: `decision:${id}`, type: "implements", metadata: {} });
     }
     this.appendEvent("decision_recorded", input.phaseId, { id, title: input.title });
-    return must(this.getDecision(id), "decision insert failed");
+    return must2(this.getDecision(id), "decision insert failed");
   }
   recordFailure(phaseId, summary, fingerprint) {
-    must(this.getPhase(phaseId), `unknown phase: ${phaseId}`);
+    must2(this.getPhase(phaseId), `unknown phase: ${phaseId}`);
     const normalizedFingerprint = fingerprint?.trim() || normalizedDiagnosticSignature(summary);
     const existing = this.db.prepare("SELECT * FROM failures WHERE phase_id = ? AND fingerprint = ?").get(phaseId, normalizedFingerprint);
     const now2 = (/* @__PURE__ */ new Date()).toISOString();
     if (existing) {
       this.db.prepare("UPDATE failures SET count = count + 1, summary = ?, last_seen_at = ? WHERE id = ?").run(summary.trim(), now2, String(existing.id));
       this.appendEvent("failure_repeated", phaseId, { fingerprint: normalizedFingerprint, count: Number(existing.count) + 1 });
-      return must(this.getFailure(String(existing.id)), "failure update failed");
+      return must2(this.getFailure(String(existing.id)), "failure update failed");
     }
-    const id = randomUUID();
+    const id = randomUUID2();
     this.db.prepare(`
       INSERT INTO failures (id, phase_id, fingerprint, summary, count, last_seen_at, resolution)
       VALUES (?, ?, ?, ?, 1, ?, NULL)
     `).run(id, phaseId, normalizedFingerprint, summary.trim(), now2);
     this.appendEvent("failure_recorded", phaseId, { fingerprint: normalizedFingerprint });
-    return must(this.getFailure(id), "failure insert failed");
+    return must2(this.getFailure(id), "failure insert failed");
   }
   listDecisions() {
     return this.db.prepare("SELECT * FROM decisions ORDER BY created_at").all().map(decisionFromRow);
@@ -947,7 +1393,7 @@ var ProjectStore = class {
   }
   snapshot() {
     return {
-      project: must(this.getProject(), "project is not initialized"),
+      project: must2(this.getProject(), "project is not initialized"),
       phases: this.listPhases(),
       decisions: this.listDecisions(),
       assumptions: this.listAssumptions(),
@@ -977,7 +1423,7 @@ var ProjectStore = class {
   }
   getPhaseBaseline(phaseId) {
     const row = this.db.prepare("SELECT value FROM metadata WHERE key = ?").get(`phase_baseline:${phaseId}`);
-    return row ? JSON.parse(text(row.value)) : null;
+    return row ? JSON.parse(text2(row.value)) : null;
   }
   setPhaseBaseline(phaseId, baseline) {
     this.db.prepare("INSERT OR IGNORE INTO metadata (key, value) VALUES (?, ?)").run(`phase_baseline:${phaseId}`, JSON.stringify(baseline));
@@ -1041,127 +1487,6 @@ var ProjectStore = class {
 function sha256(value) {
   return createHash3("sha256").update(value).digest("hex");
 }
-function must(value, message) {
-  if (value === null || value === void 0) throw new Error(message);
-  return value;
-}
-
-// src/storage/platform-db.ts
-import { DatabaseSync as DatabaseSync2 } from "node:sqlite";
-var PlatformDb = class {
-  db;
-  constructor(databasePath) {
-    this.db = new DatabaseSync2(databasePath);
-    this.migrate();
-  }
-  close() {
-    this.db.close();
-  }
-  transaction(operation) {
-    this.db.exec("BEGIN IMMEDIATE");
-    try {
-      const value = operation();
-      this.db.exec("COMMIT");
-      return value;
-    } catch (error2) {
-      this.db.exec("ROLLBACK");
-      throw error2;
-    }
-  }
-  migrate() {
-    this.db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA busy_timeout = 5000;
-      CREATE TABLE IF NOT EXISTS plan_revisions (
-        version INTEGER PRIMARY KEY, contract_json TEXT NOT NULL, amendment_json TEXT, created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS approvals (
-        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, prompt TEXT NOT NULL, status TEXT NOT NULL,
-        requested_at TEXT NOT NULL, resolved_at TEXT, resolution_note TEXT
-      );
-      CREATE TABLE IF NOT EXISTS budget_usage (
-        scope TEXT NOT NULL, scope_id TEXT NOT NULL, tokens INTEGER NOT NULL DEFAULT 0,
-        estimated_tokens INTEGER NOT NULL DEFAULT 0, cost_usd REAL NOT NULL DEFAULT 0,
-        wall_clock_ms INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY (scope, scope_id)
-      );
-      CREATE TABLE IF NOT EXISTS critic_reviews (
-        id TEXT PRIMARY KEY, phase_id TEXT NOT NULL, evidence_json TEXT NOT NULL, created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS worktrees (
-        phase_id TEXT PRIMARY KEY, path TEXT NOT NULL, branch TEXT NOT NULL, status TEXT NOT NULL,
-        base_sha TEXT NOT NULL, created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS command_failures (
-        phase_id TEXT NOT NULL, command TEXT NOT NULL, attempt INTEGER NOT NULL,
-        stdout TEXT NOT NULL, stderr TEXT NOT NULL, fingerprint TEXT NOT NULL, created_at TEXT NOT NULL,
-        PRIMARY KEY (phase_id, command, attempt)
-      );
-      CREATE INDEX IF NOT EXISTS idx_command_failures_latest ON command_failures(phase_id, command, attempt DESC);
-    `);
-    addColumn(this.db, "budget_usage", "estimated_tokens", "INTEGER NOT NULL DEFAULT 0");
-    const additions = {
-      revision: "INTEGER NOT NULL DEFAULT 1",
-      superseded_by: "TEXT",
-      requires_approval: "INTEGER NOT NULL DEFAULT 0",
-      approval_prompt: "TEXT",
-      approved_at: "TEXT",
-      budget_json: "TEXT NOT NULL DEFAULT '{}'",
-      critic_blocking: "INTEGER NOT NULL DEFAULT 0",
-      parallel_safe: "INTEGER NOT NULL DEFAULT 0",
-      reverify_reason: "TEXT",
-      verification_kind: "TEXT NOT NULL DEFAULT 'code'"
-    };
-    for (const [name2, definition] of Object.entries(additions)) addColumn(this.db, "phases", name2, definition);
-  }
-};
-function addColumn(db, table, name2, definition) {
-  const columns = db.prepare(`PRAGMA table_info(${table})`).all();
-  if (!columns.some((row) => text2(row.name) === name2)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${name2} ${definition}`);
-}
-function approvalFromRow(row) {
-  return {
-    id: text2(row.id),
-    phaseId: text2(row.phase_id),
-    prompt: text2(row.prompt),
-    status: text2(row.status),
-    requestedAt: text2(row.requested_at),
-    resolvedAt: nullable(row.resolved_at),
-    resolutionNote: nullable(row.resolution_note)
-  };
-}
-function usageFromRow(row) {
-  return {
-    tokens: Number(row.tokens),
-    estimatedTokens: Number(row.estimated_tokens ?? 0),
-    costUsd: Number(row.cost_usd),
-    wallClockMs: Number(row.wall_clock_ms),
-    updatedAt: text2(row.updated_at)
-  };
-}
-function worktreeFromRow(row) {
-  return {
-    phaseId: text2(row.phase_id),
-    path: text2(row.path),
-    branch: text2(row.branch),
-    status: text2(row.status),
-    baseSha: text2(row.base_sha),
-    createdAt: text2(row.created_at)
-  };
-}
-function text2(value) {
-  if (typeof value === "string") return value;
-  if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
-  throw new Error("non-scalar database value");
-}
-function nullable(value) {
-  return value === null || value === void 0 ? null : text2(value);
-}
-function json(value) {
-  return JSON.parse(text2(value));
-}
-function now() {
-  return (/* @__PURE__ */ new Date()).toISOString();
-}
 function must2(value, message) {
   if (value === null || value === void 0) throw new Error(message);
   return value;
@@ -1171,9 +1496,9 @@ function must2(value, message) {
 function graphNode(db, id) {
   const row = db.prepare("SELECT * FROM graph_nodes WHERE id = ? AND active = 1").get(id);
   return row ? {
-    id: text2(row.id),
-    type: text2(row.type),
-    label: text2(row.label),
+    id: text(row.id),
+    type: text(row.type),
+    label: text(row.label),
     path: nullable(row.path),
     symbol: nullable(row.symbol),
     contentHash: nullable(row.content_hash),
@@ -1184,7 +1509,7 @@ function impact(db, start2, maxDepth = 3, limit = 100) {
   const direct = graphNode(db, start2);
   const starts = direct ? [start2] : db.prepare(
     "SELECT id FROM graph_nodes WHERE active = 1 AND (path = ? OR symbol = ? OR label = ?) LIMIT 20"
-  ).all(start2.replace(/\\/g, "/"), start2, start2).map((row) => text2(row.id));
+  ).all(start2.replace(/\\/g, "/"), start2, start2).map((row) => text(row.id));
   const seen = new Set(starts);
   let frontier = starts.map((id) => ({ id, distance: 0, via: null }));
   const result = [];
@@ -1198,12 +1523,12 @@ function impact(db, start2, maxDepth = 3, limit = 100) {
         "SELECT source_id, target_id, type FROM graph_edges WHERE source_id = ? OR target_id = ?"
       ).all(item.id, item.id);
       for (const row of rows) {
-        const source = text2(row.source_id);
-        const target = text2(row.target_id);
+        const source = text(row.source_id);
+        const target = text(row.target_id);
         const neighbor = source === item.id ? target : source;
         if (seen.has(neighbor)) continue;
         seen.add(neighbor);
-        next.push({ id: neighbor, distance: item.distance + 1, via: text2(row.type) });
+        next.push({ id: neighbor, distance: item.distance + 1, via: text(row.type) });
       }
     }
     frontier = next;
@@ -1220,12 +1545,12 @@ function impactedTests(db, files) {
       "SELECT source_id, target_id, type FROM graph_edges WHERE target_id = ? OR source_id = ?"
     ).all(id, id);
     for (const row of rows) {
-      const source = text2(row.source_id);
-      const target = text2(row.target_id);
+      const source = text(row.source_id);
+      const target = text(row.target_id);
       const candidate = source === id ? target : source;
       const node = graphNode(db, candidate);
       if (node?.type === "test" && node.path) tests.add(node.path);
-      if (["imports", "tested_by"].includes(text2(row.type)) && !seen.has(candidate)) {
+      if (["imports", "tested_by"].includes(text(row.type)) && !seen.has(candidate)) {
         seen.add(candidate);
         queue.push(candidate);
       }
@@ -1241,12 +1566,12 @@ function recordInitialPlan(host, contract, phases, version2) {
 }
 function amendPlan(host, amendment) {
   if (amendment.reason.trim().length < 10) throw new Error("plan amendment requires a concrete reason");
-  const project = must2(host.project(), "project is not initialized");
-  const contract = must2(project.contract, "save the initial plan before amending it");
+  const project = must(host.project(), "project is not initialized");
+  const contract = must(project.contract, "save the initial plan before amending it");
   const existing = new Map(host.phases().map((phase) => [phase.id, phase]));
   validateDefinitions(amendment.addPhases, existing);
   for (const id of amendment.supersedePhaseIds) {
-    const phase = must2(existing.get(id), `unknown superseded phase: ${id}`);
+    const phase = must(existing.get(id), `unknown superseded phase: ${id}`);
     if (["IN_PROGRESS", "VERIFYING"].includes(phase.status)) throw new Error("an in-progress phase cannot be superseded");
   }
   const version2 = project.planVersion + 1;
@@ -1290,7 +1615,7 @@ function amendPlan(host, amendment) {
     for (const dependency of phase.dependencies) host.graphEdge({ sourceId: `phase:${phase.id}`, targetId: `phase:${dependency}`, type: "depends_on", metadata: { version: version2 } });
   });
   const currentRow = host.db.prepare("SELECT id FROM phases WHERE status IN ('READY','REVERIFY_REQUIRED','AWAITING_APPROVAL') ORDER BY ordinal LIMIT 1").get();
-  const current = currentRow ? text2(currentRow.id) : null;
+  const current = currentRow ? text(currentRow.id) : null;
   host.db.prepare("UPDATE project SET contract_json = ?, plan_version = ?, status = 'ACTIVE', current_phase_id = ?, updated_at = ?").run(JSON.stringify(nextContract), version2, current, now());
   host.db.prepare("INSERT INTO plan_revisions (version, contract_json, amendment_json, created_at) VALUES (?, ?, ?, ?)").run(version2, JSON.stringify(nextContract), JSON.stringify(amendment), now());
   host.event("plan_amended", null, {
@@ -1305,7 +1630,7 @@ function listPlanRevisions(db) {
     version: Number(row.version),
     contract: json(row.contract_json),
     amendment: row.amendment_json ? json(row.amendment_json) : null,
-    createdAt: text2(row.created_at)
+    createdAt: text(row.created_at)
   }));
 }
 function writePhaseOptions(db, phase, revision) {
@@ -1326,12 +1651,12 @@ function redirectDependencies(db, superseded, replacement) {
     const dependencies = json(row.dependencies_json);
     if (!dependencies.some((dependency) => superseded.includes(dependency))) continue;
     const redirected = [...new Set(dependencies.map((dependency) => superseded.includes(dependency) ? replacement : dependency))];
-    db.prepare("UPDATE phases SET dependencies_json = ? WHERE id = ?").run(JSON.stringify(redirected), text2(row.id));
+    db.prepare("UPDATE phases SET dependencies_json = ? WHERE id = ?").run(JSON.stringify(redirected), text(row.id));
   }
 }
 function dependencySatisfied(db, id) {
   const row = db.prepare("SELECT status FROM phases WHERE id = ?").get(id);
-  return Boolean(row && ["COMPLETED", "SUPERSEDED"].includes(text2(row.status)));
+  return Boolean(row && ["COMPLETED", "SUPERSEDED"].includes(text(row.status)));
 }
 function validateDefinitions(phases, existing) {
   const ids = /* @__PURE__ */ new Set();
@@ -1376,25 +1701,25 @@ function mergeContract(contract, patch) {
 }
 
 // src/storage/platform-runtime.ts
-import { randomUUID as randomUUID2 } from "node:crypto";
+import { randomUUID as randomUUID3 } from "node:crypto";
 function requestApproval(host, phaseId, prompt) {
   const pending = host.db.prepare("SELECT * FROM approvals WHERE phase_id = ? AND status = 'pending' LIMIT 1").get(phaseId);
   if (pending) return approvalFromRow(pending);
-  const id = randomUUID2();
+  const id = randomUUID3();
   host.db.prepare("INSERT INTO approvals VALUES (?, ?, ?, 'pending', ?, NULL, NULL)").run(id, phaseId, prompt, now());
   host.db.prepare("UPDATE phases SET status = 'AWAITING_APPROVAL' WHERE id = ?").run(phaseId);
   host.db.prepare("UPDATE project SET status = 'AWAITING_APPROVAL', current_phase_id = ?, updated_at = ?").run(phaseId, now());
   host.event("approval_requested", phaseId, { id, prompt });
-  return approvalFromRow(must2(host.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id), "approval insert failed"));
+  return approvalFromRow(must(host.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id), "approval insert failed"));
 }
 function resolveApproval(host, id, approved, note) {
-  const record2 = must2(host.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id), `unknown approval: ${id}`);
-  if (text2(record2.status) !== "pending") throw new Error("approval already resolved");
+  const record2 = must(host.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id), `unknown approval: ${id}`);
+  if (text(record2.status) !== "pending") throw new Error("approval already resolved");
   host.db.prepare("UPDATE approvals SET status = ?, resolved_at = ?, resolution_note = ? WHERE id = ?").run(approved ? "approved" : "rejected", now(), note, id);
-  host.db.prepare("UPDATE phases SET status = ?, approved_at = ? WHERE id = ?").run(approved ? "READY" : "BLOCKED", approved ? now() : null, text2(record2.phase_id));
-  host.db.prepare("UPDATE project SET status = ?, current_phase_id = ?, updated_at = ?").run(approved ? "ACTIVE" : "BLOCKED", text2(record2.phase_id), now());
-  host.event("approval_resolved", text2(record2.phase_id), { id, approved, note });
-  return approvalFromRow(must2(host.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id), "approval update failed"));
+  host.db.prepare("UPDATE phases SET status = ?, approved_at = ? WHERE id = ?").run(approved ? "READY" : "BLOCKED", approved ? now() : null, text(record2.phase_id));
+  host.db.prepare("UPDATE project SET status = ?, current_phase_id = ?, updated_at = ?").run(approved ? "ACTIVE" : "BLOCKED", text(record2.phase_id), now());
+  host.event("approval_resolved", text(record2.phase_id), { id, approved, note });
+  return approvalFromRow(must(host.db.prepare("SELECT * FROM approvals WHERE id = ?").get(id), "approval update failed"));
 }
 function listApprovals(db) {
   return db.prepare("SELECT * FROM approvals ORDER BY requested_at").all().map(approvalFromRow);
@@ -1418,8 +1743,8 @@ function getBudgetUsage(db, scope, scopeId) {
   return row ? usageFromRow(row) : { tokens: 0, estimatedTokens: 0, costUsd: 0, wallClockMs: 0, updatedAt: "" };
 }
 function budgetEvidence(host, phaseId) {
-  const project = must2(host.project(), "project missing");
-  const phase = must2(host.phase(phaseId), `unknown phase: ${phaseId}`);
+  const project = must(host.project(), "project missing");
+  const phase = must(host.phase(phaseId), `unknown phase: ${phaseId}`);
   const limits = mergeLimits(project.contract?.budget, phase.budget);
   const projectUsage = getBudgetUsage(host.db, "project", project.id);
   const phaseUsage = getBudgetUsage(host.db, "phase", phaseId);
@@ -1437,10 +1762,10 @@ function budgetEvidence(host, phaseId) {
   return { passed: violations.length === 0, limits, usage, violations };
 }
 function listBudgetUsage(db) {
-  return Object.fromEntries(db.prepare("SELECT * FROM budget_usage").all().map((row) => [`${text2(row.scope)}:${text2(row.scope_id)}`, usageFromRow(row)]));
+  return Object.fromEntries(db.prepare("SELECT * FROM budget_usage").all().map((row) => [`${text(row.scope)}:${text(row.scope_id)}`, usageFromRow(row)]));
 }
 function recordCriticReview(db, phaseId, evidence) {
-  db.prepare("INSERT INTO critic_reviews VALUES (?, ?, ?, ?)").run(randomUUID2(), phaseId, JSON.stringify(evidence), now());
+  db.prepare("INSERT INTO critic_reviews(id, phase_id, evidence_json, created_at) VALUES (?, ?, ?, ?)").run(randomUUID3(), phaseId, JSON.stringify(evidence), now());
 }
 function setWorktree(db, record2) {
   db.prepare(`INSERT INTO worktrees VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(phase_id) DO UPDATE SET path = excluded.path, branch = excluded.branch, status = excluded.status, base_sha = excluded.base_sha`).run(record2.phaseId, record2.path, record2.branch, record2.status, record2.baseSha, record2.createdAt);
@@ -1463,7 +1788,7 @@ var PlatformStore = class extends ProjectStore {
   platform;
   constructor(projectRoot) {
     super(projectRoot);
-    this.platform = new PlatformDb(this.databasePath);
+    this.platform = new PlatformDb(this.db);
   }
   close() {
     this.platform.close();
@@ -1496,30 +1821,35 @@ var PlatformStore = class extends ProjectStore {
     return this.listPhases().filter((phase) => phase.status === "READY");
   }
   startPhase(id, baseSha, allowParallel = false) {
-    const phase = required(this.getPhase(id), `unknown phase: ${id}`);
+    const phase = required2(this.getPhase(id), `unknown phase: ${id}`);
     if (phase.requiresApproval && !phase.approvedAt) {
       this.requestApproval(id, phase.approvalPrompt ?? `Approve phase ${phase.title}`);
       throw new Error(`phase ${id} is awaiting human approval`);
     }
     if (!["READY", "FAILED", "REVERIFY_REQUIRED"].includes(phase.status)) throw new Error(`phase ${id} cannot start from ${phase.status}`);
-    const dependencies = phase.dependencies.map((dependency) => required(this.getPhase(dependency), `missing dependency: ${dependency}`));
+    const dependencies = phase.dependencies.map((dependency) => required2(this.getPhase(dependency), `missing dependency: ${dependency}`));
     if (dependencies.some((dependency) => !["COMPLETED", "SUPERSEDED"].includes(dependency.status))) throw new Error(`phase ${id} has unfinished dependencies`);
     const active = this.activePhases();
     if (active.length > 0 && (!allowParallel || !phase.parallelSafe || active.some((item) => !item.parallelSafe))) {
       throw new Error("another phase is active; only parallel-safe phases may overlap");
     }
     const timestamp = now();
-    this.platform.db.prepare(`UPDATE phases SET status='IN_PROGRESS',started_at=COALESCE(started_at,?),base_sha=COALESCE(base_sha,?),reverify_reason=NULL WHERE id=?`).run(timestamp, baseSha, id);
+    const updated = this.platform.db.prepare(`
+      UPDATE phases SET status='IN_PROGRESS',started_at=COALESCE(started_at,?),
+        base_sha=COALESCE(base_sha,?),reverify_reason=NULL
+      WHERE id=? AND status IN ('READY','FAILED','REVERIFY_REQUIRED')
+    `).run(timestamp, baseSha, id);
+    if (Number(updated.changes) !== 1) throw new Error(`phase ${id} changed before it could start`);
     this.platform.db.prepare("UPDATE project SET status='ACTIVE',current_phase_id=?,updated_at=?").run(id, timestamp);
     this.appendEvent("phase_started", id, { baseSha, parallel: allowParallel });
-    return required(this.getPhase(id), "phase start failed");
+    return required2(this.getPhase(id), "phase start failed");
   }
   finishVerification(id, summary, evidence) {
     if (!evidence.budget.passed) {
       this.platform.db.prepare("UPDATE phases SET status='BLOCKED_BUDGET',attempts=attempts+1,summary=? WHERE id=?").run(summary, id);
       this.platform.db.prepare("UPDATE project SET status='BLOCKED_BUDGET',current_phase_id=?,updated_at=?").run(id, now());
       this.appendEvent("phase_budget_blocked", id, { violations: evidence.budget.violations });
-      return required(this.getPhase(id), "phase budget update failed");
+      return required2(this.getPhase(id), "phase budget update failed");
     }
     const result = this.augment(super.finishVerification(id, summary, evidence));
     recordCriticReview(this.platform.db, id, evidence.critic);
@@ -1534,7 +1864,7 @@ var PlatformStore = class extends ProjectStore {
     const timestamp = now();
     this.platform.db.prepare("UPDATE project SET status='COMPLETED',current_phase_id=NULL,updated_at=?").run(timestamp);
     this.appendEvent("project_completed", null, { phaseCount: phases.filter((phase) => phase.status === "COMPLETED").length });
-    return required(this.getProject(), "project completion failed");
+    return required2(this.getProject(), "project completion failed");
   }
   recordFailure(phaseId, summary, fingerprint) {
     return super.recordFailure(phaseId, summary, fingerprint?.trim() || normalizedDiagnosticSignature(summary));
@@ -1556,6 +1886,15 @@ var PlatformStore = class extends ProjectStore {
     this.appendEvent(eventType, scope === "phase" ? scopeId : null, { scope, scopeId, delta });
     return usage;
   }
+  recordBudgetUsageOnce(receiptKey, scope, scopeId, delta, eventType = "budget_usage_recorded") {
+    return this.platform.transaction(() => {
+      const receipt = this.platform.db.prepare("INSERT OR IGNORE INTO budget_usage_receipts(receipt_key,created_at) VALUES(?,?)").run(receiptKey, now());
+      if (Number(receipt.changes) === 0) return getBudgetUsage(this.platform.db, scope, scopeId);
+      const usage = recordBudgetUsage(this.platform.db, scope, scopeId, delta);
+      this.appendEvent(eventType, scope === "phase" ? scopeId : null, { scope, scopeId, delta, receiptKey });
+      return usage;
+    });
+  }
   budgetEvidence(phaseId) {
     return budgetEvidence(this.runtimeHost(), phaseId);
   }
@@ -1571,11 +1910,230 @@ var PlatformStore = class extends ProjectStore {
   listWorktrees() {
     return listWorktrees(this.platform.db);
   }
+  beginCheckpointRun(input) {
+    return this.platform.transaction(() => {
+      const run3 = beginCheckpointRun(this.platform.db, input);
+      this.appendEvent("checkpoint_run_started", input.phaseId, {
+        runId: run3.id,
+        executionMode: input.executionMode,
+        workspaceBaselineSha: input.workspaceBaselineSha,
+        targetBaselineSha: input.targetBaselineSha
+      });
+      return run3;
+    });
+  }
+  claimCheckpointRun(id, leaseOwner2, leaseDurationMs, force = false) {
+    return this.platform.transaction(() => {
+      const run3 = claimCheckpointRun(this.platform.db, id, leaseOwner2, leaseDurationMs, force);
+      this.appendEvent("checkpoint_run_claimed", run3.phaseId, { runId: id, forced: force });
+      return run3;
+    });
+  }
+  renewCheckpointLease(id, leaseOwner2, leaseDurationMs) {
+    renewCheckpointLease(this.platform.db, id, leaseOwner2, leaseDurationMs);
+  }
+  expireCheckpointLease(id, leaseOwner2) {
+    expireCheckpointLease(this.platform.db, id, leaseOwner2);
+  }
+  getCheckpointRun(id) {
+    return getCheckpointRun(this.platform.db, id);
+  }
+  listCheckpointRuns() {
+    return listCheckpointRuns(this.platform.db);
+  }
+  listRecoverableCheckpointRuns() {
+    return listRecoverableCheckpointRuns(this.platform.db);
+  }
+  recordCheckpointEvidence(id, leaseOwner2, evidence, impactedCompletedPhases, correctionId, leaseDurationMs) {
+    return this.platform.transaction(() => {
+      const run3 = recordCheckpointEvidence(this.platform.db, id, leaseOwner2, {
+        evidence,
+        impactedCompletedPhases,
+        correctionId
+      }, leaseDurationMs);
+      this.appendEvent("checkpoint_evidence_recorded", run3.phaseId, {
+        runId: id,
+        passed: evidence.passed,
+        diffHash: evidence.diffHash,
+        changedFiles: evidence.changedFiles
+      });
+      return run3;
+    });
+  }
+  recordCheckpointCommit(id, leaseOwner2, gitSha, leaseDurationMs) {
+    return this.platform.transaction(() => {
+      const run3 = recordCheckpointCommit(this.platform.db, id, leaseOwner2, gitSha, leaseDurationMs);
+      this.appendEvent("checkpoint_git_committed", run3.phaseId, { runId: id, gitSha });
+      return run3;
+    });
+  }
+  commitCheckpointState(id, leaseOwner2, leaseDurationMs) {
+    return this.platform.transaction(() => {
+      const run3 = required2(this.getCheckpointRun(id), `unknown checkpoint run: ${id}`);
+      if (["STATE_COMMITTED", "POST_PROCESSING", "DONE"].includes(run3.status)) {
+        return { run: run3, phase: required2(this.getPhase(run3.phaseId), `unknown phase: ${run3.phaseId}`) };
+      }
+      if (run3.leaseOwner !== leaseOwner2) throw new Error(`CHECKPOINT_LEASE_LOST: ${id}`);
+      const evidence = required2(run3.evidence, `checkpoint evidence missing: ${id}`);
+      const phase = required2(this.getPhase(run3.phaseId), `unknown phase: ${run3.phaseId}`);
+      const timestamp = now();
+      if (evidence.passed) {
+        const gitSha = required2(run3.actualGitSha, `checkpoint Git SHA missing: ${id}`);
+        if (phase.status === "VERIFYING") {
+          const update = this.platform.db.prepare(`
+            UPDATE phases SET status='COMPLETED',completed_at=?,head_sha=?,summary=?
+            WHERE id=? AND status='VERIFYING'
+          `).run(timestamp, gitSha, run3.summary, run3.phaseId);
+          if (Number(update.changes) !== 1) throw new Error(`CHECKPOINT_PHASE_COMMIT_CAS_FAILED: ${run3.phaseId}`);
+          this.platform.db.prepare(`
+            INSERT OR IGNORE INTO checkpoints(
+              id,phase_id,git_sha,summary,changed_files_json,verification_json,created_at,run_id
+            ) VALUES(?,?,?,?,?,?,?,?)
+          `).run(id, run3.phaseId, gitSha, run3.summary, JSON.stringify(evidence.changedFiles), JSON.stringify(evidence), timestamp, id);
+          for (const file of evidence.changedFiles) {
+            this.platformGraphEdge({
+              sourceId: `phase:${run3.phaseId}`,
+              targetId: `file:${file}`,
+              type: "modifies",
+              metadata: { checkpointId: id, diffHash: evidence.diffHash, runId: id }
+            });
+          }
+          this.appendEvent("phase_completed", run3.phaseId, {
+            checkpointId: id,
+            runId: id,
+            changedFiles: evidence.changedFiles
+          });
+        } else if (phase.status !== "COMPLETED") {
+          throw new Error(`CHECKPOINT_PHASE_STATE_DIVERGED: ${run3.phaseId} is ${phase.status}`);
+        }
+      } else if (phase.status === "VERIFYING") {
+        const attempts = phase.attempts + 1;
+        if (!evidence.budget.passed) {
+          this.platform.db.prepare("UPDATE phases SET status='BLOCKED_BUDGET',attempts=?,summary=? WHERE id=?").run(attempts, run3.summary, run3.phaseId);
+          this.platform.db.prepare("UPDATE project SET status='BLOCKED_BUDGET',current_phase_id=?,updated_at=?").run(run3.phaseId, timestamp);
+          this.appendEvent("phase_budget_blocked", run3.phaseId, { runId: id, violations: evidence.budget.violations });
+        } else {
+          const status = attempts >= phase.maxAttempts ? "BLOCKED" : "FAILED";
+          this.platform.db.prepare("UPDATE phases SET status=?,attempts=?,summary=? WHERE id=?").run(status, attempts, run3.summary, run3.phaseId);
+          if (status === "BLOCKED") {
+            this.platform.db.prepare("UPDATE project SET status='BLOCKED',current_phase_id=?,updated_at=?").run(run3.phaseId, timestamp);
+          }
+          this.appendEvent("phase_verification_failed", run3.phaseId, {
+            runId: id,
+            attempts,
+            status,
+            scopeViolations: evidence.scopeViolations,
+            failedCommands: evidence.commands.filter((command2) => !command2.passed).map((command2) => command2.command)
+          });
+        }
+      } else if (!["FAILED", "BLOCKED", "BLOCKED_BUDGET"].includes(phase.status)) {
+        throw new Error(`CHECKPOINT_PHASE_STATE_DIVERGED: ${run3.phaseId} is ${phase.status}`);
+      }
+      this.recordCriticReviewOnce(id, run3.phaseId, evidence);
+      const transition = this.platform.db.prepare(`
+        UPDATE checkpoint_runs SET status='STATE_COMMITTED',lease_expires_at=?,updated_at=?
+        WHERE id=? AND lease_owner=? AND status IN ('VERIFIED','GIT_COMMITTED','FAILED_RETRYABLE')
+      `).run(new Date(Date.now() + Math.max(3e4, leaseDurationMs)).toISOString(), timestamp, id, leaseOwner2);
+      if (Number(transition.changes) !== 1) throw new Error(`CHECKPOINT_STATE_CAS_FAILED: ${id}`);
+      if (evidence.passed) this.refreshReadiness();
+      return {
+        run: required2(this.getCheckpointRun(id), "checkpoint state update failed"),
+        phase: required2(this.getPhase(run3.phaseId), "phase state update failed")
+      };
+    });
+  }
+  recordCheckpointCorrectionOutcome(id, leaseOwner2, tokenEnd, complete, leaseDurationMs) {
+    return this.platform.transaction(() => {
+      const run3 = required2(this.getCheckpointRun(id), `unknown checkpoint run: ${id}`);
+      if (!run3.correctionId) return null;
+      if (run3.correctionCompletedAt) return this.getCorrection(run3.correctionId);
+      const assessed = super.assessCorrectionOutcome(run3.correctionId, run3.changedFiles, tokenEnd, complete);
+      markCheckpointStep(this.platform.db, id, leaseOwner2, "correction_completed_at", leaseDurationMs);
+      return assessed.correction;
+    });
+  }
+  markCheckpointIndexed(id, leaseOwner2, leaseDurationMs) {
+    return this.platform.transaction(() => markCheckpointStep(
+      this.platform.db,
+      id,
+      leaseOwner2,
+      "index_completed_at",
+      leaseDurationMs
+    ));
+  }
+  markCheckpointReverification(id, leaseOwner2, reason, leaseDurationMs) {
+    return this.platform.transaction(() => {
+      const run3 = required2(this.getCheckpointRun(id), `unknown checkpoint run: ${id}`);
+      if (run3.reverificationCompletedAt) return run3.reverificationRequired;
+      const marked = this.markReverification(run3.impactedCompletedPhases, reason, run3.phaseId);
+      setCheckpointReverificationRequired(this.platform.db, id, leaseOwner2, marked, leaseDurationMs);
+      return marked;
+    });
+  }
+  markCheckpointMemoryCompleted(id, leaseOwner2, leaseDurationMs) {
+    return this.platform.transaction(() => markCheckpointStep(
+      this.platform.db,
+      id,
+      leaseOwner2,
+      "memory_completed_at",
+      leaseDurationMs
+    ));
+  }
+  markCheckpointCleanupCompleted(id, leaseOwner2, leaseDurationMs) {
+    return this.platform.transaction(() => markCheckpointStep(
+      this.platform.db,
+      id,
+      leaseOwner2,
+      "cleanup_completed_at",
+      leaseDurationMs
+    ));
+  }
+  completeCheckpointRun(id, leaseOwner2) {
+    return this.platform.transaction(() => {
+      const run3 = completeCheckpointRun(this.platform.db, id, leaseOwner2);
+      this.appendEvent("checkpoint_run_completed", run3.phaseId, { runId: id, passed: run3.evidence?.passed ?? false });
+      return run3;
+    });
+  }
+  resetCheckpointRun(id, leaseOwner2, error2) {
+    return this.platform.transaction(() => {
+      const run3 = required2(this.getCheckpointRun(id), `unknown checkpoint run: ${id}`);
+      if (run3.leaseOwner !== leaseOwner2) throw new Error(`CHECKPOINT_LEASE_LOST: ${id}`);
+      this.platform.db.prepare("UPDATE phases SET status='IN_PROGRESS' WHERE id=? AND status='VERIFYING'").run(run3.phaseId);
+      this.platform.db.prepare("UPDATE project SET status='ACTIVE',current_phase_id=?,updated_at=?").run(run3.phaseId, now());
+      const timestamp = now();
+      const update = this.platform.db.prepare(`
+        UPDATE checkpoint_runs SET status='DONE',last_error=?,lease_owner=NULL,lease_expires_at=NULL,
+          updated_at=?,completed_at=COALESCE(completed_at,?)
+        WHERE id=? AND lease_owner=? AND status NOT IN ('DONE','FAILED_TERMINAL')
+      `).run(error2, timestamp, timestamp, id, leaseOwner2);
+      if (Number(update.changes) !== 1) throw new Error(`CHECKPOINT_RESET_CAS_FAILED: ${id}`);
+      this.appendEvent("checkpoint_run_reset", run3.phaseId, { runId: id, error: error2 });
+      return required2(this.getCheckpointRun(id), "checkpoint reset failed");
+    });
+  }
+  markCheckpointRetryable(id, leaseOwner2, error2) {
+    return this.platform.transaction(() => {
+      const run3 = markCheckpointRetryable(this.platform.db, id, leaseOwner2, error2);
+      this.appendEvent("checkpoint_run_retryable", run3.phaseId, { runId: id, error: error2 });
+      return run3;
+    });
+  }
+  blockCheckpointRecovery(id, leaseOwner2, error2) {
+    return this.platform.transaction(() => {
+      const run3 = required2(this.getCheckpointRun(id), `unknown checkpoint run: ${id}`);
+      this.platform.db.prepare("UPDATE phases SET status='BLOCKED',summary=? WHERE id=?").run(`Checkpoint recovery blocked: ${error2}`, run3.phaseId);
+      this.platform.db.prepare("UPDATE project SET status='BLOCKED',current_phase_id=?,updated_at=?").run(run3.phaseId, now());
+      const terminal = markCheckpointTerminal(this.platform.db, id, leaseOwner2, error2);
+      this.appendEvent("checkpoint_recovery_blocked", run3.phaseId, { runId: id, error: error2 });
+      return terminal;
+    });
+  }
   eventsSince(sequence) {
     return this.platform.db.prepare("SELECT * FROM events WHERE sequence > ? ORDER BY sequence").all(sequence).map((row) => ({
       sequence: Number(row.sequence),
-      timestamp: text2(row.timestamp),
-      type: text2(row.type),
+      timestamp: text(row.timestamp),
+      type: text(row.type),
       phaseId: nullable(row.phase_id),
       payload: json(row.payload_json)
     }));
@@ -1595,12 +2153,12 @@ var PlatformStore = class extends ProjectStore {
     const symbols = this.platform.db.prepare("SELECT * FROM graph_nodes WHERE path = ? AND type = 'symbol' AND active = 1 ORDER BY CAST(json_extract(metadata_json,'$.line') AS INTEGER), label").all(normalized).map((row) => {
       const item = json(row.metadata_json);
       return {
-        name: text2(row.label),
+        name: text(row.label),
         kind: typeof item.kind === "string" ? item.kind : "symbol",
         line: typeof item.line === "number" ? item.line : 0
       };
     });
-    const imports = this.platform.db.prepare("SELECT target_id FROM graph_edges WHERE source_id = ? AND type = 'imports' ORDER BY target_id").all(`file:${normalized}`).map((row) => text2(row.target_id).replace(/^file:/, ""));
+    const imports = this.platform.db.prepare("SELECT target_id FROM graph_edges WHERE source_id = ? AND type = 'imports' ORDER BY target_id").all(`file:${normalized}`).map((row) => text(row.target_id).replace(/^file:/, ""));
     const modifier = this.platform.db.prepare("SELECT source_id FROM graph_edges WHERE target_id = ? AND type = 'modifies' ORDER BY updated_at DESC LIMIT 1").get(`file:${normalized}`);
     return {
       path: normalized,
@@ -1608,7 +2166,7 @@ var PlatformStore = class extends ProjectStore {
       lineCount: Number(metadata2.lineCount ?? 0),
       symbols,
       imports,
-      lastModifiedByPhase: modifier ? text2(modifier.source_id).replace(/^phase:/, "") : null
+      lastModifiedByPhase: modifier ? text(modifier.source_id).replace(/^phase:/, "") : null
     };
   }
   latestCommandFailure(phaseId, command2) {
@@ -1634,7 +2192,7 @@ var PlatformStore = class extends ProjectStore {
     if (files.length === 0) return [];
     const placeholders = files.map(() => "?").join(",");
     const rows = this.platform.db.prepare(`SELECT DISTINCT SUBSTR(source_id,7) AS phase_id FROM graph_edges JOIN phases ON phases.id=SUBSTR(source_id,7) WHERE type='modifies' AND target_id IN (${placeholders}) AND phases.status='COMPLETED'`).all(...files.map((file) => `file:${file}`));
-    return rows.map((row) => text2(row.phase_id)).filter((id) => id !== exclude);
+    return rows.map((row) => text(row.phase_id)).filter((id) => id !== exclude);
   }
   graphNode(id) {
     return graphNode(this.platform.db, id);
@@ -1646,7 +2204,20 @@ var PlatformStore = class extends ProjectStore {
     return impactedTests(this.platform.db, files);
   }
   snapshot() {
-    return { ...super.snapshot(), approvals: this.listApprovals(), planRevisions: this.listPlanRevisions(), worktrees: this.listWorktrees(), budgetUsage: this.listBudgetUsage() };
+    return {
+      ...super.snapshot(),
+      approvals: this.listApprovals(),
+      checkpointRuns: this.listCheckpointRuns(),
+      planRevisions: this.listPlanRevisions(),
+      worktrees: this.listWorktrees(),
+      budgetUsage: this.listBudgetUsage()
+    };
+  }
+  recordCriticReviewOnce(runId, phaseId, evidence) {
+    this.platform.db.prepare(`
+      INSERT INTO critic_reviews(id,phase_id,evidence_json,created_at,run_id)
+      VALUES(?,?,?,?,?) ON CONFLICT(run_id) DO NOTHING
+    `).run(randomUUID4(), phaseId, JSON.stringify(evidence.critic), now(), runId);
   }
   refreshReadiness() {
     const pending = this.listPhases().filter((phase) => phase.status === "PENDING");
@@ -1673,8 +2244,8 @@ var PlatformStore = class extends ProjectStore {
       requiresApproval: Boolean(row.requires_approval),
       criticBlocking: Boolean(row.critic_blocking),
       parallelSafe: Boolean(row.parallel_safe),
-      verificationKind: text2(row.verification_kind),
-      ...row.approval_prompt ? { approvalPrompt: text2(row.approval_prompt) } : {},
+      verificationKind: text(row.verification_kind),
+      ...row.approval_prompt ? { approvalPrompt: text(row.approval_prompt) } : {},
       ...Object.keys(budget).length > 0 ? { budget } : {}
     };
   }
@@ -1704,16 +2275,16 @@ var PlatformStore = class extends ProjectStore {
 };
 function commandFailureFromRow(row) {
   return {
-    phaseId: text2(row.phase_id),
-    command: text2(row.command),
+    phaseId: text(row.phase_id),
+    command: text(row.command),
     attempt: Number(row.attempt),
-    stdout: text2(row.stdout),
-    stderr: text2(row.stderr),
-    fingerprint: text2(row.fingerprint),
-    createdAt: text2(row.created_at)
+    stdout: text(row.stdout),
+    stderr: text(row.stderr),
+    fingerprint: text(row.fingerprint),
+    createdAt: text(row.created_at)
   };
 }
-function required(value, message) {
+function required2(value, message) {
   if (value === null || value === void 0) throw new Error(message);
   return value;
 }
@@ -1744,6 +2315,9 @@ var PlaybookStore = class {
       CREATE TABLE IF NOT EXISTS failure_patterns (
         fingerprint TEXT PRIMARY KEY, summary TEXT NOT NULL, resolution TEXT, occurrences INTEGER NOT NULL,
         source_project TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS playbook_receipts (
+        receipt_key TEXT PRIMARY KEY, created_at TEXT NOT NULL
       );
     `);
     addColumn2(this.db, "playbook_patterns", "kind", "TEXT NOT NULL DEFAULT 'phase'");
@@ -1784,7 +2358,19 @@ var PlaybookStore = class {
       now2,
       now2
     );
-    return patternFromRow(required2(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature)), 1);
+    return patternFromRow(required3(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature)), 1);
+  }
+  rememberPhaseOnce(receiptKey, sourceProject, phase, keywords) {
+    const tuple = compactPhase(phase, keywords);
+    const signature = patternSignature(tuple.pattern, tuple.triggerConditions, tuple.resolution, tuple.applicabilityScope);
+    return this.transaction(() => {
+      const receipt = this.db.prepare("INSERT OR IGNORE INTO playbook_receipts(receipt_key,created_at) VALUES(?,?)").run(receiptKey, (/* @__PURE__ */ new Date()).toISOString());
+      if (Number(receipt.changes) === 0) {
+        const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature=?").get(signature);
+        return patternFromRow(required3(existing), 1);
+      }
+      return this.rememberPhase(sourceProject, phase, keywords);
+    });
   }
   rememberCorrection(sourceProject, assumption, correction) {
     const pattern = `Avoid assumption: ${assumption.statement}`;
@@ -1808,7 +2394,19 @@ ${correction.rootCause}`, 32);
         applicability_scope_json=excluded.applicability_scope_json,source_projects_json=excluded.source_projects_json,
         success_count=playbook_patterns.success_count+1,updated_at=excluded.updated_at,kind='anti_pattern',metadata_json=excluded.metadata_json
     `).run(id, signature, pattern, JSON.stringify(triggerConditions), JSON.stringify(resolution), JSON.stringify(applicabilityScope), JSON.stringify(sources), timestamp, timestamp, JSON.stringify(metadata2));
-    return patternFromRow(required2(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature)), 1);
+    return patternFromRow(required3(this.db.prepare("SELECT * FROM playbook_patterns WHERE signature = ?").get(signature)), 1);
+  }
+  rememberCorrectionOnce(receiptKey, sourceProject, assumption, correction) {
+    const signature = normalizedDiagnosticSignature(`${assumption.statement}
+${correction.rootCause}`, 32);
+    return this.transaction(() => {
+      const receipt = this.db.prepare("INSERT OR IGNORE INTO playbook_receipts(receipt_key,created_at) VALUES(?,?)").run(receiptKey, (/* @__PURE__ */ new Date()).toISOString());
+      if (Number(receipt.changes) === 0) {
+        const existing = this.db.prepare("SELECT * FROM playbook_patterns WHERE signature=?").get(signature);
+        return patternFromRow(required3(existing), 1);
+      }
+      return this.rememberCorrection(sourceProject, assumption, correction);
+    });
   }
   list(kind) {
     const rows = kind ? this.db.prepare("SELECT * FROM playbook_patterns WHERE kind = ? ORDER BY updated_at DESC").all(kind) : this.db.prepare("SELECT * FROM playbook_patterns ORDER BY updated_at DESC").all();
@@ -1866,6 +2464,17 @@ ${correction.rootCause}`, 32);
       );
     }
   }
+  transaction(operation) {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = operation();
+      this.db.exec("COMMIT");
+      return value;
+    } catch (error2) {
+      this.db.exec("ROLLBACK");
+      throw error2;
+    }
+  }
 };
 function compactPhase(phase, keywords) {
   return {
@@ -1914,7 +2523,7 @@ function scalar(value) {
   if (typeof value === "number" || typeof value === "bigint" || typeof value === "boolean") return String(value);
   throw new Error("non-scalar playbook value");
 }
-function required2(value) {
+function required3(value) {
   if (value === null || value === void 0) throw new Error("playbook write failed");
   return value;
 }
@@ -1924,7 +2533,38 @@ function addColumn2(db, table, name2, definition) {
 }
 
 // src/core/checkpoint.ts
-import { createHash as createHash8 } from "node:crypto";
+import { createHash as createHash8, randomUUID as randomUUID5 } from "node:crypto";
+import { hostname } from "node:os";
+
+// src/integrations/github.ts
+function generatePullRequestDescription(snapshot) {
+  const completed = snapshot.phases.filter((phase) => phase.status === "COMPLETED");
+  const decisions = snapshot.decisions.filter((decision) => decision.status === "active").slice(-12);
+  const checks = snapshot.checkpoints.flatMap((checkpoint) => [...checkpoint.verification.selectiveCommands, ...checkpoint.verification.commands]).filter((item, index, all) => all.findIndex((candidate) => candidate.command === item.command) === index);
+  return [
+    `## Goal
+
+${snapshot.project.contract?.goal ?? snapshot.project.originalPrompt}`,
+    `## Delivered phases
+
+${completed.map((phase) => `- **${phase.title}** \u2014 ${phase.summary ?? phase.goal}`).join("\n") || "- None"}`,
+    decisions.length > 0 ? `## Decisions
+
+${decisions.map((decision) => `- **${decision.title}:** ${decision.rationale}`).join("\n")}` : "",
+    `## Verification
+
+${checks.map((check) => `- \`${check.command}\` \u2014 ${check.passed ? "passed" : "failed"}`).join("\n") || "- No checkpoint commands recorded"}`,
+    `## Evidence
+
+- Plan version: ${snapshot.project.planVersion}
+- Checkpoints: ${snapshot.checkpoints.length}
+- Event sequence: ${snapshot.recentEvents.at(-1)?.sequence ?? 0}`
+  ].filter(Boolean).join("\n\n");
+}
+function generateCommitMessage(phaseId, summary) {
+  const normalized = summary.trim().replace(/\s+/g, " ").slice(0, 68);
+  return `keep-coding(${phaseId}): ${normalized}`;
+}
 
 // src/core/critic.ts
 import { spawn } from "node:child_process";
@@ -2103,7 +2743,7 @@ function last(values) {
 
 // src/core/graph/treesitter/engine.ts
 import { createHash as createHash5 } from "node:crypto";
-import { access, readFile as readFile2, stat } from "node:fs/promises";
+import { access as access2, readFile as readFile2, stat } from "node:fs/promises";
 import path4 from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -6198,7 +6838,7 @@ function countErrors(root) {
   return { errors, total };
 }
 async function exists(value) {
-  return access(value).then(() => true, () => false);
+  return access2(value).then(() => true, () => false);
 }
 
 // src/core/graph/treesitter/language-adapters.ts
@@ -8855,86 +9495,401 @@ function skippedCritic(blocking, enabled = true) {
 }
 
 // src/core/checkpoint.ts
-var CheckpointPipeline = class {
-  constructor(store) {
+var LEASE_DURATION_MS = 9e4;
+var HEARTBEAT_INTERVAL_MS = 2e4;
+var CheckpointCrashError = class extends Error {
+  constructor(point, runId) {
+    super(`simulated checkpoint crash at ${point}: ${runId}`);
+    this.point = point;
+    this.runId = runId;
+    this.name = "CheckpointCrashError";
+  }
+  point;
+  runId;
+};
+var CheckpointRecoveryBlockedError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CheckpointRecoveryBlockedError";
+  }
+};
+var CheckpointPipeline = class _CheckpointPipeline {
+  constructor(store, hooks = {}) {
     this.store = store;
+    this.hooks = hooks;
   }
   store;
+  hooks;
+  static async recover(git, store) {
+    const report = { recovered: [], reset: [], blocked: [], deferred: [] };
+    const pipeline = new _CheckpointPipeline(store);
+    for (const candidate of store.listRecoverableCheckpointRuns()) {
+      if (!leaseCanBeTaken(candidate)) {
+        report.deferred.push(candidate.id);
+        continue;
+      }
+      const owner = leaseOwner();
+      try {
+        const run3 = store.claimCheckpointRun(candidate.id, owner, LEASE_DURATION_MS, true);
+        if (!run3.evidence) {
+          store.resetCheckpointRun(run3.id, owner, "Recovery reset a checkpoint that had no durable verification evidence.");
+          report.reset.push(run3.id);
+          continue;
+        }
+        await pipeline.withLeaseHeartbeat(run3.id, owner, async () => {
+          await pipeline.resumeCommittedRun(run3.id, owner, git);
+        });
+        report.recovered.push(run3.id);
+      } catch (error2) {
+        const current = store.getCheckpointRun(candidate.id);
+        const message = errorMessage(error2);
+        if (current?.leaseOwner === owner && current.status !== "DONE" && current.status !== "FAILED_TERMINAL") {
+          if (error2 instanceof CheckpointRecoveryBlockedError) {
+            store.blockCheckpointRecovery(candidate.id, owner, message);
+            report.blocked.push(candidate.id);
+          } else {
+            store.markCheckpointRetryable(candidate.id, owner, message);
+            report.deferred.push(candidate.id);
+          }
+        } else if (current?.status === "FAILED_TERMINAL") {
+          report.blocked.push(candidate.id);
+        } else {
+          report.deferred.push(candidate.id);
+        }
+      }
+    }
+    return report;
+  }
   async run(options) {
-    const phase = this.store.getPhase(options.phaseId);
-    if (!phase) throw new Error(`unknown phase: ${options.phaseId}`);
+    const phase = required4(this.store.getPhase(options.phaseId), `unknown phase: ${options.phaseId}`);
     const project = this.store.getProject();
-    if (!project?.contract) throw new Error("project contract is missing");
+    const contract = project?.contract;
+    if (!project || !contract) throw new Error("project contract is missing");
     const baseline = this.store.getPhaseBaseline(options.phaseId) ?? void 0;
     const changedFiles = baseline ? await options.workspaceGit.changedFilesSince(baseline) : await options.workspaceGit.changedFiles();
     this.store.autoLinkChangedFiles(options.phaseId, changedFiles);
-    await this.enforceAssumptionPolicy(options.workspaceGit, phase, project.contract, changedFiles);
+    await this.enforceAssumptionPolicy(options.workspaceGit, phase, contract, changedFiles);
+    const executionMode = options.executionMode ?? "serial";
+    const owner = leaseOwner();
+    const run3 = this.store.beginCheckpointRun({
+      phaseId: options.phaseId,
+      executionMode,
+      summary: options.summary,
+      workspaceBaselineSha: await options.workspaceGit.headSha(),
+      targetBaselineSha: await options.indexGit.headSha(),
+      leaseOwner: owner,
+      leaseDurationMs: LEASE_DURATION_MS
+    });
+    try {
+      return await this.withLeaseHeartbeat(run3.id, owner, async () => {
+        await this.fault("after_run_started", run3.id);
+        const evidence = await this.verifyRun(run3, options, phase, contract, baseline);
+        await this.fault("after_verification", run3.id);
+        this.persistCommandFailures(
+          options.phaseId,
+          phase.attempts + 1,
+          [...evidence.selectiveCommands, ...evidence.commands]
+        );
+        recordCommandOutputUsage(
+          this.store,
+          options.phaseId,
+          [...evidence.selectiveCommands, ...evidence.commands],
+          `checkpoint:${run3.id}:command-output`
+        );
+        const correction = this.store.activeCorrection(options.phaseId);
+        this.store.recordCheckpointEvidence(
+          run3.id,
+          owner,
+          evidence,
+          evidence.impactedCompletedPhases,
+          correction?.id ?? null,
+          LEASE_DURATION_MS
+        );
+        await this.fault("after_evidence_persisted", run3.id);
+        const currentDiffHash = await options.workspaceGit.diffHash();
+        if (currentDiffHash !== evidence.diffHash) {
+          this.store.resetCheckpointRun(
+            run3.id,
+            owner,
+            `WORKTREE_CHANGED_AFTER_VERIFICATION: expected ${evidence.diffHash}, found ${currentDiffHash}`
+          );
+          throw new Error("WORKTREE_CHANGED_AFTER_VERIFICATION: checkpoint evidence no longer matches the workspace");
+        }
+        if (evidence.passed) {
+          const gitSha = await this.commitRun(run3.id, executionMode, options.workspaceGit, options.indexGit, evidence, options.summary);
+          this.store.recordCheckpointCommit(run3.id, owner, gitSha, LEASE_DURATION_MS);
+          await this.fault("after_git_committed", run3.id);
+        }
+        const committed = this.store.commitCheckpointState(run3.id, owner, LEASE_DURATION_MS);
+        await this.fault("after_state_committed", run3.id);
+        const correctionResult = this.store.recordCheckpointCorrectionOutcome(
+          run3.id,
+          owner,
+          this.store.totalRecordedTokens(),
+          evidence.passed,
+          LEASE_DURATION_MS
+        );
+        await this.fault("after_correction", run3.id);
+        let reverificationRequired = [];
+        if (evidence.passed) {
+          reverificationRequired = await this.postProcessSuccessfulRun(
+            run3.id,
+            owner,
+            options.indexGit,
+            options.reverificationReason(evidence.changedFiles)
+          );
+        } else {
+          if (executionMode === "parallel") this.markParallelFailure(run3.phaseId);
+          this.store.completeCheckpointRun(run3.id, owner);
+        }
+        const updatedRun = required4(this.store.getCheckpointRun(run3.id), `checkpoint run missing: ${run3.id}`);
+        const updatedEvidence = required4(updatedRun.evidence, `checkpoint evidence missing: ${run3.id}`);
+        const updatedPhase = required4(this.store.getPhase(run3.phaseId), `unknown phase: ${run3.phaseId}`);
+        return {
+          phase: committed.phase.status === updatedPhase.status ? updatedPhase : committed.phase,
+          evidence: updatedEvidence,
+          correction: correctionResult,
+          reverificationRequired,
+          project: this.store.getProject(),
+          nextAction: updatedEvidence.passed ? this.store.currentPhase() ? "start_phase" : "complete_project" : "repair_phase"
+        };
+      });
+    } catch (error2) {
+      await this.handleRunError(run3.id, owner, error2);
+      throw error2;
+    }
+  }
+  async verifyRun(run3, options, phase, contract, baseline) {
     const correction = this.store.activeCorrection(options.phaseId);
     const correctionAllowedFiles = correction ? this.store.correctionAllowedFiles(correction.id) : void 0;
-    this.store.markVerifying(options.phaseId);
-    const verifying = this.store.getPhase(options.phaseId);
-    if (!verifying) throw new Error(`unknown phase: ${options.phaseId}`);
+    const changedFiles = baseline ? await options.workspaceGit.changedFilesSince(baseline) : await options.workspaceGit.changedFiles();
     const impactedCompletedPhases = this.store.completedPhasesTouching(changedFiles, options.phaseId);
     const impactedTests2 = this.store.impactedTests(changedFiles);
-    const selectiveCommands = project.contract.selectiveTests && impactedTests2.length > 0 ? [project.contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests2.map(shellQuote).join(" "))] : [];
-    const previousFailures = [.../* @__PURE__ */ new Set([...selectiveCommands, ...verifying.acceptanceCommands])].map((command2) => this.store.latestCommandFailure(options.phaseId, command2)).filter((record2) => record2 !== null);
-    const evidence = await new PhaseVerifier().verify(options.workspaceGit, verifying, {
+    const selectiveCommands = contract.selectiveTests && impactedTests2.length > 0 ? [contract.selectiveTests.commandTemplate.replace("{tests}", impactedTests2.map(shellQuote).join(" "))] : [];
+    const previousFailures = [.../* @__PURE__ */ new Set([...selectiveCommands, ...phase.acceptanceCommands])].map((command2) => this.store.latestCommandFailure(options.phaseId, command2)).filter((record2) => record2 !== null);
+    this.store.renewCheckpointLease(run3.id, required4(run3.leaseOwner, "checkpoint lease owner missing"), LEASE_DURATION_MS);
+    return new PhaseVerifier().verify(options.workspaceGit, phase, {
       ...baseline ? { baseline } : {},
       selectiveCommands,
       budget: this.store.budgetEvidence(options.phaseId),
-      contract: project.contract,
+      contract,
       impactedCompletedPhases,
       previousFailures,
       ...correctionAllowedFiles ? { correctionAllowedFiles } : {}
     });
-    this.persistCommandFailures(options.phaseId, phase.attempts + 1, [...evidence.selectiveCommands, ...evidence.commands]);
-    recordCommandOutputUsage(this.store, options.phaseId, [...evidence.selectiveCommands, ...evidence.commands]);
-    let correctionResult = null;
-    if (correction) {
-      const assessed = this.store.assessCorrectionOutcome(
-        correction.id,
-        changedFiles,
+  }
+  async resumeCommittedRun(runId, owner, git) {
+    let run3 = required4(this.store.getCheckpointRun(runId), `unknown checkpoint run: ${runId}`);
+    const evidence = required4(run3.evidence, `checkpoint evidence missing: ${runId}`);
+    if (evidence.passed && !run3.actualGitSha) {
+      const gitSha = await this.recoverGitCommit(run3, git);
+      run3 = this.store.recordCheckpointCommit(run3.id, owner, gitSha, LEASE_DURATION_MS);
+    }
+    if (evidence.passed) {
+      const committedSha = required4(run3.actualGitSha, `checkpoint Git SHA missing: ${run3.id}`);
+      if (!await git.isAncestor(committedSha, "HEAD")) {
+        throw new CheckpointRecoveryBlockedError(
+          `CHECKPOINT_GIT_DIVERGED: ${committedSha} is not reachable from current HEAD`
+        );
+      }
+    }
+    if (!["STATE_COMMITTED", "POST_PROCESSING", "DONE"].includes(run3.status)) {
+      this.store.commitCheckpointState(run3.id, owner, LEASE_DURATION_MS);
+    }
+    run3 = required4(this.store.getCheckpointRun(run3.id), `checkpoint run missing: ${run3.id}`);
+    if (!run3.correctionCompletedAt && run3.correctionId) {
+      this.store.recordCheckpointCorrectionOutcome(
+        run3.id,
+        owner,
         this.store.totalRecordedTokens(),
-        false
+        evidence.passed,
+        LEASE_DURATION_MS
       );
-      correctionResult = assessed.correction;
-      if (assessed.unauthorizedFiles.length > 0) {
-        evidence.passed = false;
-        evidence.scopePassed = false;
-        evidence.scopeViolations = [.../* @__PURE__ */ new Set([...evidence.scopeViolations, ...assessed.unauthorizedFiles])];
-      }
     }
     if (evidence.passed) {
-      evidence.gitSha = await options.commitEvidence(evidence);
-      if (correction) {
-        correctionResult = this.store.assessCorrectionOutcome(
-          correction.id,
-          changedFiles,
-          this.store.totalRecordedTokens(),
-          true
-        ).correction;
-      }
-    }
-    const updated = this.store.finishVerification(options.phaseId, options.summary, evidence);
-    let reverificationRequired = [];
-    if (evidence.passed) {
-      await indexRepository(this.store, options.indexGit);
-      reverificationRequired = this.store.markReverification(
-        impactedCompletedPhases,
-        options.reverificationReason(changedFiles),
-        options.phaseId
+      await this.postProcessSuccessfulRun(
+        run3.id,
+        owner,
+        git,
+        `Recovered files affected by ${run3.phaseId}: ${run3.changedFiles.join(", ")}`
       );
-      this.rememberSuccessfulPhase(updated, options.indexGit.root);
-      if (correctionResult?.completedAt) this.rememberCorrection(correctionResult);
+    } else {
+      if (run3.executionMode === "parallel") this.markParallelFailure(run3.phaseId);
+      this.store.completeCheckpointRun(run3.id, owner);
     }
-    return {
-      phase: updated,
-      evidence,
-      correction: correctionResult,
-      reverificationRequired,
-      project: this.store.getProject(),
-      nextAction: evidence.passed ? this.store.currentPhase() ? "start_phase" : "complete_project" : "repair_phase"
-    };
+  }
+  async recoverGitCommit(run3, git) {
+    if (run3.executionMode === "serial") {
+      const existing = await git.checkpointCommit(run3.id, "HEAD");
+      if (existing) return existing;
+      const detached = await git.checkpointCommit(run3.id, "--all");
+      if (detached) {
+        if (await git.isAncestor(detached, "HEAD")) return detached;
+        throw new CheckpointRecoveryBlockedError(`CHECKPOINT_COMMIT_DIVERGED: ${detached} is outside HEAD`);
+      }
+      if (await git.headSha() !== run3.targetBaselineSha) {
+        throw new CheckpointRecoveryBlockedError(
+          `CHECKPOINT_BASELINE_DIVERGED: expected HEAD ${run3.targetBaselineSha}, found ${await git.headSha()}`
+        );
+      }
+      await this.assertDiffBinding(git, run3);
+      return git.commitFilesForRun(run3.changedFiles, generateCommitMessage(run3.phaseId, run3.summary), run3.id);
+    }
+    const merged = await git.checkpointMerge(run3.id, "HEAD");
+    if (merged) return merged;
+    const record2 = this.store.getWorktree(run3.phaseId);
+    if (!record2) throw new CheckpointRecoveryBlockedError(`CHECKPOINT_WORKTREE_MISSING: ${run3.phaseId}`);
+    const phaseCommit = await git.checkpointCommit(run3.id, record2.branch);
+    if (!phaseCommit) {
+      let isolated;
+      try {
+        isolated = await GitRepository.open(record2.path);
+      } catch {
+        throw new CheckpointRecoveryBlockedError(`CHECKPOINT_WORKTREE_UNAVAILABLE: ${record2.path}`);
+      }
+      if (await isolated.headSha() !== run3.workspaceBaselineSha) {
+        throw new CheckpointRecoveryBlockedError(
+          `CHECKPOINT_WORKTREE_BASELINE_DIVERGED: expected ${run3.workspaceBaselineSha}, found ${await isolated.headSha()}`
+        );
+      }
+      await this.assertDiffBinding(isolated, run3);
+      await isolated.commitFilesForRun(
+        run3.changedFiles,
+        generateCommitMessage(run3.phaseId, run3.summary),
+        run3.id
+      );
+    }
+    if (!await git.isAncestor(run3.targetBaselineSha, "HEAD")) {
+      throw new CheckpointRecoveryBlockedError(
+        `CHECKPOINT_TARGET_HISTORY_DIVERGED: ${run3.targetBaselineSha} is not an ancestor of HEAD`
+      );
+    }
+    const mergeSha = await git.mergeWorktreeForRun(record2.branch, run3.id);
+    this.store.setWorktree({ ...record2, status: "merged" });
+    return mergeSha;
+  }
+  async commitRun(runId, executionMode, workspaceGit, indexGit, evidence, summary) {
+    if (executionMode === "serial") {
+      return workspaceGit.commitFilesForRun(
+        evidence.changedFiles,
+        generateCommitMessage(required4(this.store.getCheckpointRun(runId), "checkpoint run missing").phaseId, summary),
+        runId
+      );
+    }
+    const run3 = required4(this.store.getCheckpointRun(runId), `checkpoint run missing: ${runId}`);
+    const record2 = required4(this.store.getWorktree(run3.phaseId), `active worktree not found for phase ${run3.phaseId}`);
+    await workspaceGit.commitFilesForRun(
+      evidence.changedFiles,
+      generateCommitMessage(run3.phaseId, summary),
+      runId
+    );
+    const mergeSha = await indexGit.mergeWorktreeForRun(record2.branch, runId);
+    this.store.setWorktree({ ...record2, status: "merged" });
+    return mergeSha;
+  }
+  async postProcessSuccessfulRun(runId, owner, git, reverificationReason) {
+    let run3 = required4(this.store.getCheckpointRun(runId), `checkpoint run missing: ${runId}`);
+    if (!run3.indexCompletedAt) {
+      await indexRepository(this.store, git);
+      this.store.markCheckpointIndexed(run3.id, owner, LEASE_DURATION_MS);
+      await this.fault("after_indexing", run3.id);
+    }
+    run3 = required4(this.store.getCheckpointRun(run3.id), `checkpoint run missing: ${run3.id}`);
+    let reverificationRequired = run3.reverificationRequired;
+    if (!run3.reverificationCompletedAt) {
+      reverificationRequired = this.store.markCheckpointReverification(
+        run3.id,
+        owner,
+        reverificationReason,
+        LEASE_DURATION_MS
+      );
+      await this.fault("after_reverification", run3.id);
+    }
+    run3 = required4(this.store.getCheckpointRun(run3.id), `checkpoint run missing: ${run3.id}`);
+    if (!run3.memoryCompletedAt) {
+      const memory = this.rememberCheckpoint(run3, git.root);
+      await this.fault("after_memory_write", run3.id);
+      this.appendMemoryEventsOnce(run3.id, memory.events);
+      this.store.markCheckpointMemoryCompleted(run3.id, owner, LEASE_DURATION_MS);
+      await this.fault("after_memory", run3.id);
+    }
+    run3 = required4(this.store.getCheckpointRun(run3.id), `checkpoint run missing: ${run3.id}`);
+    if (!run3.cleanupCompletedAt) {
+      if (run3.executionMode === "parallel") await this.cleanupParallelRun(run3, git);
+      this.store.markCheckpointCleanupCompleted(run3.id, owner, LEASE_DURATION_MS);
+      await this.fault("after_cleanup", run3.id);
+    }
+    this.store.completeCheckpointRun(run3.id, owner);
+    return reverificationRequired;
+  }
+  rememberCheckpoint(run3, fallbackRoot) {
+    const project = this.store.getProject();
+    const phase = this.store.getPhase(run3.phaseId);
+    if (!project?.contract?.playbookOptIn || !phase) return { events: [] };
+    const events = [];
+    const playbook = new PlaybookStore();
+    try {
+      const phasePattern = playbook.rememberPhaseOnce(
+        `checkpoint:${run3.id}:phase`,
+        project.root ?? fallbackRoot,
+        phase,
+        [project.contract.goal]
+      );
+      events.push({
+        type: "playbook_pattern_recorded",
+        phaseId: phase.id,
+        payload: { phaseId: phase.id, patternId: phasePattern.id, runId: run3.id }
+      });
+      if (run3.correctionId) {
+        const correction = this.store.getCorrection(run3.correctionId);
+        const assumption = correction ? this.store.getAssumption(correction.assumptionId) : null;
+        if (correction?.completedAt && correction.outcome !== null && assumption) {
+          const pattern = playbook.rememberCorrectionOnce(
+            `checkpoint:${run3.id}:correction`,
+            project.root,
+            assumption,
+            correction
+          );
+          events.push({
+            type: "playbook_antipattern_recorded",
+            phaseId: correction.phaseId,
+            payload: { correctionId: correction.id, patternId: pattern.id, runId: run3.id }
+          });
+        }
+      }
+    } finally {
+      playbook.close();
+    }
+    return { events };
+  }
+  appendMemoryEventsOnce(runId, events) {
+    const existing = new Set(
+      this.store.eventsSince(0).filter((event) => event.payload.runId === runId).map((event) => `${event.type}\0${event.phaseId ?? ""}`)
+    );
+    for (const event of events) {
+      const key = `${event.type}\0${event.phaseId ?? ""}`;
+      if (existing.has(key)) continue;
+      this.store.appendEvent(event.type, event.phaseId, event.payload);
+      existing.add(key);
+    }
+  }
+  async cleanupParallelRun(run3, git) {
+    const record2 = this.store.getWorktree(run3.phaseId);
+    if (!record2) throw new CheckpointRecoveryBlockedError(`CHECKPOINT_WORKTREE_RECORD_MISSING: ${run3.phaseId}`);
+    await git.removeWorktree(record2.path, record2.branch);
+    this.store.setWorktree({ ...record2, status: "cleaned" });
+  }
+  markParallelFailure(phaseId) {
+    const record2 = this.store.getWorktree(phaseId);
+    if (record2 && record2.status !== "cleaned") this.store.setWorktree({ ...record2, status: "failed" });
+  }
+  async assertDiffBinding(git, run3) {
+    const actual = await git.diffHash();
+    if (actual !== run3.diffHash) {
+      throw new CheckpointRecoveryBlockedError(
+        `CHECKPOINT_EVIDENCE_DIVERGED: expected ${run3.diffHash ?? "missing"}, found ${actual}`
+      );
+    }
   }
   async enforceAssumptionPolicy(git, phase, contract, changedFiles) {
     const phaseAssumptions = this.store.listAssumptions(phase.id);
@@ -8977,43 +9932,90 @@ var CheckpointPipeline = class {
       });
     }
   }
-  rememberCorrection(correction) {
-    const project = this.store.getProject();
-    if (!project?.contract?.playbookOptIn || correction.outcome === null) return;
-    const assumption = this.store.getAssumption(correction.assumptionId);
-    if (!assumption) return;
-    const playbook = new PlaybookStore();
+  async handleRunError(runId, owner, error2) {
+    const current = this.store.getCheckpointRun(runId);
+    if (!current || current.status === "DONE" || current.status === "FAILED_TERMINAL") return;
+    if (current.leaseOwner !== owner) return;
+    if (error2 instanceof CheckpointCrashError) {
+      this.store.expireCheckpointLease(runId, owner);
+      return;
+    }
+    if (!current.evidence) {
+      this.store.resetCheckpointRun(runId, owner, errorMessage(error2));
+      return;
+    }
+    this.store.markCheckpointRetryable(runId, owner, errorMessage(error2));
+  }
+  async withLeaseHeartbeat(runId, owner, operation) {
+    const heartbeat = setInterval(() => {
+      try {
+        this.store.renewCheckpointLease(runId, owner, LEASE_DURATION_MS);
+      } catch {
+        clearInterval(heartbeat);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+    heartbeat.unref();
     try {
-      const pattern = playbook.rememberCorrection(project.root, assumption, correction);
-      this.store.appendEvent("playbook_antipattern_recorded", correction.phaseId, {
-        correctionId: correction.id,
-        patternId: pattern.id
-      });
+      return await operation();
     } finally {
-      playbook.close();
+      clearInterval(heartbeat);
     }
   }
-  rememberSuccessfulPhase(phase, fallbackRoot) {
-    if (!this.store.getProject()?.contract?.playbookOptIn) return;
-    const playbook = new PlaybookStore();
-    try {
-      const project = this.store.getProject();
-      playbook.rememberPhase(project?.root ?? fallbackRoot, phase, [project?.contract?.goal ?? phase.goal]);
-      this.store.appendEvent("playbook_pattern_recorded", phase.id, { phaseId: phase.id });
-    } finally {
-      playbook.close();
-    }
+  async fault(point, runId) {
+    await this.hooks.faultInjector?.(point, runId);
   }
 };
-function recordCommandOutputUsage(store, phaseId, commands) {
+function recordCommandOutputUsage(store, phaseId, commands, receiptKey) {
   const chars = commands.reduce((sum, command2) => sum + command2.stdout.length + command2.stderr.length, 0);
   const tokens = Math.ceil(chars / 4);
   if (tokens <= 0) return;
   const project = store.getProject();
   if (!project) return;
   const delta = { tokens, estimatedTokens: tokens };
+  if (receiptKey) {
+    store.recordBudgetUsageOnce(
+      `${receiptKey}:project`,
+      "project",
+      project.id,
+      delta,
+      "plugin_token_command_output_estimated"
+    );
+    if (phaseId) {
+      store.recordBudgetUsageOnce(
+        `${receiptKey}:phase:${phaseId}`,
+        "phase",
+        phaseId,
+        delta,
+        "plugin_token_command_output_estimated"
+      );
+    }
+    return;
+  }
   store.recordBudgetUsage("project", project.id, delta, "plugin_token_command_output_estimated");
   if (phaseId) store.recordBudgetUsage("phase", phaseId, delta, "plugin_token_command_output_estimated");
+}
+function leaseOwner() {
+  return `${hostname()}:${process.pid}:${randomUUID5()}`;
+}
+function leaseCanBeTaken(run3) {
+  if (!run3.leaseOwner || !run3.leaseExpiresAt || Date.parse(run3.leaseExpiresAt) <= Date.now()) return true;
+  const [ownerHost, ownerPid] = run3.leaseOwner.split(":");
+  if (ownerHost !== hostname() || !ownerPid) return false;
+  const pid = Number(ownerPid);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error2) {
+    return error2.code === "ESRCH";
+  }
+}
+function errorMessage(error2) {
+  return error2 instanceof Error ? `${error2.name}: ${error2.message}` : String(error2);
+}
+function required4(value, message) {
+  if (value === null || value === void 0) throw new Error(message);
+  return value;
 }
 function shellQuote(value) {
   return process.platform === "win32" ? `"${value.replaceAll('"', '""')}"` : `'${value.replaceAll("'", "'\\''")}'`;
@@ -9304,36 +10306,6 @@ function bullets(values) {
   return values.length === 0 ? "- None" : values.map((value) => `- ${value}`).join("\n");
 }
 
-// src/integrations/github.ts
-function generatePullRequestDescription(snapshot) {
-  const completed = snapshot.phases.filter((phase) => phase.status === "COMPLETED");
-  const decisions = snapshot.decisions.filter((decision) => decision.status === "active").slice(-12);
-  const checks = snapshot.checkpoints.flatMap((checkpoint) => [...checkpoint.verification.selectiveCommands, ...checkpoint.verification.commands]).filter((item, index, all) => all.findIndex((candidate) => candidate.command === item.command) === index);
-  return [
-    `## Goal
-
-${snapshot.project.contract?.goal ?? snapshot.project.originalPrompt}`,
-    `## Delivered phases
-
-${completed.map((phase) => `- **${phase.title}** \u2014 ${phase.summary ?? phase.goal}`).join("\n") || "- None"}`,
-    decisions.length > 0 ? `## Decisions
-
-${decisions.map((decision) => `- **${decision.title}:** ${decision.rationale}`).join("\n")}` : "",
-    `## Verification
-
-${checks.map((check) => `- \`${check.command}\` \u2014 ${check.passed ? "passed" : "failed"}`).join("\n") || "- No checkpoint commands recorded"}`,
-    `## Evidence
-
-- Plan version: ${snapshot.project.planVersion}
-- Checkpoints: ${snapshot.checkpoints.length}
-- Event sequence: ${snapshot.recentEvents.at(-1)?.sequence ?? 0}`
-  ].filter(Boolean).join("\n\n");
-}
-function generateCommitMessage(phaseId, summary) {
-  const normalized = summary.trim().replace(/\s+/g, " ").slice(0, 68);
-  return `keep-coding(${phaseId}): ${normalized}`;
-}
-
 // src/core/orchestrator.ts
 var ParallelOrchestrator = class {
   constructor(git, store) {
@@ -9393,20 +10365,12 @@ var ParallelOrchestrator = class {
     const result = await new CheckpointPipeline(this.store).run({
       phaseId,
       summary,
+      executionMode: "parallel",
       workspaceGit: isolated,
       indexGit: this.git,
-      commitEvidence: async (evidence) => {
-        await isolated.commitFiles(evidence.changedFiles, generateCommitMessage(phaseId, summary));
-        return this.git.mergeWorktree(record2.branch);
-      },
       reverificationReason: (changedFiles) => `Files affected by parallel phase ${phaseId}: ${changedFiles.join(", ")}`
     });
-    if (!result.evidence.passed) {
-      this.store.setWorktree({ ...record2, status: "failed" });
-      throw new Error(`parallel phase ${phaseId} failed verification`);
-    }
-    this.store.setWorktree({ ...record2, status: "merged" });
-    await this.git.removeWorktree(record2.path, record2.branch);
+    if (!result.evidence.passed) throw new Error(`parallel phase ${phaseId} failed verification`);
     return {
       evidence: result.evidence,
       mergeSha: result.evidence.gitSha,
@@ -9597,6 +10561,10 @@ var KeepCodingService = class _KeepCodingService {
   static async open(projectRoot) {
     const git = await GitRepository.open(projectRoot);
     const store = new PlatformStore(git.root);
+    const recovery = await CheckpointPipeline.recover(git, store);
+    if ([...recovery.recovered, ...recovery.reset, ...recovery.blocked, ...recovery.deferred].length > 0) {
+      store.appendEvent("checkpoint_recovery_scanned", null, { ...recovery });
+    }
     return new _KeepCodingService(git, store, new WorkspaceTools(git, store));
   }
   close() {
@@ -9694,12 +10662,9 @@ var KeepCodingService = class _KeepCodingService {
     return new CheckpointPipeline(this.store).run({
       phaseId,
       summary,
+      executionMode: "serial",
       workspaceGit: this.git,
       indexGit: this.git,
-      commitEvidence: (evidence) => this.git.commitFiles(
-        evidence.changedFiles,
-        generateCommitMessage(phaseId, summary)
-      ),
       reverificationReason: (changedFiles) => `Files affected by ${phaseId}: ${changedFiles.join(", ")}`
     });
   }
@@ -10080,7 +11045,7 @@ __export(util_exports, {
   promiseAllObject: () => promiseAllObject,
   propertyKeyTypes: () => propertyKeyTypes,
   randomString: () => randomString,
-  required: () => required3,
+  required: () => required5,
   safeExtend: () => safeExtend,
   shallowClone: () => shallowClone,
   slugify: () => slugify,
@@ -10551,7 +11516,7 @@ function partial(Class2, schema, mask) {
   });
   return clone(schema, def);
 }
-function required3(Class2, schema, mask) {
+function required5(Class2, schema, mask) {
   const def = mergeDefs(schema._zod.def, {
     get shape() {
       const oldShape = schema._zod.def.shape;
@@ -16669,9 +17634,9 @@ function requiredClientCapabilitiesForInputRequest(entry) {
       return;
   }
 }
-function missingClientCapabilities(required4, declared) {
+function missingClientCapabilities(required6, declared) {
   const missing = {};
-  for (const [capability, requirement] of Object.entries(required4)) {
+  for (const [capability, requirement] of Object.entries(required6)) {
     if (requirement === void 0) continue;
     const declaredValue = declared === void 0 ? void 0 : declared[capability];
     if (declaredValue === void 0) {
@@ -20011,11 +20976,11 @@ function isLibraryFormatPattern(format, pattern, vendor) {
 function promptArgumentsFromStandardSchema(schema) {
   const jsonSchema = standardSchemaToJsonSchema(schema, "input");
   const properties = jsonSchema.properties || {};
-  const required4 = jsonSchema.required || [];
+  const required6 = jsonSchema.required || [];
   return Object.entries(properties).map(([name2, prop]) => ({
     name: name2,
     description: prop?.description,
-    required: required4.includes(name2)
+    required: required6.includes(name2)
   }));
 }
 function isJsonObject(value) {
@@ -26686,8 +27651,8 @@ var require_discriminator = /* @__PURE__ */ __commonJSMin(((exports) => {
         }
         if (!tagRequired) throw new Error(`discriminator: "${tagName}" must be required`);
         return oneOfMapping;
-        function hasRequired({ required: required4 }) {
-          return Array.isArray(required4) && required4.includes(tagName);
+        function hasRequired({ required: required6 }) {
+          return Array.isArray(required6) && required6.includes(tagName);
         }
         function addMappings(sch, i2) {
           if (sch.const) addMapping(sch.const, i2);
@@ -28654,11 +29619,11 @@ function resolveLegacyShimOptions(options) {
 function coerceEmbeddedInputRequest(method, key, entry) {
   if (entry === null || typeof entry !== "object" || typeof entry.method !== "string") throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an invalid input request '${key}': each inputRequests entry must be an embedded elicitation/create, sampling/createMessage, or roots/list request`);
   const embedded = entry;
-  const required4 = requiredClientCapabilitiesForInputRequest(embedded);
-  if (required4 === void 0) throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an input request '${key}' of kind '${embedded.method}', which is not an embedded request the 2026-07-28 revision defines`);
+  const required6 = requiredClientCapabilitiesForInputRequest(embedded);
+  if (required6 === void 0) throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an input request '${key}' of kind '${embedded.method}', which is not an embedded request the 2026-07-28 revision defines`);
   return {
     embedded,
-    required: required4
+    required: required6
   };
 }
 function syntheticElicitationId() {
@@ -28702,9 +29667,9 @@ var LegacyInputRequiredShim = class {
         const declared = this._host.resolvedClientCapabilities(ctx);
         const coerced = [];
         for (const [key, entry] of Object.entries(inputRequests)) {
-          const { embedded, required: required4 } = coerceEmbeddedInputRequest(method, key, entry);
+          const { embedded, required: required6 } = coerceEmbeddedInputRequest(method, key, entry);
           if (embedded.method !== "roots/list" && embedded.params === void 0) throw new ProtocolError(ProtocolErrorCode.InternalError, `Handler for ${method} returned an input request '${key}' of kind '${embedded.method}' without params`);
-          if (missingClientCapabilities(required4, declared) !== void 0) return legacyShimFailure(method, `Cannot request input '${key}' (${embedded.method}): the client on this 2025-era connection did not declare the required capability${declared === void 0 ? " (no client capabilities are available on this connection \u2014 per-request legacy serving cannot receive server-to-client requests)" : ""}`);
+          if (missingClientCapabilities(required6, declared) !== void 0) return legacyShimFailure(method, `Cannot request input '${key}' (${embedded.method}): the client on this 2025-era connection did not declare the required capability${declared === void 0 ? " (no client capabilities are available on this connection \u2014 per-request legacy serving cannot receive server-to-client requests)" : ""}`);
           coerced.push([key, embedded]);
         }
         const roundAbort = linkedRoundAbort(outerSignal);
@@ -29015,8 +29980,8 @@ var Server = class extends Protocol {
     if (hasInputRequests) {
       const declared = this._inputRequestCapabilityView(ctx);
       for (const [key, entry] of Object.entries(inputRequests)) {
-        const { embedded, required: required4 } = coerceEmbeddedInputRequest(method, key, entry);
-        const missing = missingClientCapabilities(required4, declared);
+        const { embedded, required: required6 } = coerceEmbeddedInputRequest(method, key, entry);
+        const missing = missingClientCapabilities(required6, declared);
         if (missing !== void 0) throw new MissingRequiredClientCapabilityError({ requiredCapabilities: missing }, `Cannot request input '${key}' (${embedded.method}): the request's client capabilities do not declare the required capability`);
       }
     }
@@ -29504,11 +30469,11 @@ var McpServer = class {
   * @param errorMessage - The error message.
   * @returns The tool error result.
   */
-  createToolError(errorMessage) {
+  createToolError(errorMessage2) {
     return {
       content: [{
         type: "text",
-        text: errorMessage
+        text: errorMessage2
       }],
       isError: true
     };
@@ -31010,9 +31975,9 @@ function createMcpHandler(factory, options = {}) {
     const meta2 = route.messageKind === "request" ? requestMetaOf(route.message.params) : void 0;
     const declaredClientCapabilities = meta2?.[CLIENT_CAPABILITIES_META_KEY];
     if (route.messageKind === "request") {
-      const required4 = requiredClientCapabilitiesForRequest(route.message.method);
-      if (required4 !== void 0) {
-        const missing = missingClientCapabilities(required4, declaredClientCapabilities);
+      const required6 = requiredClientCapabilitiesForRequest(route.message.method);
+      if (required6 !== void 0) {
+        const missing = missingClientCapabilities(required6, declaredClientCapabilities);
         if (missing !== void 0) {
           const error2 = new MissingRequiredClientCapabilityError({ requiredCapabilities: missing });
           reportError(error2);
@@ -32140,8 +33105,8 @@ function validateEvaluationCorpus(manifest) {
     }
     for (const command2 of task.verifier.commands) validateCommand(command2, task.id);
   }
-  for (const required4 of ["greenfield", "refactor", "python", "cpp"]) {
-    if (!categories.has(required4)) throw new Error(`evaluation corpus is missing ${required4} tasks`);
+  for (const required6 of ["greenfield", "refactor", "python", "cpp"]) {
+    if (!categories.has(required6)) throw new Error(`evaluation corpus is missing ${required6} tasks`);
   }
 }
 async function runEvaluationCorpus(configPath) {

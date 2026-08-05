@@ -11,8 +11,8 @@ and evidence-gated completion for long-running coding agents.
 [![Keep Coding Verification](https://github.com/brutalstein/keep-coding-plugin/actions/workflows/keep-coding.yml/badge.svg)](https://github.com/brutalstein/keep-coding-plugin/actions/workflows/keep-coding.yml)
 ![Release](https://img.shields.io/badge/release-v0.4.0-7c3aed?style=flat-square)
 ![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22.13-339933?style=flat-square\&logo=nodedotjs\&logoColor=white)
-![Tests](https://img.shields.io/badge/tests-131%20passing-22c55e?style=flat-square)
-![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.89%25-0ea5e9?style=flat-square)
+![Tests](https://img.shields.io/badge/tests-149%20passing-22c55e?style=flat-square)
+![Branch Coverage](https://img.shields.io/badge/branch%20coverage-75.05%25-0ea5e9?style=flat-square)
 ![MCP](https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP-f97316?style=flat-square)
 
 [Quick Start](#-quick-start) ·
@@ -237,6 +237,7 @@ See [`docs/INSTALL_MCP.md`](docs/INSTALL_MCP.md) for the complete setup.
 * Supports adaptive phase insertion and supersession
 * Preserves completed evidence during plan amendments
 * Upgrades existing v0.1–v0.3 SQLite state additively
+* Recovers interrupted serial and parallel checkpoints through a leased, replayable SQLite saga journal
 
 ### Scoped implementation
 
@@ -338,18 +339,18 @@ Pyright or clangd integration is intentionally deferred until real evaluation ev
 
 | Metric                          |              v0.4.0 |
 | ------------------------------- | ------------------: |
-| Source tests                    |     **131 passing** |
-| Source test files               |              **32** |
+| Source tests                    |     **149 passing** |
+| Source test files               |              **39** |
 | Compiled distribution scenarios |       **5 passing** |
-| Statement coverage              |          **86.24%** |
-| Branch coverage                 |          **75.89%** |
+| Statement coverage              |          **84.32%** |
+| Branch coverage                 |          **75.05%** |
 | Enforced branch floor           |             **75%** |
-| Function coverage               |          **88.47%** |
-| Line coverage                   |          **92.18%** |
-| Executable size                 | **1,292,929 bytes** |
+| Function coverage               |          **88.13%** |
+| Line coverage                   |          **89.56%** |
+| Executable size                 | **1,309,988 bytes** |
 | Verified parser sidecars        | **4,721,428 bytes** |
 
-Verified source suite: 131 tests across 32 files.
+Verified source suite: 149 tests across 39 files.
 
 The complete check command runs:
 

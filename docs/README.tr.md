@@ -15,6 +15,7 @@ Keep Coding, uzun süreli coding-agent çalışmalarını kalıcı sözleşme, b
 - CI yalnızca source testini değil production CLI'ı ve parser sidecar dosyalarını da çalıştırır.
 - Native parser hatası indexlemeyi düşürmez; açıkça işaretlenen legacy fallback'e geçer.
 - Düşük confidence assumption ve yüksek ambiguity checkpoint'i sessizce geçemez.
+- Yarıda kalan seri veya paralel checkpoint; lease/CAS kontrollü kalıcı journal üzerinden yeniden oynatılır, belirsiz Git ayrışmalarında fail-closed bloklanır.
 
 ## Sağlanan yetenekler
 
@@ -42,7 +43,7 @@ npm run check
 
 Commitlenen dağıtım yalnızca `keep-coding.mjs` değildir; `plugins/keep-coding/dist/` altındaki executable, hash-manifestli WASM grammar'lar ve query dosyalarının tamamıdır.
 
-Doğrulanmış source suite: 131 test, 32 dosya. Build sonrası artifact suite beş compiled-distribution senaryosu ekler; context ve graph benchmark'ları ayrı çalışır.
+Doğrulanmış source suite: 149 test, 39 dosya. Build sonrası artifact suite beş compiled-distribution senaryosu ekler; context ve graph benchmark'ları ayrı çalışır.
 
 ## Kullanım ve dağıtım
 
