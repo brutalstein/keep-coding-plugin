@@ -9,7 +9,6 @@ export interface CommandSpec {
   display: string;
 }
 
-const FORBIDDEN_SHELL_SEQUENCE = /(?:&&|\|\||[;|<>`]|\$\(|\$\{|\r|\n)/u;
 const ENV_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/u;
 
 /**
@@ -21,8 +20,8 @@ export function parseCommandSpec(command: string): CommandSpec {
   if (command !== command.trim() || command.length === 0) {
     throw new Error("COMMAND_SPEC_INVALID: command must be non-empty and trimmed");
   }
-  if (hasForbiddenControl(command) || FORBIDDEN_SHELL_SEQUENCE.test(command)) {
-    throw new Error("COMMAND_SPEC_SHELL_SYNTAX: shell operators, substitutions, redirections, and newlines are forbidden");
+  if (hasForbiddenControl(command)) {
+    throw new Error("COMMAND_SPEC_SHELL_SYNTAX: control characters and newlines are forbidden");
   }
 
   const tokens: string[] = [];
@@ -31,7 +30,8 @@ export function parseCommandSpec(command: string): CommandSpec {
   let escaping = false;
   let tokenStarted = false;
 
-  for (const character of command) {
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index] ?? "";
     if (escaping) {
       current += character;
       escaping = false;
@@ -52,6 +52,9 @@ export function parseCommandSpec(command: string): CommandSpec {
       quote = quote === "double" ? null : "double";
       tokenStarted = true;
       continue;
+    }
+    if (quote === null && isShellSyntax(command, index)) {
+      throw new Error("COMMAND_SPEC_SHELL_SYNTAX: unquoted shell syntax is forbidden");
     }
     if (/\s/u.test(character) && quote === null) {
       if (tokenStarted) {
@@ -96,5 +99,12 @@ function hasForbiddenControl(value: string): boolean {
     const code = character.charCodeAt(0);
     if (code <= 8 || code === 11 || code === 12 || (code >= 14 && code <= 31) || code === 127) return true;
   }
-  return false;
+  return value.includes("\r") || value.includes("\n");
+}
+
+function isShellSyntax(value: string, index: number): boolean {
+  const character = value[index] ?? "";
+  const code = character.charCodeAt(0);
+  if ([38, 59, 60, 62, 96, 124].includes(code)) return true;
+  return character === "$" && (value[index + 1] === "(" || value[index + 1] === "{");
 }
