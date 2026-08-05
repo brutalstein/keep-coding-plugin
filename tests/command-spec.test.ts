@@ -13,6 +13,13 @@ describe("shell-free command specification", () => {
     expect(commandSpecHash(spec)).toBe(commandSpecHash(parseCommandSpec(spec.display)));
   });
 
+  it("preserves Windows-style path separators", () => {
+    expect(parseCommandSpec("node C:\\repo\\src\\main.js")).toMatchObject({
+      executable: "node",
+      argv: ["C:\\repo\\src\\main.js"]
+    });
+  });
+
   it("formats argv into a parseable display string", () => {
     const display = formatCommandSpec("node", ["--check", "src/file with spaces.js"]);
     expect(parseCommandSpec(display)).toMatchObject({
