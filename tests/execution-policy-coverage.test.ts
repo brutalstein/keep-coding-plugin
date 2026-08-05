@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { parseCommandSpec } from "../src/core/command-spec.js";
+import { commandSpecHash, parseCommandSpec } from "../src/core/command-spec.js";
 import {
   commandAllowed,
   defaultExecutionPolicy,
@@ -89,9 +89,7 @@ describe("execution policy fail-closed branches", () => {
     expect(commandAllowed(builtin, parseCommandSpec("node --version"))).toBe(true);
     const exact = {
       ...builtin,
-      allowedCommandHashes: [
-        (await import("../src/core/command-spec.js")).commandSpecHash(parseCommandSpec("node --version"))
-      ]
+      allowedCommandHashes: [commandSpecHash(parseCommandSpec("node --version"))]
     };
     expect(commandAllowed(exact, parseCommandSpec("node --version"))).toBe(true);
     expect(commandAllowed(exact, parseCommandSpec('node -p "1"'))).toBe(false);
