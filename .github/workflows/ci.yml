@@ -26,7 +26,10 @@ jobs:
           if-no-files-found: error
 
   synchronize-execution-kernel:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/agent/execution-policy-kernel'
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'agent/execution-policy-kernel'
     runs-on: ubuntu-latest
     permissions:
       contents: write
