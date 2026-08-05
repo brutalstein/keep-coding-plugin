@@ -1,5 +1,6 @@
 import type { CriticEvidence, PhaseRecord, ProjectContract } from "../domain/model.js";
 import { ExecutionKernel, type ExecutionAttestation } from "./execution-kernel.js";
+import { GitRepository } from "./git.js";
 
 const MAX_OUTPUT = 32_000;
 
@@ -42,7 +43,11 @@ export class CriticRunner {
       };
     }
 
-    const kernel = await ExecutionKernel.open(input.root);
+    const [kernel, git] = await Promise.all([
+      ExecutionKernel.open(input.root),
+      GitRepository.open(input.root)
+    ]);
+    const before = await git.workingTreeSnapshot();
     const result = await kernel.execute({
       command: this.command,
       cwd: input.root,
@@ -56,18 +61,27 @@ export class CriticRunner {
       }),
       timeoutMs: this.timeoutMs
     });
+    const producedFiles = await git.changedFilesSince(before);
+    result.attestation.producedFiles = producedFiles;
+    if (producedFiles.length > 0) {
+      const violation = `EXECUTION_CRITIC_WRITE_DENIED: ${producedFiles.join(", ")}`;
+      result.policyViolations.push(violation);
+      result.stderr = result.stderr ? `${result.stderr}\n${violation}` : violation;
+      result.passed = false;
+    }
+
     const output = `${result.stdout}${result.stderr}`.slice(-MAX_OUTPUT);
     if (!result.passed) {
       const policyDenied = result.policyViolations.length > 0;
       return {
         configured: true,
         blocking,
-        passed: !blocking,
+        passed: policyDenied ? false : !blocking,
         summary: policyDenied
           ? "Critic execution was denied by the operator execution policy."
           : `Critic command failed with exit code ${result.exitCode ?? "unknown"}.`,
         findings: [{
-          severity: blocking ? "error" : "warning",
+          severity: policyDenied || blocking ? "error" : "warning",
           rule: policyDenied ? "critic-policy-denied" : "critic-command-failed",
           message: output.slice(-2_000)
         }],
