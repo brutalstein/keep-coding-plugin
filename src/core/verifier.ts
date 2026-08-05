@@ -67,11 +67,9 @@ export class PhaseVerifier {
       }
     }
 
-    const changedFiles = options.baseline ? await git.changedFilesSince(options.baseline) : await git.changedFiles();
-    const finalScopeViolations = scopeViolations(changedFiles, phase.allowedScope, correctionScope);
-    const scopeViolationSet = new Set([...initialScopeViolations, ...finalScopeViolations]);
-    const allScopeViolations = [...scopeViolationSet].sort();
-    const secretScan = await scanChangedFiles(git.root, changedFiles);
+    const preCriticChangedFiles = options.baseline ? await git.changedFilesSince(options.baseline) : await git.changedFiles();
+    const preCriticScopeViolations = scopeViolations(preCriticChangedFiles, phase.allowedScope, correctionScope);
+    const preCriticSecretScan = await scanChangedFiles(git.root, preCriticChangedFiles);
     const commandGatePassed = selectiveCommands.length === (options.selectiveCommands ?? []).length
       && selectiveCommands.every((command) => command.passed)
       && commands.length === phase.acceptanceCommands.length
@@ -82,8 +80,8 @@ export class PhaseVerifier {
     const criticEnabled = options.forceBlockingCritic === true
       || phase.criticBlocking === true
       || options.contract.critic?.enabled === true;
-    const deterministicFinalPassed = allScopeViolations.length === 0
-      && secretScan.passed
+    const deterministicFinalPassed = [...initialScopeViolations, ...preCriticScopeViolations].length === 0
+      && preCriticSecretScan.passed
       && options.budget.passed
       && commandGatePassed;
     const critic: CriticEvidence = deterministicFinalPassed && criticEnabled
@@ -91,10 +89,19 @@ export class PhaseVerifier {
           root: git.root,
           phase,
           contract: options.contract,
-          changedFiles,
+          changedFiles: preCriticChangedFiles,
           diff: await git.diff()
         }, blocking)
       : skippedCritic(blocking, criticEnabled);
+
+    const changedFiles = options.baseline ? await git.changedFilesSince(options.baseline) : await git.changedFiles();
+    const postCriticScopeViolations = scopeViolations(changedFiles, phase.allowedScope, correctionScope);
+    const allScopeViolations = [...new Set([
+      ...initialScopeViolations,
+      ...preCriticScopeViolations,
+      ...postCriticScopeViolations
+    ])].sort();
+    const secretScan = await scanChangedFiles(git.root, changedFiles);
     const scopePassed = allScopeViolations.length === 0;
     return {
       passed: scopePassed && secretScan.passed && options.budget.passed && commandGatePassed && critic.passed,
